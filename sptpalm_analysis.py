@@ -89,7 +89,9 @@ from tqdm import tqdm
 try:
     import aicspylibczi
     HAS_AICS = True
-except ImportError:
+except (ImportError, OSError):
+    # OSError covers the case where the package is installed but its
+    # bundled C++ shared library cannot be found (common in PyInstaller bundles)
     HAS_AICS = False
 
 try:
@@ -214,9 +216,9 @@ def load_projection_fast(path, channel=0, max_frames=100):
                         continue   # skip unreadable subblocks; keep going
                 if not frames:
                     raise RuntimeError(
-                        "Could not read any preview frames from this CZI file. "
-                        "Install aicspylibczi for full CZI support: "
-                        "pip install aicspylibczi")
+                        "czifile could not decode any preview frames.\n"
+                        "Fix: pip install imagecodecs\n"
+                        "Or:  pip install aicspylibczi")
                 proj = np.stack(frames).mean(axis=0)
         else:
             raise RuntimeError("Cannot read CZI: install aicspylibczi or czifile.")
@@ -271,17 +273,21 @@ def load_czi(path, channel=0):
     if HAS_CZIFILE:
         # Use subblock-by-subblock reading — czi.asarray() loads the whole
         # file at once and hangs for large (16K-frame) datasets.
+        # Note: czifile needs imagecodecs to decompress JPEG XR frames
+        # (the default compression for Zeiss Elyra).
+        # Install with: pip install imagecodecs
         with czifile.CziFile(path) as czi:
             xml  = czi.metadata()
             meta = _parse_czi_metadata(xml)
             entries = list(czi.subblock_directory)
             if not entries:
                 raise RuntimeError(
-                    "No subblocks found in CZI file. "
-                    "Install aicspylibczi: pip install aicspylibczi")
+                    "No subblocks found in CZI file.\n"
+                    "Try: pip install aicspylibczi imagecodecs")
             n      = len(entries)
             print(f"  Subblocks: {n}  |  Using channel: {channel}", flush=True)
             frames = []
+            _first_err = None   # log first decode error for diagnosis
             for i, entry in enumerate(entries):
                 try:
                     seg = entry.data_segment()
@@ -293,21 +299,27 @@ def load_czi(path, channel=0):
                         arr = arr[0]
                     if arr.ndim == 2:
                         frames.append(arr)
-                except Exception:
+                except Exception as exc:
+                    if _first_err is None:
+                        _first_err = exc
                     continue
                 if i % 1000 == 0 and i > 0:
                     print(f"  Loading: {i}/{n} subblocks...", flush=True)
             if not frames:
+                hint = (f"\nFirst decode error: {_first_err}" if _first_err else "")
                 raise RuntimeError(
-                    "Could not read any frames from CZI file.\n"
-                    "Install aicspylibczi: pip install aicspylibczi")
+                    "czifile could not decode any frames from this CZI.\n"
+                    "This usually means the JPEG XR codec is missing.\n"
+                    "Fix: pip install imagecodecs\n"
+                    "Or:  pip install aicspylibczi"
+                    + hint)
             data = np.stack(frames)
         print(f"  Shape: {data.shape}  (T x Y x X)", flush=True)
         return data, meta["pixel_size_um"], meta["frame_interval_s"]
 
     raise RuntimeError(
         "Cannot read CZI: install aicspylibczi or czifile.\n"
-        "Run:  pip install aicspylibczi czifile")
+        "Run:  pip install aicspylibczi imagecodecs")
 
 
 def load_tif(path):

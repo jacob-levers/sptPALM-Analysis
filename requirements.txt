@@ -10,6 +10,7 @@ trackpy
 joblib
 tqdm
 czifile
+imagecodecs        # JPEG XR decompression for czifile (required for Zeiss Elyra CZI)
 aicspylibczi
 tifffile
 imageio

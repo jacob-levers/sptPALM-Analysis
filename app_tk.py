@@ -30,8 +30,8 @@ def _bootstrap():
     ]
     _INSTALL = [
         "numpy", "pandas", "scipy", "matplotlib", "Pillow",
-        "scikit-image", "trackpy", "tifffile", "czifile", "aicspylibczi",
-        "joblib", "tqdm", "imageio", "psutil",
+        "scikit-image", "trackpy", "tifffile", "czifile", "imagecodecs",
+        "aicspylibczi", "joblib", "tqdm", "imageio", "psutil",
     ]
 
     missing = []

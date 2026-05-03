@@ -24,9 +24,10 @@ hidden += collect_submodules("skimage")
 hidden += collect_submodules("matplotlib")
 hidden += collect_submodules("joblib")
 hidden += collect_submodules("aicspylibczi")
+hidden += collect_submodules("imagecodecs")
 hidden += [
     # CZI readers
-    "czifile", "aicspylibczi",
+    "czifile", "aicspylibczi", "imagecodecs",
     # TIFF
     "tifffile",
     # Tkinter backends
