@@ -8,6 +8,9 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+permissions:
+  contents: write   # required to create releases and upload assets
+
 jobs:
   # ──────────────────────────────────────────────────────────────────────────
   #  macOS  →  sptPALM.app  →  sptPALM-macOS.dmg
