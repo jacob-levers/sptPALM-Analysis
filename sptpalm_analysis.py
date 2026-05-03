@@ -1236,16 +1236,52 @@ def _draw_track(grp, color, ax, lw=0.8, alpha=0.6):
 
 
 def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
-                pixel_size, frame_interval, output_path, roi_mask=None):
+                pixel_size, frame_interval, output_path, roi_mask=None,
+                fig_theme="Dark", proj_cmap="Inferno"):
     print("  Rendering figure ...")
-    BG, PNL = "#0d1117", "#161b22"
-    TXT, GRD, ACC = "#e6edf3", "#30363d", "#58a6ff"
+
+    # ── Theme palettes ─────────────────────────────────────────────────────────
+    if fig_theme == "Light":
+        BG, PNL   = "#ffffff", "#f6f8fa"
+        TXT, GRD  = "#24292f", "#d0d7de"
+        ACC       = "#0969da"
+        _kde_col  = "#000000"
+        _traj_bg  = "Greys"
+        _pie_text = "#ffffff"
+        _font     = "sans-serif"
+    elif fig_theme == "Publication":
+        BG, PNL   = "#ffffff", "#ffffff"
+        TXT, GRD  = "#000000", "#cccccc"
+        ACC       = "#333333"
+        _kde_col  = "#000000"
+        _traj_bg  = "Greys"
+        _pie_text = "#ffffff"
+        _font     = "serif"
+    else:                                    # Dark (default)
+        BG, PNL   = "#0d1117", "#161b22"
+        TXT, GRD  = "#e6edf3", "#30363d"
+        ACC       = "#58a6ff"
+        _kde_col  = "white"
+        _traj_bg  = "Greys_r"
+        _pie_text = "#0d1117"
+        _font     = "monospace"
+
+    # ── Projection colourmap ───────────────────────────────────────────────────
+    _cmap_map = {
+        "Inferno": "inferno",
+        "Hot":     "hot",
+        "Viridis": "viridis",
+        "Plasma":  "plasma",
+        "Greys":   "Greys" if fig_theme in ("Light", "Publication") else "Greys_r",
+    }
+    _pcmap = _cmap_map.get(proj_cmap, "inferno")
+
     plt.rcParams.update({
-        "text.color":TXT, "axes.labelcolor":TXT,
-        "xtick.color":TXT, "ytick.color":TXT,
-        "axes.edgecolor":GRD, "axes.facecolor":PNL,
-        "grid.color":GRD, "grid.alpha":0.4,
-        "font.family":"monospace"})
+        "text.color":       TXT, "axes.labelcolor": TXT,
+        "xtick.color":      TXT, "ytick.color":     TXT,
+        "axes.edgecolor":   GRD, "axes.facecolor":  PNL,
+        "grid.color":       GRD, "grid.alpha":      0.4,
+        "font.family":      _font})
 
     fig = plt.figure(figsize=(20,14), facecolor=BG)
     gs  = GridSpec(2,3,figure=fig,hspace=0.38,wspace=0.32,
@@ -1269,7 +1305,7 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
 
     # A — max projection
     ax = fig.add_subplot(gs[0,0])
-    ax.imshow(proj_eq, cmap="inferno", origin="lower", aspect="equal")
+    ax.imshow(proj_eq, cmap=_pcmap, origin="lower", aspect="equal")
     bp = 5/pixel_size; y0,x0 = proj.shape[0]*.05, proj.shape[1]*.05
     ax.plot([x0,x0+bp],[y0,y0],"-",color="white",lw=3)
     ax.text(x0+bp/2,y0+proj.shape[0]*.025,"5 um",
@@ -1285,7 +1321,7 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
 
     # B — trajectory map (subsample if very many tracks)
     ax = fig.add_subplot(gs[0,1])
-    ax.imshow(proj_eq,cmap="Greys_r",origin="lower",aspect="equal",alpha=0.35)
+    ax.imshow(proj_eq,cmap=_traj_bg,origin="lower",aspect="equal",alpha=0.35)
     all_pids  = list(tracks["particle"].unique())
     draw_pids = set(np.random.default_rng(42).choice(
         all_pids, min(2000, len(all_pids)), replace=False))
@@ -1298,7 +1334,7 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
     els = [Line2D([0],[0],color=MC[m],lw=2,label=m)
            for m in MORD if m in mcol.values()]
     ax.legend(handles=els,fontsize=8,loc="upper right",
-              framealpha=0.6,facecolor=PNL,edgecolor=GRD,labelcolor=TXT)
+              framealpha=0.7,facecolor=PNL,edgecolor=GRD,labelcolor=TXT)
     ax.set_xlim(0,proj.shape[1]); ax.set_ylim(0,proj.shape[0])
     ax.set_xlabel("X (px)",fontsize=9); ax.set_ylabel("Y (px)",fontsize=9)
     shown = f"{n_drawn:,}" + (f" of {len(all_pids):,}" if n_drawn < len(all_pids) else "")
@@ -1347,7 +1383,7 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
             kde = gaussian_kde(ld)
             xk  = np.linspace(ld.min(), ld.max(), 300)
             ax.plot(xk, kde(xk)*len(dv)*(bins[1]-bins[0]),
-                    "-",color="white",lw=2)
+                    "-",color=_kde_col,lw=2)
         ax.axvline(np.log10(dv.median()),color=ACC,ls="--",lw=1.5,
                    label=f"Median={dv.median():.4f}")
         ax.set_xlabel("log10(D)  [um2/s]",fontsize=9)
@@ -1365,7 +1401,7 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
     _,_,ats = ax.pie(sz,labels=lbl,colors=co,autopct="%1.1f%%",startangle=140,
                       textprops={"color":TXT,"fontsize":9},
                       wedgeprops={"edgecolor":PNL,"linewidth":2})
-    for at in ats: at.set_fontsize(8); at.set_color("#0d1117")
+    for at in ats: at.set_fontsize(8); at.set_color(_pie_text)
     sax(ax,"E","Motion Classification")
 
     # F — alpha distribution

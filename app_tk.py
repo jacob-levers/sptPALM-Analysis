@@ -928,6 +928,7 @@ class SPTPalmApp(tk.Tk):
         self._elapsed_id          = None   # after() id for elapsed counter
         self._init_vars()
         self._build_ui()
+        self._load_settings()   # overwrite defaults with any saved preferences
         self._install_scroll_dispatcher()
         self._set_icon()
 
@@ -997,15 +998,17 @@ class SPTPalmApp(tk.Tk):
         self._drawn_roi_mask = None   # numpy bool array set by ROI editor
 
         # Acquisition
-        self.v_pixel_size     = tk.DoubleVar(value=0.106)
+        # Defaults are tuned for Drosophila neurons on Zeiss Elyra 7.
+        # CZI files override pixel_size and frame_interval automatically.
+        self.v_pixel_size     = tk.DoubleVar(value=0.104)
         self.v_frame_interval = tk.DoubleVar(value=0.020)
-        self.v_override_px    = tk.BooleanVar(value=False)  # override pixel size
-        self.v_override_fi    = tk.BooleanVar(value=False)  # override frame interval
+        self.v_override_px    = tk.BooleanVar(value=False)
+        self.v_override_fi    = tk.BooleanVar(value=False)
         self.v_channel        = tk.IntVar(value=0)
 
         # Preprocessing
         self.v_bg_method = tk.StringVar(value="Uniform Filter")
-        self.v_bg_radius = tk.IntVar(value=50)
+        self.v_bg_radius = tk.IntVar(value=10)   # small for thin neurites
 
         # Localisation
         self.v_diameter = tk.IntVar(value=7)
@@ -1022,19 +1025,23 @@ class SPTPalmApp(tk.Tk):
         self.v_max_lagtime = tk.IntVar(value=20)
         self.v_n_fit       = tk.IntVar(value=5)
 
-        # ROI
-        self.v_roi_mode        = tk.StringVar(value="Disabled")
-        self.v_roi_auto_method = tk.StringVar(value="Auto")
-        self.v_roi_threshold   = tk.DoubleVar(value=0.15)
+        # ROI — auto-threshold with Li algorithm by default (best for neurites)
+        self.v_roi_mode        = tk.StringVar(value="Auto threshold")
+        self.v_roi_auto_method = tk.StringVar(value="Li")
+        self.v_roi_threshold   = tk.DoubleVar(value=0.08)
         self.v_roi_mask_mode   = tk.StringVar(value="Mean")
 
-        # Drift correction
-        self.v_drift_correct = tk.BooleanVar(value=False)
-        self.v_drift_segment = tk.IntVar(value=200)
+        # Drift correction — enabled by default (recommended for neurite data)
+        self.v_drift_correct = tk.BooleanVar(value=True)
+        self.v_drift_segment = tk.IntVar(value=500)   # sparse labelling
 
         # Performance
         self.v_workers    = tk.IntVar(value=N_CPUS)
         self.v_chunk_size = tk.IntVar(value=500)
+
+        # Figure style
+        self.v_fig_theme  = tk.StringVar(value="Dark")
+        self.v_proj_cmap  = tk.StringVar(value="Inferno")
 
     # ── Top-level layout ──────────────────────────────────────────────────────
 
@@ -1587,8 +1594,39 @@ class SPTPalmApp(tk.Tk):
                       "Reduce if you see out-of-memory errors."
                   ))
 
-        # Spacer at bottom
-        ttk.Label(p, style="Panel.TLabel").pack(pady=6)
+        # ── Figure Style ──────────────────────────────────────────────────────
+        f = self._section(p, "Figure Style")
+        self._row(f, "Theme",
+                  lambda P: self._combo(P, self.v_fig_theme,
+                                        ["Dark", "Light", "Publication"]),
+                  info=(
+                      "Visual style of the output figure.\n\n"
+                      "Dark — dark background; ideal for presentations.\n\n"
+                      "Light — white background with light panels; good for "
+                      "reports and slides.\n\n"
+                      "Publication — white background, serif font, minimal "
+                      "gridlines; suitable for journal figures."
+                  ))
+        self._row(f, "Projection colourmap",
+                  lambda P: self._combo(P, self.v_proj_cmap,
+                                        ["Inferno", "Hot", "Viridis",
+                                         "Plasma", "Greys"]),
+                  info=(
+                      "Colourmap applied to the max-projection image (panel A).\n\n"
+                      "Inferno — warm yellow-orange; high contrast. Default.\n"
+                      "Hot — red-orange; classic fluorescence look.\n"
+                      "Viridis — blue-green-yellow; perceptually uniform and "
+                      "colourblind-safe.\n"
+                      "Plasma — purple-pink-yellow; vivid.\n"
+                      "Greys — greyscale; clean for publication."
+                  ))
+
+        # ── Save Settings ─────────────────────────────────────────────────────
+        # Thin divider
+        tk.Frame(p, bg=BORDER, height=1).pack(fill="x", padx=16, pady=(12, 4))
+        _FlatButton(p, text="💾  Save current settings as default",
+                    command=self._save_settings
+                    ).pack(fill="x", padx=16, pady=(4, 14))
 
     # ── Toggle callbacks ──────────────────────────────────────────────────────
 
@@ -1620,6 +1658,101 @@ class SPTPalmApp(tk.Tk):
         self._roi_thresh_w.configure(state=thresh_s)
         self._roi_mmode_w.configure(state=mmode_s)
         self._roi_draw_btn.configure(state=draw_s)
+
+    # ── Settings save / load ──────────────────────────────────────────────────
+
+    _SETTINGS_PATH = os.path.join(os.path.expanduser("~"),
+                                  ".sptpalm_settings.json")
+
+    def _settings_dict(self) -> dict:
+        """Serialise every settings variable to a plain dict."""
+        return {
+            "pixel_size":      self.v_pixel_size.get(),
+            "frame_interval":  self.v_frame_interval.get(),
+            "override_px":     self.v_override_px.get(),
+            "override_fi":     self.v_override_fi.get(),
+            "channel":         self.v_channel.get(),
+            "bg_method":       self.v_bg_method.get(),
+            "bg_radius":       self.v_bg_radius.get(),
+            "diameter":        self.v_diameter.get(),
+            "auto_mm":         self.v_auto_mm.get(),
+            "minmass":         self.v_minmass.get(),
+            "search_range":    self.v_search_range.get(),
+            "memory":          self.v_memory.get(),
+            "min_track_len":   self.v_min_track_len.get(),
+            "max_track_len":   self.v_max_track_len.get(),
+            "max_lagtime":     self.v_max_lagtime.get(),
+            "n_fit":           self.v_n_fit.get(),
+            "roi_mode":        self.v_roi_mode.get(),
+            "roi_auto_method": self.v_roi_auto_method.get(),
+            "roi_threshold":   self.v_roi_threshold.get(),
+            "roi_mask_mode":   self.v_roi_mask_mode.get(),
+            "drift_correct":   self.v_drift_correct.get(),
+            "drift_segment":   self.v_drift_segment.get(),
+            "workers":         self.v_workers.get(),
+            "chunk_size":      self.v_chunk_size.get(),
+            "fig_theme":       self.v_fig_theme.get(),
+            "proj_cmap":       self.v_proj_cmap.get(),
+        }
+
+    def _apply_settings_dict(self, d: dict):
+        """Apply a settings dict loaded from disk to all Tk variables."""
+        def _s(var, key):
+            if key in d:
+                var.set(d[key])
+        _s(self.v_pixel_size,     "pixel_size")
+        _s(self.v_frame_interval, "frame_interval")
+        _s(self.v_override_px,    "override_px")
+        _s(self.v_override_fi,    "override_fi")
+        _s(self.v_channel,        "channel")
+        _s(self.v_bg_method,      "bg_method")
+        _s(self.v_bg_radius,      "bg_radius")
+        _s(self.v_diameter,       "diameter")
+        _s(self.v_auto_mm,        "auto_mm")
+        _s(self.v_minmass,        "minmass")
+        _s(self.v_search_range,   "search_range")
+        _s(self.v_memory,         "memory")
+        _s(self.v_min_track_len,  "min_track_len")
+        _s(self.v_max_track_len,  "max_track_len")
+        _s(self.v_max_lagtime,    "max_lagtime")
+        _s(self.v_n_fit,          "n_fit")
+        _s(self.v_roi_mode,       "roi_mode")
+        _s(self.v_roi_auto_method,"roi_auto_method")
+        _s(self.v_roi_threshold,  "roi_threshold")
+        _s(self.v_roi_mask_mode,  "roi_mask_mode")
+        _s(self.v_drift_correct,  "drift_correct")
+        _s(self.v_drift_segment,  "drift_segment")
+        _s(self.v_workers,        "workers")
+        _s(self.v_chunk_size,     "chunk_size")
+        _s(self.v_fig_theme,      "fig_theme")
+        _s(self.v_proj_cmap,      "proj_cmap")
+        # Refresh dependent widget states
+        self._toggle_px()
+        self._toggle_fi()
+        self._toggle_minmass()
+        self._toggle_drift()
+        self._toggle_roi()
+
+    def _save_settings(self):
+        import json
+        try:
+            with open(self._SETTINGS_PATH, "w") as fh:
+                json.dump(self._settings_dict(), fh, indent=2)
+            self._status_var.set("✓  Settings saved as default")
+            self.after(2500, lambda: self._status_var.set(""))
+        except Exception as exc:
+            messagebox.showerror("Save failed", str(exc))
+
+    def _load_settings(self):
+        import json
+        if not os.path.exists(self._SETTINGS_PATH):
+            return
+        try:
+            with open(self._SETTINGS_PATH) as fh:
+                d = json.load(fh)
+            self._apply_settings_dict(d)
+        except Exception:
+            pass  # Corrupt / old file — silently use built-in defaults
 
     def _open_roi_editor(self):
         fpath = self.v_file.get().strip()
@@ -2397,7 +2530,9 @@ class SPTPalmApp(tk.Tk):
             _emit_progress("Saving outputs…", 85)
             fig_path = os.path.join(out_dir, f"{stem}_sptpalm_figure.png")
             make_figure(proj_sample, tracks, imsd_df, emsd_df, diff_df,
-                        px, fi, fig_path, roi_mask=roi_mask)
+                        px, fi, fig_path, roi_mask=roi_mask,
+                        fig_theme=self.v_fig_theme.get(),
+                        proj_cmap=self.v_proj_cmap.get())
             del proj_sample; gc.collect()
 
             # Preview: the final saved figure
