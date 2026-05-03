@@ -156,6 +156,61 @@ def _dim_size(v, default=1):
     return int(v) if v is not None else default
 
 
+def load_projection_fast(path, channel=0, max_frames=100):
+    """
+    Return a normalised [0,1] float32 mean-projection image using at most
+    *max_frames* evenly-spaced frames.  Much faster than load_file() for
+    large datasets because frames are read individually (no full stack load).
+    Used by the ROI Editor so it doesn't have to load all 16K frames.
+    """
+    ext = os.path.splitext(path)[1].lower()
+
+    if ext == ".czi":
+        if HAS_AICS:
+            czi  = aicspylibczi.CziFile(path)
+            dims = dict(czi.get_dims_shape()[0])
+            n_t  = _dim_size(dims.get("T"), 1)
+            n_c  = _dim_size(dims.get("C"), 1)
+            ch   = min(channel, n_c - 1)
+            indices = np.linspace(0, n_t - 1, min(max_frames, n_t),
+                                  dtype=int)
+            frames = []
+            for t in indices:
+                img, _ = czi.read_image(T=int(t), C=ch)
+                frame  = img.squeeze()
+                if frame.ndim > 2:
+                    frame = frame[0]
+                frames.append(frame.astype(np.float32))
+            proj = np.stack(frames).mean(axis=0)
+        elif HAS_CZIFILE:
+            # czifile has no random-access API — load all, then sample
+            with czifile.CziFile(path) as czi:
+                data = czi.asarray().astype(np.float32)
+            data = data.squeeze()
+            if   data.ndim == 5: data = data[:, channel, 0, :, :]
+            elif data.ndim == 4: data = data[:, channel, :, :]
+            elif data.ndim == 2: data = data[np.newaxis]
+            step = max(1, len(data) // max_frames)
+            proj = data[::step].mean(axis=0)
+        else:
+            raise RuntimeError("Cannot read CZI: install aicspylibczi or czifile.")
+
+    elif ext in (".tif", ".tiff"):
+        if not HAS_TIFFFILE:
+            raise RuntimeError("Run: pip install tifffile")
+        with tifffile.TiffFile(path) as tif:
+            n     = len(tif.pages)
+            step  = max(1, n // max_frames)
+            pages = [tif.pages[i].asarray().astype(np.float32)
+                     for i in range(0, n, step)]
+        proj = np.stack(pages).mean(axis=0)
+    else:
+        raise RuntimeError(f"Unsupported file type: {ext}")
+
+    lo, hi = proj.min(), proj.max()
+    return (proj - lo) / (hi - lo) if hi > lo else np.zeros_like(proj)
+
+
 def load_czi(path, channel=0):
     print(f"  Loading CZI: {path}")
     if HAS_AICS:

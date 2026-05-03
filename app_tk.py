@@ -725,13 +725,11 @@ class _ROIEditorDialog(tk.Toplevel):
                         else os.path.dirname(os.path.abspath(__file__)))
                 if base not in _sys.path:
                     _sys.path.insert(0, base)
-                from sptpalm_analysis import load_file
-                stack, _, _ = load_file(self._fpath, channel=self._channel)
-                n    = len(stack)
-                step = max(1, n // 80)        # sample ≤ 80 frames for speed
-                proj = stack[::step].mean(axis=0).astype(float)
-                lo, hi = proj.min(), proj.max()
-                proj = (proj - lo) / (hi - lo) if hi > lo else proj * 0.0
+                from sptpalm_analysis import load_projection_fast
+                # Reads only ~100 evenly-spaced frames — fast even for 16K files
+                proj = load_projection_fast(self._fpath,
+                                            channel=self._channel,
+                                            max_frames=100)
                 try:
                     import matplotlib.cm as _cm
                     from PIL import Image

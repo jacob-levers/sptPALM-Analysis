@@ -23,6 +23,7 @@ hidden += collect_submodules("scipy")
 hidden += collect_submodules("skimage")
 hidden += collect_submodules("matplotlib")
 hidden += collect_submodules("joblib")
+hidden += collect_submodules("aicspylibczi")
 hidden += [
     # CZI readers
     "czifile", "aicspylibczi",
@@ -49,6 +50,7 @@ hidden += [
 datas = []
 datas += collect_data_files("skimage")
 datas += collect_data_files("matplotlib")
+datas += collect_data_files("aicspylibczi")
 # Include the science engine alongside the GUI
 datas += [("sptpalm_analysis.py", ".")]
 
