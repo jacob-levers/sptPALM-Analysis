@@ -1624,7 +1624,7 @@ class SPTPalmApp(tk.Tk):
         # ── Save Settings ─────────────────────────────────────────────────────
         # Thin divider
         tk.Frame(p, bg=BORDER, height=1).pack(fill="x", padx=16, pady=(12, 4))
-        _FlatButton(p, text="💾  Save current settings as default",
+        _FlatButton(p, text="Save",
                     command=self._save_settings
                     ).pack(fill="x", padx=16, pady=(4, 14))
 
@@ -1948,7 +1948,6 @@ class SPTPalmApp(tk.Tk):
 
     def _show_results(self, data: dict):
         self._clear_right()
-        import numpy as np
 
         diff_df  = data["diff_df"]
         fig_path = data["fig_path"]
@@ -1956,62 +1955,22 @@ class SPTPalmApp(tk.Tk):
         out_dir  = data["out_dir"]
         stem     = data["stem"]
 
-        nb = ttk.Notebook(self._right)
-        nb.pack(fill="both", expand=True, padx=4, pady=4)
+        # ── helpers ──────────────────────────────────────────────────────────
+        def _bordered_card(parent):
+            """1 px BORDER outline → CARD face, same pattern as _FlatButton."""
+            outer = tk.Frame(parent, bg=BORDER, padx=1, pady=1,
+                             highlightthickness=0)
+            inner = tk.Frame(outer, bg=CARD, highlightthickness=0)
+            inner.pack(fill="both", expand=True)
+            return outer, inner
 
-        # ── Tab 1: Summary ────────────────────────────────────────────────────
-        t1 = ttk.Frame(nb, padding=20)
-        nb.add(t1, text="  Summary  ")
+        def _divider(parent):
+            tk.Frame(parent, bg=BORDER, height=1).pack(fill="x",
+                                                        padx=20, pady=12)
 
-        n_tracks  = diff_df.shape[0]
-        med_D     = diff_df["D"].dropna().median()
-        mean_D    = diff_df["D"].dropna().mean()
-        med_alpha = diff_df["alpha"].dropna().median()
-        mc        = diff_df["motion"].value_counts()
-
-        # Metric row
-        mf = tk.Frame(t1, bg=BG)
-        mf.pack(fill="x", pady=(0, 20))
-        for label, val, unit in [
-            ("Trajectories", f"{n_tracks:,}", ""),
-            ("Median D",  f"{med_D:.4f}",  "µm²/s"),
-            ("Mean D",    f"{mean_D:.4f}", "µm²/s"),
-            ("Median α",  f"{med_alpha:.3f}", ""),
-        ]:
-            card = tk.Frame(mf, bg=CARD, bd=1, relief="solid")
-            card.pack(side="left", expand=True, fill="x", padx=5)
-            tk.Label(card, text=label, bg=CARD, fg=MUTED,
-                     font=("Helvetica", 9)).pack(pady=(8, 0))
-            tk.Label(card, text=val, bg=CARD, fg=ACC,
-                     font=("Helvetica", 19, "bold")).pack()
-            tk.Label(card, text=unit or " ", bg=CARD, fg=MUTED,
-                     font=("Helvetica", 8)).pack(pady=(0, 8))
-
-        # Motion breakdown
-        ttk.Label(t1, text="Motion Classification",
-                  style="Section.TLabel").pack(anchor="w", pady=(0, 8))
-        mof = tk.Frame(t1, bg=BG)
-        mof.pack(fill="x", pady=(0, 20))
-        for mot in ["Immobile", "Confined", "Brownian", "Directed"]:
-            cnt = mc.get(mot, 0)
-            pct = 100 * cnt / max(n_tracks, 1)
-            col = MOTION_COLORS[mot]
-            card = tk.Frame(mof, bg=CARD, bd=1, relief="solid")
-            card.pack(side="left", expand=True, fill="x", padx=5)
-            tk.Label(card, text=mot, bg=CARD, fg=col,
-                     font=("Helvetica", 10, "bold")).pack(pady=(8, 0))
-            tk.Label(card, text=f"{cnt:,}", bg=CARD, fg=TXT,
-                     font=("Helvetica", 16, "bold")).pack()
-            tk.Label(card, text=f"{pct:.1f}%", bg=CARD, fg=MUTED,
-                     font=("Helvetica", 9)).pack(pady=(0, 8))
-
-        ttk.Separator(t1, orient="horizontal").pack(fill="x", pady=14)
-        ttk.Button(t1, text="Open Output Folder",
-                   command=lambda: _open_folder(out_dir)).pack(anchor="w")
-
-        # ── Tab 2: Figure ─────────────────────────────────────────────────────
-        t2 = ttk.Frame(nb)
-        nb.add(t2, text="  Figure  ")
+        def _section_label(parent, text):
+            tk.Label(parent, text=text.upper(), bg=BG, fg=MUTED,
+                     font=F(8, "bold")).pack(anchor="w", padx=20, pady=(14, 6))
 
         def _embed_image(parent, path, max_w=900, max_h=560):
             try:
@@ -2020,42 +1979,138 @@ class SPTPalmApp(tk.Tk):
                 img.thumbnail((max_w, max_h), Image.LANCZOS)
                 photo = ImageTk.PhotoImage(img)
                 self._img_refs.append(photo)
-                lbl = tk.Label(parent, image=photo, bg=BG)
-                lbl.pack(padx=8, pady=8)
+                tk.Label(parent, image=photo, bg=BG).pack(padx=12, pady=12)
                 return True
             except ImportError:
-                ttk.Label(parent,
-                          text=f"Install Pillow to view figure here.\nSaved to:\n{path}",
-                          style="TLabel", justify="center").pack(expand=True)
+                tk.Label(parent,
+                         text=f"Install Pillow to view figure here.\n{path}",
+                         bg=BG, fg=MUTED, font=F(9), justify="center"
+                         ).pack(expand=True)
             except Exception as exc:
-                ttk.Label(parent,
-                          text=f"Could not load image:\n{exc}",
-                          style="TLabel").pack(expand=True)
+                tk.Label(parent, text=f"Could not load image:\n{exc}",
+                         bg=BG, fg=RED, font=F(9)).pack(expand=True)
             return False
 
-        fig_scroll = _ScrollFrame(t2)
+        # ── Tab strip (manual, themed) ────────────────────────────────────────
+        # We avoid ttk.Notebook entirely — it pulls in native OS chrome that
+        # doesn't respect our dark palette.  Instead we build a simple
+        # button-strip + stacked Frame approach.
+        outer = tk.Frame(self._right, bg=BG)
+        outer.pack(fill="both", expand=True)
+
+        tab_bar = tk.Frame(outer, bg=SIDEBAR, height=36)
+        tab_bar.pack(fill="x")
+        tab_bar.pack_propagate(False)
+
+        content = tk.Frame(outer, bg=BG)
+        content.pack(fill="both", expand=True)
+
+        _tabs   = {}   # name → Frame
+        _btns   = {}
+        _active = tk.StringVar(value="")
+
+        def _switch(name):
+            prev = _active.get()
+            if prev and prev in _btns:
+                _btns[prev].configure(bg=SIDEBAR, fg=MUTED)
+            _active.set(name)
+            _btns[name].configure(bg=BG, fg=TXT)
+            for n, f in _tabs.items():
+                if n == name:
+                    f.place(relx=0, rely=0, relwidth=1, relheight=1)
+                else:
+                    f.place_forget()
+
+        def _add_tab(name):
+            f = tk.Frame(content, bg=BG)
+            _tabs[name] = f
+            btn = tk.Label(tab_bar, text=name, bg=SIDEBAR, fg=MUTED,
+                           font=F(10), padx=18, pady=8, cursor="hand2")
+            btn.pack(side="left")
+            btn.bind("<Button-1>", lambda e, n=name: _switch(n))
+            _btns[name] = btn
+            return f
+
+        # ── Tab: Summary ──────────────────────────────────────────────────────
+        t1 = _add_tab("Summary")
+        t1_scroll = _ScrollFrame(t1, bg=BG)
+        t1_scroll.pack(fill="both", expand=True)
+        p1 = t1_scroll.inner
+
+        n_tracks  = diff_df.shape[0]
+        med_D     = diff_df["D"].dropna().median()
+        mean_D    = diff_df["D"].dropna().mean()
+        med_alpha = diff_df["alpha"].dropna().median()
+        mc        = diff_df["motion"].value_counts()
+
+        _section_label(p1, "Key metrics")
+        mf = tk.Frame(p1, bg=BG)
+        mf.pack(fill="x", padx=16, pady=(0, 4))
+        for label, val, unit in [
+            ("Trajectories", f"{n_tracks:,}",    ""),
+            ("Median D",     f"{med_D:.4f}",      "µm²/s"),
+            ("Mean D",       f"{mean_D:.4f}",     "µm²/s"),
+            ("Median α",     f"{med_alpha:.3f}",  ""),
+        ]:
+            outer_c, inner_c = _bordered_card(mf)
+            outer_c.pack(side="left", expand=True, fill="x", padx=4, pady=4)
+            tk.Label(inner_c, text=label, bg=CARD, fg=MUTED,
+                     font=F(9)).pack(pady=(10, 2))
+            tk.Label(inner_c, text=val, bg=CARD, fg=ACC,
+                     font=F(20, "bold")).pack()
+            tk.Label(inner_c, text=unit or " ", bg=CARD, fg=MUTED,
+                     font=F(8)).pack(pady=(0, 10))
+
+        _section_label(p1, "Motion classification")
+        mof = tk.Frame(p1, bg=BG)
+        mof.pack(fill="x", padx=16, pady=(0, 4))
+        for mot in ["Immobile", "Confined", "Brownian", "Directed"]:
+            cnt = mc.get(mot, 0)
+            pct = 100 * cnt / max(n_tracks, 1)
+            col = MOTION_COLORS[mot]
+            outer_c, inner_c = _bordered_card(mof)
+            outer_c.pack(side="left", expand=True, fill="x", padx=4, pady=4)
+            # coloured top accent strip
+            tk.Frame(inner_c, bg=col, height=3).pack(fill="x")
+            tk.Label(inner_c, text=mot, bg=CARD, fg=col,
+                     font=F(9, "bold")).pack(pady=(8, 2))
+            tk.Label(inner_c, text=f"{cnt:,}", bg=CARD, fg=TXT,
+                     font=F(17, "bold")).pack()
+            tk.Label(inner_c, text=f"{pct:.1f}%", bg=CARD, fg=MUTED,
+                     font=F(9)).pack(pady=(0, 10))
+
+        _divider(p1)
+        _FlatButton(p1, text="Open Output Folder",
+                    command=lambda: _open_folder(out_dir)
+                    ).pack(anchor="w", padx=20, pady=(0, 16))
+
+        # ── Tab: Figure ───────────────────────────────────────────────────────
+        t2 = _add_tab("Figure")
+        fig_scroll = _ScrollFrame(t2, bg=BG)
         fig_scroll.pack(fill="both", expand=True)
         _embed_image(fig_scroll.inner, fig_path)
-
         if roi_path and os.path.exists(roi_path):
-            ttk.Label(fig_scroll.inner, text="ROI Mask Preview:",
-                      style="Section.TLabel").pack(anchor="w", padx=10, pady=(10, 4))
+            _section_label(fig_scroll.inner, "ROI mask preview")
             _embed_image(fig_scroll.inner, roi_path, max_w=900, max_h=320)
 
-        # ── Tab 3: Output Files ───────────────────────────────────────────────
-        t3 = ttk.Frame(nb, padding=20)
-        nb.add(t3, text="  Output Files  ")
+        # ── Tab: Output Files ─────────────────────────────────────────────────
+        t3 = _add_tab("Output Files")
+        t3_scroll = _ScrollFrame(t3, bg=BG)
+        t3_scroll.pack(fill="both", expand=True)
+        p3 = t3_scroll.inner
 
-        ttk.Label(t3, text="Saved to:", style="TLabel").pack(anchor="w")
-        tk.Label(t3, text=out_dir, bg=BG, fg=ACC,
-                 font=("Courier", 10)).pack(anchor="w", pady=(2, 14))
+        _section_label(p3, "Saved to")
+        tk.Label(p3, text=out_dir, bg=BG, fg=ACC,
+                 font=FM(9), wraplength=680, justify="left",
+                 anchor="w").pack(anchor="w", padx=20, pady=(0, 4))
 
+        _section_label(p3, "Files")
         file_info = [
-            (f"{stem}_sptpalm_figure.png",     "6-panel analysis figure"),
-            (f"{stem}_diffusion_summary.csv",  "Per-trajectory D, α, motion class"),
-            (f"{stem}_trajectories.csv",       "Full trajectory table"),
-            (f"{stem}_localisations.csv",      "Raw localisations"),
-            (f"{stem}_ensemble_msd.csv",       "Ensemble MSD curve"),
+            (f"{stem}_sptpalm_figure.png",    "6-panel analysis figure"),
+            (f"{stem}_diffusion_summary.csv", "Per-trajectory D, α, motion class"),
+            (f"{stem}_trajectories.csv",      "Full trajectory table"),
+            (f"{stem}_localisations.csv",     "Raw localisations"),
+            (f"{stem}_ensemble_msd.csv",      "Ensemble MSD curve"),
         ]
         if roi_path and os.path.exists(roi_path):
             file_info.append((os.path.basename(roi_path), "ROI mask preview"))
@@ -2063,18 +2118,26 @@ class SPTPalmApp(tk.Tk):
         for fname, desc in file_info:
             fpath  = os.path.join(out_dir, fname)
             exists = os.path.exists(fpath)
-            icon   = "OK  " if exists else "!!  "
-            row    = tk.Frame(t3, bg=BG)
-            row.pack(fill="x", pady=2)
-            tk.Label(row, text=icon + fname, bg=BG,
-                     fg=TXT if exists else RED,
-                     font=("Courier", 10)).pack(side="left")
-            tk.Label(row, text=f"  —  {desc}", bg=BG,
-                     fg=MUTED, font=("Helvetica", 9)).pack(side="left")
+            outer_r, inner_r = _bordered_card(p3)
+            outer_r.pack(fill="x", padx=20, pady=3)
+            row = tk.Frame(inner_r, bg=CARD)
+            row.pack(fill="x", padx=12, pady=8)
+            tk.Label(row, text="✓" if exists else "✗",
+                     bg=CARD, fg=GREEN2 if exists else RED,
+                     font=F(11, "bold")).pack(side="left", padx=(0, 8))
+            tk.Label(row, text=fname, bg=CARD,
+                     fg=TXT if exists else MUTED,
+                     font=FM(9)).pack(side="left")
+            tk.Label(row, text=f"  —  {desc}", bg=CARD, fg=MUTED,
+                     font=F(9)).pack(side="left")
 
-        ttk.Separator(t3, orient="horizontal").pack(fill="x", pady=14)
-        ttk.Button(t3, text="Open Output Folder",
-                   command=lambda: _open_folder(out_dir)).pack(anchor="w")
+        _divider(p3)
+        _FlatButton(p3, text="Open Output Folder",
+                    command=lambda: _open_folder(out_dir)
+                    ).pack(anchor="w", padx=20, pady=(0, 16))
+
+        # activate first tab
+        _switch("Summary")
 
     # ── Icon ─────────────────────────────────────────────────────────────────
 
