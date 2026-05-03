@@ -58,6 +58,16 @@ def _bootstrap():
                 if sys.platform == "win32"
                 else os.path.join(_VENV, "bin", "pip"))
 
+    # Prefer Python 3.12 for the venv — it has pre-built wheels for all
+    # scientific packages (aicspylibczi, scipy, etc.) and avoids compilation
+    # errors seen on Python 3.13+ with newer compilers.
+    import shutil as _shutil
+    _PREFERRED_PY = (
+        _shutil.which("python3.12") or
+        _shutil.which("python3.13") or
+        sys.executable
+    )
+
     # Palette (duplicated here so bootstrap needs no app-level globals)
     _BG     = "#09090e"
     _CARD   = "#181d27"
@@ -130,9 +140,9 @@ def _bootstrap():
     def _run():
         try:
             _set_status("Creating virtual environment…")
-            _log("Creating virtual environment…", "muted")
+            _log(f"Creating virtual environment (Python {_PREFERRED_PY})…", "muted")
             subprocess.run(
-                [sys.executable, "-m", "venv", _VENV],
+                [_PREFERRED_PY, "-m", "venv", _VENV],
                 check=True, capture_output=True)
             _log("  ✓ Virtual environment ready", "acc")
 
