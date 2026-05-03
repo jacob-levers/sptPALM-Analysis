@@ -12,5 +12,6 @@ tqdm
 czifile
 aicspylibczi
 tifffile
+imageio
 Pillow
 psutil

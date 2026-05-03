@@ -41,6 +41,8 @@ hidden += [
     # multiprocessing (spawn support)
     "multiprocessing.pool",
     "multiprocessing.managers",
+    # memory management (conditionally imported inside function)
+    "psutil",
 ]
 
 # ── Datas ─────────────────────────────────────────────────────────────────────

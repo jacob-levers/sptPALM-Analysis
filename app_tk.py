@@ -16,21 +16,22 @@ import sys
 
 def _bootstrap():
     _REQUIRED = [
-        ("numpy",    "numpy"),
-        ("pandas",   "pandas"),
-        ("scipy",    "scipy"),
-        ("PIL",      "Pillow"),
-        ("skimage",  "scikit-image"),
-        ("trackpy",  "trackpy"),
-        ("tifffile", "tifffile"),
-        ("czifile",  "czifile"),
-        ("joblib",   "joblib"),
-        ("tqdm",     "tqdm"),
+        ("numpy",      "numpy"),
+        ("pandas",     "pandas"),
+        ("scipy",      "scipy"),
+        ("matplotlib", "matplotlib"),
+        ("PIL",        "Pillow"),
+        ("skimage",    "scikit-image"),
+        ("trackpy",    "trackpy"),
+        ("tifffile",   "tifffile"),
+        ("czifile",    "czifile"),
+        ("joblib",     "joblib"),
+        ("tqdm",       "tqdm"),
     ]
     _INSTALL = [
-        "numpy", "pandas", "scipy", "Pillow", "scikit-image",
-        "trackpy", "tifffile", "czifile", "aicspylibczi",
-        "joblib", "tqdm", "imageio",
+        "numpy", "pandas", "scipy", "matplotlib", "Pillow",
+        "scikit-image", "trackpy", "tifffile", "czifile", "aicspylibczi",
+        "joblib", "tqdm", "imageio", "psutil",
     ]
 
     missing = []
