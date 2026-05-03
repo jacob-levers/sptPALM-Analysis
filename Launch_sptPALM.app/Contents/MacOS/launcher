@@ -1,0 +1,22 @@
+#!/bin/bash
+# sptPALM — Launch script
+# On first run the app installs its own dependencies automatically.
+
+FOLDER="$(cd "$(dirname "$0")/../../.." && pwd)"
+APP="$FOLDER/app_tk.py"
+VENV_PY="$FOLDER/sptpalm-env/bin/python3"
+
+# Prefer the venv Python (present after first-time setup), fall back to system Python 3
+if [ -f "$VENV_PY" ]; then
+    PYTHON="$VENV_PY"
+else
+    PYTHON="$(command -v python3 2>/dev/null)"
+fi
+
+if [ -z "$PYTHON" ] || [ ! -f "$PYTHON" ]; then
+    osascript -e 'display alert "Python 3 not found" message "Please install Python 3 from python.org, then double-click Launch sptPALM again." buttons {"OK"} default button "OK"'
+    exit 1
+fi
+
+cd "$FOLDER"
+exec "$PYTHON" "$APP"

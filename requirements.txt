@@ -1,0 +1,16 @@
+# sptPALM Analysis Pipeline — runtime dependencies
+# Install with:  pip install -r requirements.txt
+
+numpy
+pandas
+scipy
+matplotlib
+scikit-image
+trackpy
+joblib
+tqdm
+czifile
+aicspylibczi
+tifffile
+Pillow
+psutil
