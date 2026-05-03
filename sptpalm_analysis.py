@@ -247,27 +247,62 @@ def load_czi(path, channel=0):
         n_t  = _dim_size(dims.get("T"), 1)
         n_c  = _dim_size(dims.get("C"), 1)
         ch   = min(channel, n_c - 1)
-        print(f"  Frames: {n_t}  |  Channels: {n_c}  |  Using channel: {ch}")
-        frames = []
-        for t in tqdm(range(n_t), desc="  Reading frames", unit="fr", ncols=70):
+        print(f"  Frames: {n_t}  |  Channels: {n_c}  |  Using channel: {ch}", flush=True)
+        # Read first frame to discover H×W, then pre-allocate the full array.
+        # This avoids building a Python list + np.stack which doubles peak RAM.
+        img0, _ = czi.read_image(T=0, C=ch)
+        f0 = img0.squeeze()
+        if f0.ndim > 2:
+            f0 = f0[0]
+        H, W  = f0.shape
+        stack = np.empty((n_t, H, W), dtype=np.float32)
+        stack[0] = f0.astype(np.float32)
+        for t in range(1, n_t):
             img, _ = czi.read_image(T=t, C=ch)
             frame  = img.squeeze()
             if frame.ndim > 2:
                 frame = frame[0]
-            frames.append(frame.astype(np.float32))
-        stack = np.stack(frames)
+            stack[t] = frame.astype(np.float32)
+            if t % 1000 == 0:
+                print(f"  Loading: {t}/{n_t} frames...", flush=True)
+        print(f"  Shape: {stack.shape}  (T x Y x X)", flush=True)
         return stack, meta["pixel_size_um"], meta["frame_interval_s"]
 
     if HAS_CZIFILE:
+        # Use subblock-by-subblock reading — czi.asarray() loads the whole
+        # file at once and hangs for large (16K-frame) datasets.
         with czifile.CziFile(path) as czi:
             xml  = czi.metadata()
             meta = _parse_czi_metadata(xml)
-            data = czi.asarray().astype(np.float32)
-        data = data.squeeze()
-        if   data.ndim == 5: data = data[:, channel, 0, :, :]
-        elif data.ndim == 4: data = data[:, channel, :, :]
-        elif data.ndim == 2: data = data[np.newaxis]
-        print(f"  Shape: {data.shape}  (T x Y x X)")
+            entries = list(czi.subblock_directory)
+            if not entries:
+                raise RuntimeError(
+                    "No subblocks found in CZI file. "
+                    "Install aicspylibczi: pip install aicspylibczi")
+            n      = len(entries)
+            print(f"  Subblocks: {n}  |  Using channel: {channel}", flush=True)
+            frames = []
+            for i, entry in enumerate(entries):
+                try:
+                    seg = entry.data_segment()
+                    arr = np.asarray(seg.data(raw=False),
+                                     dtype=np.float32).squeeze()
+                    if arr.size == 0:
+                        continue
+                    while arr.ndim > 2:
+                        arr = arr[0]
+                    if arr.ndim == 2:
+                        frames.append(arr)
+                except Exception:
+                    continue
+                if i % 1000 == 0 and i > 0:
+                    print(f"  Loading: {i}/{n} subblocks...", flush=True)
+            if not frames:
+                raise RuntimeError(
+                    "Could not read any frames from CZI file.\n"
+                    "Install aicspylibczi: pip install aicspylibczi")
+            data = np.stack(frames)
+        print(f"  Shape: {data.shape}  (T x Y x X)", flush=True)
         return data, meta["pixel_size_um"], meta["frame_interval_s"]
 
     raise RuntimeError(
