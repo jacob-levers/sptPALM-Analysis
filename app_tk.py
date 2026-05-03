@@ -33,8 +33,12 @@ def _bootstrap():
         "joblib", "tqdm", "imageio",
     ]
 
-    missing = [pkg for mod, pkg in _REQUIRED
-               if not __import__("importlib").util.find_spec(mod)]
+    missing = []
+    for _mod, _pkg in _REQUIRED:
+        try:
+            __import__(_mod)
+        except ImportError:
+            missing.append(_pkg)
     if not missing:
         return  # All packages present — proceed normally
 
