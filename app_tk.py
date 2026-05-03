@@ -2526,4 +2526,5 @@ def main():
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()   # must be first — prevents double-window on PyInstaller + spawn
     main()

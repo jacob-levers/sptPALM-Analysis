@@ -183,15 +183,31 @@ def load_projection_fast(path, channel=0, max_frames=100):
                 frames.append(frame.astype(np.float32))
             proj = np.stack(frames).mean(axis=0)
         elif HAS_CZIFILE:
-            # czifile has no random-access API — load all, then sample
+            # Use czifile subblock directory for per-frame access (avoids
+            # loading the entire stack into RAM)
             with czifile.CziFile(path) as czi:
-                data = czi.asarray().astype(np.float32)
-            data = data.squeeze()
-            if   data.ndim == 5: data = data[:, channel, 0, :, :]
-            elif data.ndim == 4: data = data[:, channel, :, :]
-            elif data.ndim == 2: data = data[np.newaxis]
-            step = max(1, len(data) // max_frames)
-            proj = data[::step].mean(axis=0)
+                try:
+                    entries = list(czi.subblock_directory)
+                    n       = len(entries)
+                    step    = max(1, n // max_frames)
+                    frames  = []
+                    for entry in entries[::step]:
+                        seg  = entry.data_segment()
+                        arr  = np.asarray(seg.data(raw=False),
+                                          dtype=np.float32).squeeze()
+                        if arr.ndim == 2:
+                            frames.append(arr)
+                    if not frames:
+                        raise ValueError("no frames decoded")
+                    proj = np.stack(frames).mean(axis=0)
+                except Exception:
+                    # Last resort: full load (slow for very large files)
+                    data = czi.asarray().astype(np.float32).squeeze()
+                    if   data.ndim == 5: data = data[:, channel, 0, :, :]
+                    elif data.ndim == 4: data = data[:, channel, :, :]
+                    elif data.ndim == 2: data = data[np.newaxis]
+                    step = max(1, len(data) // max_frames)
+                    proj = data[::step].mean(axis=0)
         else:
             raise RuntimeError("Cannot read CZI: install aicspylibczi or czifile.")
 
