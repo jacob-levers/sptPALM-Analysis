@@ -1780,7 +1780,10 @@ class SPTPalmApp(tk.Tk):
                        "Saved to figures/panels/ inside the output folder.")
         # Panel selector grid
         self._panel_sel_frame = tk.Frame(f, bg=CARD)
-        self._panel_sel_frame.pack(fill="x", padx=10, pady=(0, 6))
+        _psel_r = getattr(f, "_row_count", 0)
+        f._row_count = _psel_r + 1
+        self._panel_sel_frame.grid(row=_psel_r, column=0, columnspan=2,
+                                   sticky="ew", padx=10, pady=(0, 6))
         for i, ltr in enumerate("ABCDEFGHIJKLMN"):
             r, c = divmod(i, 7)
             ttk.Checkbutton(self._panel_sel_frame, text=ltr,
