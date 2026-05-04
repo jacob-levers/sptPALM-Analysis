@@ -2244,19 +2244,23 @@ class SPTPalmApp(tk.Tk):
                  font=FM(9), wraplength=680, justify="left",
                  anchor="w").pack(anchor="w", padx=20, pady=(0, 4))
 
+        fig_dir2  = os.path.join(out_dir, "figures")
+        data_dir2 = os.path.join(out_dir, "data")
+
         _section_label(p3, "Files")
         file_info = [
-            (f"{stem}_sptpalm_figure.png",    "Analysis figure (6 panels + JDD)"),
-            (f"{stem}_diffusion_summary.csv", "Per-trajectory D, α, motion class"),
-            (f"{stem}_trajectories.csv",      "Full trajectory table"),
-            (f"{stem}_localisations.csv",     "Raw localisations"),
-            (f"{stem}_ensemble_msd.csv",      "Ensemble MSD curve"),
+            (f"{stem}_sptpalm_figure.png",    "Analysis figure",              fig_dir2),
+            (f"{stem}_sptpalm_figure.pdf",    "Analysis figure (PDF/vector)", fig_dir2),
+            (f"{stem}_diffusion_summary.csv", "Per-trajectory D, α, motion",  data_dir2),
+            (f"{stem}_trajectories.csv",      "Full trajectory table",         data_dir2),
+            (f"{stem}_localisations.csv",     "Raw localisations",             data_dir2),
+            (f"{stem}_ensemble_msd.csv",      "Ensemble MSD curve",            data_dir2),
         ]
         if roi_path and os.path.exists(roi_path):
-            file_info.append((os.path.basename(roi_path), "ROI mask preview"))
+            file_info.append((os.path.basename(roi_path), "ROI mask preview", data_dir2))
 
-        for fname, desc in file_info:
-            fpath  = os.path.join(out_dir, fname)
+        for fname, desc, fdir in file_info:
+            fpath  = os.path.join(fdir, fname)
             exists = os.path.exists(fpath)
             outer_r, inner_r = _bordered_card(p3)
             outer_r.pack(fill="x", padx=20, pady=3)
@@ -2439,8 +2443,11 @@ class SPTPalmApp(tk.Tk):
                 _check_stop()
                 fpath = os.path.join(folder, fname)
                 stem  = os.path.splitext(fname)[0]
-                out_dir = os.path.join(folder, "batch_results", stem)
-                os.makedirs(out_dir, exist_ok=True)
+                out_dir  = os.path.join(folder, "batch_results", stem)
+                fig_dir  = os.path.join(out_dir, "figures")
+                data_dir = os.path.join(out_dir, "data")
+                os.makedirs(fig_dir,  exist_ok=True)
+                os.makedirs(data_dir, exist_ok=True)
 
                 pct_base = int(i / n * 90)
                 _emit_progress(f"[{i+1}/{n}]  {fname}", pct_base)
@@ -2467,7 +2474,7 @@ class SPTPalmApp(tk.Tk):
                             precomputed_mean_proj=raw_mean_norm,
                             threshold=thresh, mode="mean",
                             threshold_method=roi_auto_method_raw if roi_auto else "auto",
-                            save_path=os.path.join(out_dir, f"{stem}_roi_mask.png"))
+                            save_path=os.path.join(data_dir, f"{stem}_roi_mask.png"))
 
                     minmass_arg = None if self.v_auto_mm.get() else self.v_minmass.get()
                     locs, _, _ = preprocess_and_localise_adaptive(
@@ -2485,7 +2492,7 @@ class SPTPalmApp(tk.Tk):
                         locs, drift_df = correct_drift(
                             locs, n_seg_frames=self.v_drift_segment.get())
                         drift_df.to_csv(
-                            os.path.join(out_dir, f"{stem}_drift.csv"), index=False)
+                            os.path.join(data_dir, f"{stem}_drift.csv"), index=False)
 
                     max_tl = self.v_max_track_len.get()
                     tracks = link_trajectories(
@@ -2511,17 +2518,24 @@ class SPTPalmApp(tk.Tk):
                     jdd = compute_jdd(tracks, px, fi,
                                       n_components=self.v_jdd_components.get())
 
+                    b_ta = compute_turning_angles(tracks)
+                    b_mf = compute_mobile_fraction_over_time(
+                        tracks, diff_df, fi,
+                        window_frames=max(50, int(0.1 * tracks["frame"].max()))
+                        if len(tracks) else 100)
+
                     # Save CSVs
                     for df, suf in [(locs, "localisations"),
                                     (tracks, "trajectories"),
                                     (diff_df, "diffusion_summary")]:
-                        df.to_csv(os.path.join(out_dir, f"{stem}_{suf}.csv"), index=False)
+                        df.to_csv(os.path.join(data_dir, f"{stem}_{suf}.csv"), index=False)
 
-                    fig_path = os.path.join(out_dir, f"{stem}_sptpalm_figure.png")
+                    fig_path = os.path.join(fig_dir, f"{stem}_sptpalm_figure.png")
                     make_figure(proj_sample, tracks, imsd_df, emsd_df, diff_df,
                                 px, fi, fig_path, roi_mask=roi_mask,
                                 fig_theme=self.v_fig_theme.get(),
-                                proj_cmap=self.v_proj_cmap.get(), jdd=jdd)
+                                proj_cmap=self.v_proj_cmap.get(), jdd=jdd,
+                                turning_angles=b_ta, mobile_frac_df=b_mf)
 
                     mc_  = diff_df["motion"].value_counts()
                     row  = {
@@ -2556,14 +2570,64 @@ class SPTPalmApp(tk.Tk):
                     rows.append({"file": fname, "status": f"ERROR: {exc}"})
 
             # Save batch summary
+            batch_root     = os.path.join(folder, "batch_results")
+            batch_data_dir = os.path.join(batch_root, "data")
+            batch_fig_dir  = os.path.join(batch_root, "figures")
+            os.makedirs(batch_data_dir, exist_ok=True)
+            os.makedirs(batch_fig_dir,  exist_ok=True)
             if rows:
                 import pandas as _pd
-                summary_path = os.path.join(folder, "batch_results", "batch_summary.csv")
+                summary_path = os.path.join(batch_data_dir, "batch_summary.csv")
                 _pd.DataFrame(rows).to_csv(summary_path, index=False)
                 _emit_log(f"\nBatch summary -> {summary_path}")
 
+            # Batch summary comparison plot
+            try:
+                ok_rows = [r for r in rows if r.get("status") == "OK"]
+                if len(ok_rows) >= 2:
+                    import matplotlib.pyplot as _bplt
+                    _bplt.rcParams.update({"font.family": "sans-serif"})
+                    names    = [os.path.splitext(r["file"])[0] for r in ok_rows]
+                    mean_Ds  = [r.get("mean_D", 0) for r in ok_rows]
+                    mob_pcts = [r.get("brownian_pct", 0) + r.get("directed_pct", 0)
+                                for r in ok_rows]
+                    x = np.arange(len(names))
+                    fig_b, ax1 = _bplt.subplots(figsize=(max(6, len(names) * 1.2), 5))
+                    fig_b.patch.set_facecolor("#161b22")
+                    ax1.set_facecolor("#161b22")
+                    ax1.bar(x, mean_Ds, color="#58a6ff", alpha=0.8, label="Mean D (µm²/s)")
+                    ax1.set_xticks(x)
+                    ax1.set_xticklabels(names, rotation=30, ha="right",
+                                        fontsize=9, color="#e6edf3")
+                    ax1.set_ylabel("Mean D  (µm²/s)", color="#e6edf3", fontsize=10)
+                    ax1.tick_params(axis="y", colors="#e6edf3")
+                    for sp in ax1.spines.values(): sp.set_edgecolor("#30363d")
+                    ax2 = ax1.twinx()
+                    ax2.plot(x, mob_pcts, "o-", color="#3fb950", lw=2, ms=6,
+                             label="Mobile %")
+                    ax2.set_ylabel("Mobile fraction (%)", color="#3fb950", fontsize=10)
+                    ax2.tick_params(axis="y", colors="#3fb950")
+                    ax2.set_ylim(0, 100)
+                    h1, l1 = ax1.get_legend_handles_labels()
+                    h2, l2 = ax2.get_legend_handles_labels()
+                    ax1.legend(h1 + h2, l1 + l2, fontsize=8, facecolor="#161b22",
+                               edgecolor="#30363d", labelcolor="#e6edf3",
+                               loc="upper right")
+                    _bplt.title("Batch Summary", color="#e6edf3", fontsize=12)
+                    _bplt.tight_layout()
+                    _bplt.savefig(os.path.join(batch_fig_dir, "batch_summary_plot.png"),
+                                  dpi=150, bbox_inches="tight",
+                                  facecolor=fig_b.get_facecolor())
+                    _bplt.savefig(os.path.join(batch_fig_dir, "batch_summary_plot.pdf"),
+                                  bbox_inches="tight",
+                                  facecolor=fig_b.get_facecolor())
+                    _bplt.close(fig_b)
+                    _emit_log(f"Batch summary plot -> {batch_fig_dir}")
+            except Exception as _be:
+                _emit_log(f"  Batch plot error: {_be}")
+
             _emit_progress(f"Batch complete — {len(files)} files", 100)
-            self._q.put(("batch_done", {"out_dir": os.path.join(folder, "batch_results")}))
+            self._q.put(("batch_done", {"out_dir": batch_root}))
 
         except Exception:
             self._q.put(("stopped", None))
@@ -2697,6 +2761,7 @@ class SPTPalmApp(tk.Tk):
             from sptpalm_analysis import (
                 load_file, preprocess_and_localise_adaptive,
                 link_trajectories, compute_msd_and_fit, compute_jdd,
+                compute_turning_angles, compute_mobile_fraction_over_time,
                 build_roi_mask, apply_roi_mask, make_figure,
                 correct_drift, _Cancelled,
             )
@@ -2706,6 +2771,10 @@ class SPTPalmApp(tk.Tk):
             out_dir = (self.v_outdir.get().strip()
                        or os.path.dirname(os.path.abspath(fpath)))
             os.makedirs(out_dir, exist_ok=True)
+            fig_dir  = os.path.join(out_dir, "figures")
+            data_dir = os.path.join(out_dir, "data")
+            os.makedirs(fig_dir,  exist_ok=True)
+            os.makedirs(data_dir, exist_ok=True)
 
             # Independent overrides
             px_arg = self.v_pixel_size.get()     if self.v_override_px.get() else None
@@ -2770,7 +2839,7 @@ class SPTPalmApp(tk.Tk):
             if roi_draw and self._drawn_roi_mask is not None:
                 _emit_progress("Applying drawn ROI…", 12)
                 roi_mask = self._drawn_roi_mask
-                roi_path = os.path.join(out_dir, f"{stem}_roi_mask.png")
+                roi_path = os.path.join(data_dir, f"{stem}_roi_mask.png")
                 try:
                     from PIL import Image as _PILImg
                     _PILImg.fromarray((roi_mask * 255).astype("uint8")).save(roi_path)
@@ -2802,7 +2871,7 @@ class SPTPalmApp(tk.Tk):
                 raw_mean_norm = (raw_mean - mn) / (mx - mn) if mx > mn else raw_mean
                 del raw_mean; gc.collect()
 
-                roi_path = os.path.join(out_dir, f"{stem}_roi_mask.png")
+                roi_path = os.path.join(data_dir, f"{stem}_roi_mask.png")
                 thresh   = self.v_roi_threshold.get() if roi_manual else None
                 roi_mask = build_roi_mask(
                     precomputed_mean_proj=raw_mean_norm,
@@ -2866,7 +2935,7 @@ class SPTPalmApp(tk.Tk):
                     locs, n_seg_frames=self.v_drift_segment.get())
                 # Save drift trajectory alongside other outputs
                 drift_df.to_csv(
-                    os.path.join(out_dir, f"{stem}_drift.csv"), index=False)
+                    os.path.join(data_dir, f"{stem}_drift.csv"), index=False)
                 # Preview: drift trajectory plot
                 try:
                     t_arr = drift_df["frame"].values * fi
@@ -2998,16 +3067,23 @@ class SPTPalmApp(tk.Tk):
                 _emit_log("  JDD: too few jumps to fit.")
                 jdd = None
 
+            turning_angles = compute_turning_angles(tracks)
+            mobile_frac_df = compute_mobile_fraction_over_time(
+                tracks, diff_df, fi,
+                window_frames=max(50, int(0.1 * tracks["frame"].max())) if len(tracks) else 100)
+
             _check_stop()
 
             # ── 6. Save ───────────────────────────────────────────────────────
             _emit_progress("Saving outputs…", 85)
-            fig_path = os.path.join(out_dir, f"{stem}_sptpalm_figure.png")
+            fig_path = os.path.join(fig_dir, f"{stem}_sptpalm_figure.png")
             make_figure(proj_sample, tracks, imsd_df, emsd_df, diff_df,
                         px, fi, fig_path, roi_mask=roi_mask,
                         fig_theme=self.v_fig_theme.get(),
                         proj_cmap=self.v_proj_cmap.get(),
-                        jdd=jdd)
+                        jdd=jdd,
+                        turning_angles=turning_angles,
+                        mobile_frac_df=mobile_frac_df)
             del proj_sample; gc.collect()
 
             # Preview: the final saved figure
@@ -3025,14 +3101,14 @@ class SPTPalmApp(tk.Tk):
                 pass
 
             locs.to_csv(
-                os.path.join(out_dir, f"{stem}_localisations.csv"), index=False)
+                os.path.join(data_dir, f"{stem}_localisations.csv"), index=False)
             tracks.to_csv(
-                os.path.join(out_dir, f"{stem}_trajectories.csv"), index=False)
+                os.path.join(data_dir, f"{stem}_trajectories.csv"), index=False)
             diff_df.to_csv(
-                os.path.join(out_dir, f"{stem}_diffusion_summary.csv"), index=False)
+                os.path.join(data_dir, f"{stem}_diffusion_summary.csv"), index=False)
             (emsd_df.to_frame("msd_um2")
                     .reset_index(names="lag_frame")
-                    .to_csv(os.path.join(out_dir, f"{stem}_ensemble_msd.csv"),
+                    .to_csv(os.path.join(data_dir, f"{stem}_ensemble_msd.csv"),
                             index=False))
 
             _emit_progress("Complete!", 100)

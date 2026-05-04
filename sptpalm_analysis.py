@@ -1626,6 +1626,73 @@ def compute_jdd(tracks, pixel_size_um, frame_interval_s, n_components=2):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  TURNING ANGLES
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compute_turning_angles(tracks):
+    """
+    For each track with ≥3 points, compute step-to-step turning angles in degrees.
+
+    Returns a flat np.array of all angles across all tracks.
+    """
+    all_angles = []
+    for pid, grp in tracks.groupby("particle"):
+        grp = grp.sort_values("frame")
+        xy  = grp[["x", "y"]].values
+        if len(xy) < 3:
+            continue
+        v1 = np.diff(xy, axis=0)[:-1]   # shape (n-2, 2)
+        v2 = np.diff(xy, axis=0)[1:]    # shape (n-2, 2)
+        dot   = np.sum(v1 * v2, axis=1)
+        norm1 = np.linalg.norm(v1, axis=1)
+        norm2 = np.linalg.norm(v2, axis=1)
+        cos_a = dot / (norm1 * norm2 + 1e-12)
+        cos_a = np.clip(cos_a, -1.0, 1.0)
+        angles = np.degrees(np.arccos(cos_a))
+        all_angles.append(angles)
+    if all_angles:
+        return np.concatenate(all_angles)
+    return np.array([])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MOBILE FRACTION OVER TIME
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compute_mobile_fraction_over_time(tracks, diff_df, frame_interval,
+                                       window_frames=100):
+    """
+    Compute mobile fraction in sliding windows of `window_frames` frames.
+
+    Returns DataFrame with columns: time_s, mobile_fraction, n_tracks.
+    Only windows with ≥5 tracks are included.
+    """
+    if len(tracks) == 0 or len(diff_df) == 0:
+        return pd.DataFrame(columns=["time_s", "mobile_fraction", "n_tracks"])
+
+    track_times = tracks.groupby("particle")["frame"].mean().reset_index()
+    track_times.columns = ["particle", "mean_frame"]
+    merged = track_times.merge(diff_df[["particle", "motion"]], on="particle", how="inner")
+
+    max_frame = int(tracks["frame"].max())
+    windows   = range(0, max_frame, window_frames)
+    rows = []
+    for w in windows:
+        sel = merged[(merged["mean_frame"] >= w) &
+                     (merged["mean_frame"] < w + window_frames)]
+        total = len(sel)
+        if total < 5:
+            continue
+        mobile = sel["motion"].isin(["Free diffusion", "Directed", "Brownian"]).sum()
+        rows.append({
+            "time_s":          (w + window_frames / 2) * frame_interval,
+            "mobile_fraction": mobile / total,
+            "n_tracks":        total,
+        })
+    return pd.DataFrame(rows)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  FIGURE
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1645,7 +1712,8 @@ def _draw_track(grp, color, ax, lw=0.8, alpha=0.6):
 
 def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
                 pixel_size, frame_interval, output_path, roi_mask=None,
-                fig_theme="Dark", proj_cmap="Inferno", jdd=None):
+                fig_theme="Dark", proj_cmap="Inferno", jdd=None,
+                turning_angles=None, mobile_frac_df=None):
     print("  Rendering figure ...")
 
     # ── Theme palettes ─────────────────────────────────────────────────────────
@@ -1692,10 +1760,9 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
         "font.family":      _font})
 
     _has_jdd = jdd is not None
-    # Always 3 rows: row 2 = density heatmap (col 0) + JDD (cols 1-2, optional)
-    fig = plt.figure(figsize=(20, 20), facecolor=BG)
-    gs  = GridSpec(3, 3, figure=fig, hspace=0.40, wspace=0.32,
-                   left=0.06, right=0.97, top=0.91, bottom=0.06)
+    fig = plt.figure(figsize=(20, 26), facecolor=BG)
+    gs  = GridSpec(4, 3, figure=fig, hspace=0.42, wspace=0.32,
+                   left=0.06, right=0.97, top=0.93, bottom=0.05)
 
     def sax(ax, ltr, ttl):
         ax.set_facecolor(PNL)
@@ -1729,7 +1796,7 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
                 color="#58a6ff", fontsize=8, va="bottom")
     sax(ax,"A","Max Projection")
 
-    # B — trajectory map (subsample if very many tracks)
+    # B — trajectory map coloured by motion type (subsample if very many tracks)
     ax = fig.add_subplot(gs[0,1])
     ax.imshow(proj_eq,cmap=_traj_bg,origin="lower",aspect="equal",alpha=0.35)
     all_pids  = list(tracks["particle"].unique())
@@ -1750,8 +1817,40 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
     shown = f"{n_drawn:,}" + (f" of {len(all_pids):,}" if n_drawn < len(all_pids) else "")
     sax(ax,"B",f"Trajectories  (n={shown})")
 
-    # C — MSD curves
+    # C — trajectories coloured by D value
     ax = fig.add_subplot(gs[0,2])
+    ax.imshow(proj_eq, cmap=_traj_bg, origin="lower", aspect="equal", alpha=0.35)
+    d_map = diff_df.set_index("particle")["D"].to_dict()
+    d_vals_valid = [v for v in d_map.values() if v is not None and np.isfinite(v) and v > 0]
+    if d_vals_valid:
+        log_d_vals = np.log10(d_vals_valid)
+        _p5  = np.percentile(log_d_vals, 5)
+        _p95 = np.percentile(log_d_vals, 95)
+        _cmap_d = plt.cm.plasma
+        _norm_d = plt.Normalize(vmin=_p5, vmax=_p95)
+        _sm_d   = plt.cm.ScalarMappable(cmap=_cmap_d, norm=_norm_d)
+        _sm_d.set_array([])
+        draw_pids_c = set(np.random.default_rng(43).choice(
+            all_pids, min(2000, len(all_pids)), replace=False))
+        for pid, grp in (tracks[tracks["particle"].isin(draw_pids_c)]
+                         .reset_index(drop=True).sort_values("frame")
+                         .groupby("particle")):
+            D_val = d_map.get(pid)
+            if D_val is not None and np.isfinite(D_val) and D_val > 0:
+                col = _cmap_d(_norm_d(np.log10(D_val)))
+            else:
+                col = "#555555"
+            _draw_track(grp, col, ax)
+        cb = plt.colorbar(_sm_d, ax=ax, fraction=0.046, pad=0.04)
+        cb.set_label("log10(D)  [µm²/s]", fontsize=8, color=TXT)
+        cb.ax.yaxis.set_tick_params(color=TXT)
+        plt.setp(cb.ax.yaxis.get_ticklabels(), color=TXT, fontsize=7)
+    ax.set_xlim(0, proj.shape[1]); ax.set_ylim(0, proj.shape[0])
+    ax.set_xlabel("X (px)", fontsize=9); ax.set_ylabel("Y (px)", fontsize=9)
+    sax(ax, "C", "Trajectories by D value")
+
+    # D — MSD curves
+    ax = fig.add_subplot(gs[1,0])
     lt  = emsd_df.index.values * frame_interval
     rng = np.random.default_rng(42)
     for pid in rng.choice(list(imsd_df.columns), min(200,len(imsd_df.columns)), replace=False):
@@ -1775,10 +1874,10 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
     ax.set_xscale("log"); ax.set_yscale("log")
     ax.grid(True,which="both",ls=":",alpha=0.3)
     ax.legend(fontsize=8,framealpha=0.6,facecolor=PNL,edgecolor=GRD,labelcolor=TXT)
-    sax(ax,"C","MSD Curves")
+    sax(ax,"D","MSD Curves")
 
-    # D — D distribution
-    ax = fig.add_subplot(gs[1,0])
+    # E — D distribution
+    ax = fig.add_subplot(gs[1,1])
     dv = diff_df["D"].dropna()
     dv = dv[(dv>0) & (dv<dv.quantile(0.995))]
     if len(dv) > 5:
@@ -1800,10 +1899,10 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
         ax.set_ylabel("Count",fontsize=9)
         ax.legend(fontsize=8,framealpha=0.6,facecolor=PNL,edgecolor=GRD,labelcolor=TXT)
     ax.grid(True,ls=":",alpha=0.3)
-    sax(ax,"D","Diffusion Coefficient Distribution")
+    sax(ax,"E","Diffusion Coefficient Distribution")
 
-    # E — pie chart
-    ax = fig.add_subplot(gs[1,1])
+    # F — pie chart
+    ax = fig.add_subplot(gs[1,2])
     mc_ = diff_df["motion"].value_counts()
     lbl = [m for m in MORD if m in mc_]
     sz  = [mc_[m] for m in lbl]
@@ -1812,10 +1911,10 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
                       textprops={"color":TXT,"fontsize":9},
                       wedgeprops={"edgecolor":PNL,"linewidth":2})
     for at in ats: at.set_fontsize(8); at.set_color(_pie_text)
-    sax(ax,"E","Motion Classification")
+    sax(ax,"F","Motion Classification")
 
-    # F — alpha distribution
-    ax = fig.add_subplot(gs[1,2])
+    # G — alpha distribution
+    ax = fig.add_subplot(gs[2,0])
     av = diff_df["alpha"].dropna()
     av = av[(av>-1) & (av<4)]
     if len(av) > 5:
@@ -1831,10 +1930,10 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
         ax.set_ylabel("Count",fontsize=9)
         ax.legend(fontsize=7,framealpha=0.6,facecolor=PNL,edgecolor=GRD,labelcolor=TXT)
     ax.grid(True,ls=":",alpha=0.3)
-    sax(ax,"F","Anomalous Exponent Alpha Distribution")
+    sax(ax,"G","Anomalous Exponent Alpha Distribution")
 
-    # G — Position Density Heatmap (always shown)
-    ax = fig.add_subplot(gs[2, 0])
+    # H — Position Density Heatmap
+    ax = fig.add_subplot(gs[2, 1])
     try:
         x_um = tracks["x"].values * pixel_size
         y_um = tracks["y"].values * pixel_size
@@ -1855,12 +1954,47 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
                 colors=["#58a6ff"], linewidths=[1.0], alpha=0.7)
     except Exception:
         pass
-    sax(ax, "G", "Position Density Map")
+    sax(ax, "H", "Position Density Map")
 
-    # H — Jump Distance Distribution (when JDD was computed)
+    # I — Turning Angle Distribution
+    ax = fig.add_subplot(gs[2, 2])
+    if turning_angles is None or len(turning_angles) < 10:
+        ax.text(0.5, 0.5, "Insufficient data", transform=ax.transAxes,
+                ha="center", va="center", color=TXT, fontsize=12)
+    else:
+        _ta_bins = np.linspace(0, 180, 37)
+        ax.hist(turning_angles, bins=_ta_bins, color=ACC, alpha=0.8, edgecolor="none")
+        ax.axvline(90, color=GRD, lw=1.5, ls="--", label="90°")
+        ax.text(45,  ax.get_ylim()[1] * 0.85 if ax.get_ylim()[1] > 0 else 1,
+                "← Confined", ha="center", color="#f78166", fontsize=9)
+        ax.text(135, ax.get_ylim()[1] * 0.85 if ax.get_ylim()[1] > 0 else 1,
+                "Directed →", ha="center", color="#3fb950", fontsize=9)
+        ax.set_xlabel("Turning angle (°)", fontsize=9)
+        ax.set_ylabel("Count", fontsize=9)
+        ax.legend(fontsize=8, framealpha=0.6, facecolor=PNL, edgecolor=GRD, labelcolor=TXT)
+        ax.grid(True, ls=":", alpha=0.3)
+    sax(ax, "I", "Turning Angle Distribution")
+
+    # J — Mobile Fraction Over Time
+    ax = fig.add_subplot(gs[3, 0])
+    if mobile_frac_df is None or len(mobile_frac_df) < 2:
+        ax.text(0.5, 0.5, "Insufficient data", transform=ax.transAxes,
+                ha="center", va="center", color=TXT, fontsize=12)
+    else:
+        ts  = mobile_frac_df["time_s"].values
+        mf  = mobile_frac_df["mobile_fraction"].values * 100
+        ax.plot(ts, mf, "o-", color=ACC, lw=2, ms=5)
+        ax.fill_between(ts, 0, mf, alpha=0.2, color=ACC)
+        ax.set_ylim(0, 100)
+        ax.set_xlabel("Time (s)", fontsize=9)
+        ax.set_ylabel("Mobile fraction (%)", fontsize=9)
+        ax.grid(True, ls=":", alpha=0.3)
+    sax(ax, "J", "Mobile Fraction Over Time")
+
+    # K — Jump Distance Distribution (spans cols 1–2)
+    ax = fig.add_subplot(gs[3, 1:])
     if _has_jdd:
         _jdd_colors = ["#58a6ff", "#f78166", "#3fb950", "#d2a8ff"]
-        ax = fig.add_subplot(gs[2, 1:])   # cols 1 and 2
 
         r_max_plot = np.percentile(jdd["jumps"], 99.5)
         bins = np.linspace(0, r_max_plot, 60)
@@ -1886,10 +2020,14 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
         ax.legend(fontsize=8, framealpha=0.6,
                   facecolor=PNL, edgecolor=GRD, labelcolor=TXT,
                   loc="upper right")
-        sax(ax, "H",
+        sax(ax, "K",
             f"Jump Distance Distribution  "
             f"({jdd['n_components']}-population fit  |  "
             f"{jdd['n_jumps']:,} jumps)")
+    else:
+        ax.text(0.5, 0.5, "JDD not computed", transform=ax.transAxes,
+                ha="center", va="center", color=TXT, fontsize=12)
+        sax(ax, "K", "Jump Distance Distribution")
 
     md = diff_df["D"].dropna().median()
     ma = diff_df["alpha"].dropna().median()
@@ -1898,10 +2036,16 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
         f"Median D = {md:.4f} um2/s  |  Median alpha = {ma:.2f}",
         fontsize=13,color=TXT,y=0.97,fontweight="bold")
 
-    plt.savefig(output_path,dpi=180,bbox_inches="tight",
+    plt.savefig(output_path, dpi=180, bbox_inches="tight",
                 facecolor=fig.get_facecolor())
-    plt.close(fig)
     print(f"  Figure -> {output_path}")
+
+    pdf_path = os.path.splitext(output_path)[0] + ".pdf"
+    plt.savefig(pdf_path, dpi=150, bbox_inches="tight",
+                facecolor=fig.get_facecolor())
+    print(f"  Figure (PDF) -> {pdf_path}")
+
+    plt.close(fig)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2080,7 +2224,8 @@ def main():
     fig_path = os.path.join(out_dir, f"{stem}_sptpalm_figure.png")
     make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
                 pixel_size, frame_interval, fig_path,
-                roi_mask=roi_mask, jdd=jdd)
+                roi_mask=roi_mask, jdd=jdd,
+                turning_angles=None, mobile_frac_df=None)
 
     # Summary
     total = time.perf_counter() - t_start
