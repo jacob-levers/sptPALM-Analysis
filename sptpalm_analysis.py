@@ -67,6 +67,18 @@ import warnings
 import xml.etree.ElementTree as ET
 warnings.filterwarnings("ignore")
 
+# ── Prevent BLAS/OpenBLAS/MKL thread oversubscription ─────────────────────────
+# Scientific libraries (numpy, scipy, skimage) each spin up their own internal
+# threads (via OpenBLAS or MKL).  When joblib ALSO spawns N_CPUS Python threads
+# each calling numpy, you end up with N_CPUS² threads fighting for N_CPUS cores
+# — performance collapses, especially on Windows.  Setting these to "1" caps
+# internal BLAS parallelism so joblib's threads are the ones that scale linearly.
+# This must be done *before* numpy is imported to take full effect.
+for _blas_env in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
+                  "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+                  "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_blas_env, "1")
+
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -292,8 +304,22 @@ def _find_czi_series(path):
     return series if series else [path]
 
 
-def _load_single_czi(path, channel=0):
-    """Load a single CZI file and return (stack, pixel_size_um, frame_interval_s)."""
+class _Cancelled(Exception):
+    """Raised inside loaders when a stop_event fires mid-load."""
+    pass
+
+
+def _load_single_czi(path, channel=0, stop_event=None):
+    """Load a single CZI file and return (stack, pixel_size_um, frame_interval_s).
+
+    stop_event : threading.Event or None
+        If set, loading is aborted and _Cancelled is raised.
+        The check runs every 500 frames so the UI stays responsive.
+    """
+    def _chk():
+        if stop_event is not None and stop_event.is_set():
+            raise _Cancelled()
+
     if HAS_AICS:
         czi  = aicspylibczi.CziFile(path)
         xml  = czi.meta if hasattr(czi, "meta") else None
@@ -318,8 +344,9 @@ def _load_single_czi(path, channel=0):
             if frame.ndim > 2:
                 frame = frame[0]
             stack[t] = frame.astype(np.float32)
-            if t % 1000 == 0:
+            if t % 500 == 0:
                 print(f"  Loading: {t}/{n_t} frames...", flush=True)
+                _chk()
         return stack, meta["pixel_size_um"], meta["frame_interval_s"]
 
     if HAS_CZIFILE:
@@ -355,8 +382,9 @@ def _load_single_czi(path, channel=0):
                     if _first_err is None:
                         _first_err = exc
                     continue
-                if i % 1000 == 0 and i > 0:
+                if i % 500 == 0 and i > 0:
                     print(f"  Loading: {i}/{n} subblocks...", flush=True)
+                    _chk()
             if not frames:
                 hint = (f"\nFirst decode error: {_first_err}" if _first_err else "")
                 raise RuntimeError(
@@ -373,14 +401,14 @@ def _load_single_czi(path, channel=0):
         "Run:  pip install aicspylibczi imagecodecs")
 
 
-def load_czi(path, channel=0):
+def load_czi(path, channel=0, stop_event=None):
     # Detect multi-file series (Zeiss splits large datasets into companion files)
     series = _find_czi_series(path)
 
     if len(series) == 1:
         # Single file — straightforward load
         print(f"  Loading CZI: {path}")
-        stack, px_um, fi_s = _load_single_czi(path, channel)
+        stack, px_um, fi_s = _load_single_czi(path, channel, stop_event)
         print(f"  Shape: {stack.shape}  (T x Y x X)", flush=True)
         return stack, px_um, fi_s
 
@@ -392,7 +420,7 @@ def load_czi(path, channel=0):
     fi_s_out   = None
     for i, fpath in enumerate(series):
         print(f"  [{i+1}/{len(series)}] {os.path.basename(fpath)}", flush=True)
-        st, px, fi = _load_single_czi(fpath, channel)
+        st, px, fi = _load_single_czi(fpath, channel, stop_event)
         stacks.append(st)
         if i == 0:
             px_um_out = px
@@ -543,13 +571,25 @@ def _parse_ome_metadata(tif):
     return px_um, fi_s
 
 
-def load_tif(path):
+def load_tif(path, stop_event=None):
     if not HAS_TIFFFILE:
         raise RuntimeError("Run: pip install tifffile")
     print(f"  Loading TIF: {path}")
     with tifffile.TiffFile(path) as tif:
         px_um, fi_s = _parse_ome_metadata(tif)
-        stack = tif.asarray().astype(np.float32)
+        n_pages = len(tif.pages)
+        if stop_event is not None and n_pages > 500:
+            # Large file: load page-by-page so stop can interrupt mid-load
+            frames = []
+            for i, page in enumerate(tif.pages):
+                frames.append(page.asarray().astype(np.float32))
+                if i % 500 == 0 and i > 0:
+                    print(f"  Loading: {i}/{n_pages} frames...", flush=True)
+                    if stop_event.is_set():
+                        raise _Cancelled()
+            stack = np.stack(frames)
+        else:
+            stack = tif.asarray().astype(np.float32)
 
     if   stack.ndim == 2: stack = stack[np.newaxis]
     elif stack.ndim == 4:
@@ -564,10 +604,10 @@ def load_tif(path):
     return stack, px_um, fi_s
 
 
-def load_file(path, channel=0):
+def load_file(path, channel=0, stop_event=None):
     ext = os.path.splitext(path)[1].lower()
-    if   ext == ".czi":            return load_czi(path, channel)
-    elif ext in (".tif", ".tiff"): return load_tif(path)
+    if   ext == ".czi":            return load_czi(path, channel, stop_event)
+    elif ext in (".tif", ".tiff"): return load_tif(path, stop_event)
     else: sys.exit(f"ERROR: Unsupported file '{ext}'. Use .czi or .tif")
 
 

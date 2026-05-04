@@ -205,6 +205,15 @@ import traceback
 import multiprocessing
 import subprocess
 
+# Cap BLAS/OpenBLAS/MKL internal threads to 1 before numpy is imported.
+# Without this, each joblib worker thread also spawns N_CPUS BLAS threads
+# internally, causing N_CPUS² threads competing for N_CPUS cores — which
+# collapses multi-core performance (most visible on Windows).
+for _blas_env in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
+                  "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+                  "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_blas_env, "1")
+
 # Must be set before any other imports on macOS
 if sys.platform == "darwin":
     try:
@@ -397,6 +406,13 @@ def _apply_theme(root: tk.Tk) -> None:
         padding=(24, 12), font=F(14, "bold"), borderwidth=0)
     style.map("Run.TButton",
         background=[("active", "#3fb950"), ("disabled", BORDER)],
+        foreground=[("disabled", MUTED)])
+
+    style.configure("Stop.TButton",
+        background="#a12d2d", foreground="white",
+        padding=(24, 12), font=F(14, "bold"), borderwidth=0)
+    style.map("Stop.TButton",
+        background=[("active", "#c0392b"), ("disabled", BORDER)],
         foreground=[("disabled", MUTED)])
 
     style.configure("TButton",
@@ -1153,7 +1169,8 @@ class SPTPalmApp(tk.Tk):
     def _on_stop(self):
         """Signal the worker to stop. Button stays in place, text changes."""
         self._stop_event.set()
-        self._run_btn.configure(state="disabled", text="■  Stopping…")
+        self._run_btn.configure(state="disabled", text="■  Stopping…",
+                                style="Stop.TButton")
 
     def _toggle_params(self):
         if self._panel_visible:
@@ -1876,17 +1893,22 @@ class SPTPalmApp(tk.Tk):
         self._preview_canvas.after(100, self._preview_placeholder_text)
 
     def _preview_placeholder_text(self):
-        if self._preview_image_array is None and self._preview_canvas:
-            try:
-                w = self._preview_canvas.winfo_width()
-                h = self._preview_canvas.winfo_height()
-                self._preview_canvas.delete("all")
-                self._preview_canvas.create_text(
-                    w // 2, h // 2,
-                    text="first frame appears\nwhen localisation begins",
-                    fill=MUTED, font=F(11), justify="center")
-            except Exception:
-                pass
+        if self._preview_image_array is not None or not self._preview_canvas:
+            return
+        try:
+            w = self._preview_canvas.winfo_width()
+            h = self._preview_canvas.winfo_height()
+            if w <= 1 or h <= 1:
+                # Canvas not yet laid out — retry shortly
+                self._preview_canvas.after(120, self._preview_placeholder_text)
+                return
+            self._preview_canvas.delete("all")
+            self._preview_canvas.create_text(
+                w // 2, h // 2,
+                text="Live preview will appear\nonce localisation begins",
+                fill=MUTED, font=F(11), justify="center", anchor="center")
+        except Exception:
+            pass
 
     def _update_preview(self, rgb_array, label: str = ""):
         """Display a pre-rendered RGB numpy array on the preview canvas."""
@@ -2232,7 +2254,8 @@ class SPTPalmApp(tk.Tk):
         self._running = True
         self._analysis_start = time.monotonic()
         self._stop_event.clear()
-        self._run_btn.configure(text="■  Stop", command=self._on_stop)
+        self._run_btn.configure(text="■  Stop", command=self._on_stop,
+                                style="Stop.TButton")
         self._show_progress_panel()
         self._status_var.set("Analysis running…")
 
@@ -2338,7 +2361,7 @@ class SPTPalmApp(tk.Tk):
                 load_file, preprocess_and_localise_adaptive,
                 link_trajectories, compute_msd_and_fit,
                 build_roi_mask, apply_roi_mask, make_figure,
-                correct_drift,
+                correct_drift, _Cancelled,
             )
 
             fpath   = self.v_file.get()
@@ -2374,7 +2397,7 @@ class SPTPalmApp(tk.Tk):
             # ── 1. Load ───────────────────────────────────────────────────────
             _emit_progress("Loading file…", 5)
             stack, meta_px, meta_fi = load_file(
-                fpath, channel=self.v_channel.get())
+                fpath, channel=self.v_channel.get(), stop_event=stop)
             n_frames = len(stack)
             px = px_arg or meta_px or 0.104
             fi = fi_arg or meta_fi or 0.050
@@ -2646,7 +2669,7 @@ class SPTPalmApp(tk.Tk):
                 "roi_path": roi_path, "out_dir": out_dir, "stem": stem,
             }))
 
-        except _Stopped:
+        except (_Stopped, _Cancelled):
             self._q.put(("stopped", None))
         except Exception:
             self._q.put(("error", traceback.format_exc()))
@@ -2691,6 +2714,7 @@ class SPTPalmApp(tk.Tk):
         """Restore button to Run mode after analysis finishes or is stopped."""
         self._run_btn.configure(state="normal",
                                 text="▶  Run Analysis",
+                                style="Run.TButton",
                                 command=self._on_run)
 
     def _on_done(self, data: dict):
