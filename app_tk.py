@@ -1889,31 +1889,51 @@ class SPTPalmApp(tk.Tk):
         self._preview_canvas = tk.Canvas(parent, bg=BG, bd=0, highlightthickness=0)
         self._preview_canvas.pack(fill="both", expand=True)
         self._preview_canvas.bind("<Configure>", lambda e: self._draw_preview_image())
-        # Placeholder text until the first frame arrives
-        self._preview_canvas.after(100, self._preview_placeholder_text)
+        self._spinner_angle  = 0
+        self._spinner_id     = None   # after() handle so we can cancel it
+        self._preview_canvas.after(120, self._preview_spinner_tick)
 
-    def _preview_placeholder_text(self):
+    def _preview_spinner_tick(self):
+        """Animate a revolving arc placeholder until the first frame arrives."""
         if self._preview_image_array is not None or not self._preview_canvas:
-            return
+            return  # first frame arrived — stop spinning
         try:
             w = self._preview_canvas.winfo_width()
             h = self._preview_canvas.winfo_height()
             if w <= 1 or h <= 1:
-                # Canvas not yet laid out — retry shortly
-                self._preview_canvas.after(120, self._preview_placeholder_text)
+                self._spinner_id = self._preview_canvas.after(
+                    120, self._preview_spinner_tick)
                 return
-            self._preview_canvas.delete("all")
-            self._preview_canvas.create_text(
-                w // 2, h // 2,
-                text="Live preview will appear\nonce localisation begins",
-                fill=MUTED, font=F(11), justify="center", anchor="center")
+
+            cx, cy = w // 2, h // 2
+            r = 18
+
+            self._preview_canvas.delete("spinner")
+
+            self._preview_canvas.create_arc(
+                cx - r, cy - r, cx + r, cy + r,
+                start=self._spinner_angle, extent=260,
+                outline=ACC, width=3, style="arc",
+                tags="spinner")
+
+            self._spinner_angle = (self._spinner_angle + 12) % 360
         except Exception:
             pass
+
+        self._spinner_id = self._preview_canvas.after(
+            50, self._preview_spinner_tick)
 
     def _update_preview(self, rgb_array, label: str = ""):
         """Display a pre-rendered RGB numpy array on the preview canvas."""
         if self._preview_canvas is None:
             return
+        # Stop the spinner now that we have a real frame
+        if self._spinner_id is not None:
+            try:
+                self._preview_canvas.after_cancel(self._spinner_id)
+            except Exception:
+                pass
+            self._spinner_id = None
         self._preview_image_array = rgb_array
         self._draw_preview_image()
         if hasattr(self, "_preview_info"):
