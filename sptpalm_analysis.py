@@ -1500,6 +1500,120 @@ def compute_msd_and_fit(tracks, pixel_size, frame_interval,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  JUMP DISTANCE DISTRIBUTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compute_jdd(tracks, pixel_size_um, frame_interval_s, n_components=2):
+    """
+    Jump Distance Distribution (JDD) analysis.
+
+    Extracts single-frame displacements from all tracks, then fits the
+    empirical CDF to a mixture of 2D Brownian populations:
+
+        CDF(r) = 1 - Σᵢ fᵢ · exp(–r² / 4Dᵢ Δt)
+
+    Fitting the CDF (rather than histogram) avoids binning artefacts and
+    gives robust estimates even with short tracks — ideal for sptPALM where
+    many tracks have only 2–5 frames.
+
+    Parameters
+    ----------
+    n_components : 1, 2, or 3
+
+    Returns
+    -------
+    dict or None (if too few jumps to fit)
+    """
+    dt = frame_interval_s
+    jumps = []
+
+    for pid, grp in tracks.groupby("particle"):
+        grp    = grp.sort_values("frame")
+        frames = grp["frame"].values
+        x      = grp["x"].values * pixel_size_um
+        y      = grp["y"].values * pixel_size_um
+        for i in range(len(frames) - 1):
+            if frames[i + 1] - frames[i] == 1:   # consecutive frames only
+                dx = x[i + 1] - x[i]
+                dy = y[i + 1] - y[i]
+                jumps.append(np.sqrt(dx * dx + dy * dy))
+
+    jumps = np.asarray(jumps, dtype=np.float64)
+    if len(jumps) < 30:
+        return None
+
+    r_sorted = np.sort(jumps)
+    cdf_emp  = np.arange(1, len(r_sorted) + 1) / len(r_sorted)
+
+    # ── CDF model definitions ─────────────────────────────────────────────────
+    def _cdf1(r, D1):
+        return 1.0 - np.exp(-r ** 2 / (4 * D1 * dt))
+
+    def _cdf2(r, D1, D2, f1):
+        f2 = 1.0 - f1
+        return 1.0 - f1 * np.exp(-r**2 / (4*D1*dt)) \
+                   - f2 * np.exp(-r**2 / (4*D2*dt))
+
+    def _cdf3(r, D1, D2, D3, f1, f2):
+        f3 = 1.0 - f1 - f2
+        return (1.0 - f1 * np.exp(-r**2 / (4*D1*dt))
+                    - f2 * np.exp(-r**2 / (4*D2*dt))
+                    - f3 * np.exp(-r**2 / (4*D3*dt)))
+
+    configs = {
+        1: (_cdf1, [0.05],                   ([1e-6],        [100.0])),
+        2: (_cdf2, [0.005, 0.3, 0.4],        ([1e-6, 1e-5, 0.01], [10.0, 100.0, 0.99])),
+        3: (_cdf3, [0.003, 0.05, 0.5, 0.3, 0.35],
+                                              ([1e-6, 1e-5, 1e-4, 0.01, 0.01],
+                                               [1.0, 10.0, 100.0, 0.97, 0.97])),
+    }
+
+    model, p0, (lb, ub) = configs[n_components]
+    try:
+        popt, _ = curve_fit(model, r_sorted, cdf_emp,
+                            p0=p0, bounds=(lb, ub), maxfev=20000)
+    except Exception:
+        return None
+
+    # ── Extract sorted (D, fraction) pairs ───────────────────────────────────
+    if n_components == 1:
+        pairs = [(popt[0], 1.0)]
+    elif n_components == 2:
+        pairs = sorted([(popt[0], popt[2]), (popt[1], 1.0 - popt[2])])
+    else:
+        f3    = 1.0 - popt[3] - popt[4]
+        pairs = sorted([(popt[0], popt[3]), (popt[1], popt[4]), (popt[2], f3)])
+
+    D_values  = [p[0] for p in pairs]
+    fractions = [p[1] for p in pairs]
+
+    # ── PDF for plotting ──────────────────────────────────────────────────────
+    # Rayleigh-like: f_i(r) = r/(2DᵢΔt) · exp(–r²/4DᵢΔt)
+    r_range = np.linspace(0, np.percentile(jumps, 99.5), 500)
+
+    def _pdf_component(r, D):
+        return (r / (2 * D * dt)) * np.exp(-r**2 / (4 * D * dt))
+
+    pdfs = [frac * _pdf_component(r_range, D)
+            for D, frac in zip(D_values, fractions)]
+    pdf_total = np.sum(pdfs, axis=0)
+
+    return {
+        "jumps":         jumps,
+        "D_values":      D_values,
+        "fractions":     fractions,
+        "n_components":  n_components,
+        "n_jumps":       len(jumps),
+        "r_range":       r_range,
+        "pdfs":          pdfs,           # per-component PDF arrays
+        "pdf_total":     pdf_total,
+        "cdf_r":         r_sorted,
+        "cdf_empirical": cdf_emp,
+        "cdf_fit":       model(r_sorted, *popt),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  FIGURE
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1519,7 +1633,7 @@ def _draw_track(grp, color, ax, lw=0.8, alpha=0.6):
 
 def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
                 pixel_size, frame_interval, output_path, roi_mask=None,
-                fig_theme="Dark", proj_cmap="Inferno"):
+                fig_theme="Dark", proj_cmap="Inferno", jdd=None):
     print("  Rendering figure ...")
 
     # ── Theme palettes ─────────────────────────────────────────────────────────
@@ -1565,9 +1679,12 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
         "grid.color":       GRD, "grid.alpha":      0.4,
         "font.family":      _font})
 
-    fig = plt.figure(figsize=(20,14), facecolor=BG)
-    gs  = GridSpec(2,3,figure=fig,hspace=0.38,wspace=0.32,
-                   left=0.06,right=0.97,top=0.91,bottom=0.08)
+    _has_jdd = jdd is not None
+    _nrows   = 3 if _has_jdd else 2
+    _height  = 20 if _has_jdd else 14
+    fig = plt.figure(figsize=(20, _height), facecolor=BG)
+    gs  = GridSpec(_nrows, 3, figure=fig, hspace=0.40, wspace=0.32,
+                   left=0.06, right=0.97, top=0.91, bottom=0.06)
 
     def sax(ax, ltr, ttl):
         ax.set_facecolor(PNL)
@@ -1704,6 +1821,44 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
         ax.legend(fontsize=7,framealpha=0.6,facecolor=PNL,edgecolor=GRD,labelcolor=TXT)
     ax.grid(True,ls=":",alpha=0.3)
     sax(ax,"F","Anomalous Exponent Alpha Distribution")
+
+    # G — Jump Distance Distribution (only when JDD was computed)
+    if _has_jdd:
+        _jdd_colors = ["#58a6ff", "#f78166", "#3fb950", "#d2a8ff"]
+        ax = fig.add_subplot(gs[2, :])   # spans all three columns
+
+        # Histogram of observed jump distances
+        r_max_plot = np.percentile(jdd["jumps"], 99.5)
+        bins = np.linspace(0, r_max_plot, 60)
+        ax.hist(jdd["jumps"], bins=bins, density=True,
+                color="#8b949e", alpha=0.45, edgecolor="none",
+                label=f"Observed  (n={jdd['n_jumps']:,})")
+
+        # Per-component fitted PDF
+        _comp_labels = ["Slow", "Medium", "Fast"]
+        for k, (pdf_k, D_k, f_k) in enumerate(
+                zip(jdd["pdfs"], jdd["D_values"], jdd["fractions"])):
+            lbl = (f"{_comp_labels[k]}  D={D_k:.4f} µm²/s  "
+                   f"({f_k*100:.1f}%)")
+            ax.plot(jdd["r_range"], pdf_k,
+                    color=_jdd_colors[k], lw=2, label=lbl)
+
+        # Total fitted PDF
+        ax.plot(jdd["r_range"], jdd["pdf_total"],
+                color=TXT, lw=2.5, ls="--", label="Total fit")
+
+        ax.set_xlabel("Jump distance  (µm)", fontsize=9)
+        ax.set_ylabel("Probability density", fontsize=9)
+        ax.set_xlim(0, r_max_plot)
+        ax.set_ylim(bottom=0)
+        ax.grid(True, ls=":", alpha=0.3)
+        ax.legend(fontsize=8, framealpha=0.6,
+                  facecolor=PNL, edgecolor=GRD, labelcolor=TXT,
+                  loc="upper right")
+        sax(ax, "G",
+            f"Jump Distance Distribution  "
+            f"({jdd['n_components']}-population fit  |  "
+            f"{jdd['n_jumps']:,} jumps)")
 
     md = diff_df["D"].dropna().median()
     ma = diff_df["alpha"].dropna().median()
@@ -1868,6 +2023,16 @@ def main():
         tracks, pixel_size, frame_interval,
         max_lagtime=args.max_lagtime, workers=args.workers)
 
+    # 5b — JDD
+    print("\n[5b/6] Jump Distance Distribution")
+    jdd = compute_jdd(tracks, pixel_size, frame_interval, n_components=2)
+    if jdd:
+        print(f"  Jumps: {jdd['n_jumps']:,}")
+        for k, (D, f) in enumerate(zip(jdd["D_values"], jdd["fractions"])):
+            print(f"  Population {k+1}: D={D:.4f} um2/s  fraction={f*100:.1f}%")
+    else:
+        print("  Too few jumps to fit JDD.")
+
     # 6 — Save
     print("\n[6/6] Saving outputs")
     for df, suffix in [(locs,"localisations"), (tracks,"trajectories"),
@@ -1883,7 +2048,8 @@ def main():
 
     fig_path = os.path.join(out_dir, f"{stem}_sptpalm_figure.png")
     make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
-                pixel_size, frame_interval, fig_path, roi_mask=roi_mask)
+                pixel_size, frame_interval, fig_path,
+                roi_mask=roi_mask, jdd=jdd)
 
     # Summary
     total = time.perf_counter() - t_start

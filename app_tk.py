@@ -1066,8 +1066,9 @@ class SPTPalmApp(tk.Tk):
         self.v_chunk_size = tk.IntVar(value=500)
 
         # Figure style
-        self.v_fig_theme  = tk.StringVar(value="Dark")
-        self.v_proj_cmap  = tk.StringVar(value="Inferno")
+        self.v_fig_theme      = tk.StringVar(value="Dark")
+        self.v_proj_cmap      = tk.StringVar(value="Inferno")
+        self.v_jdd_components = tk.IntVar(value=2)
 
     # ── Top-level layout ──────────────────────────────────────────────────────
 
@@ -1541,6 +1542,21 @@ class SPTPalmApp(tk.Tk):
                       "optimal."
                   ))
 
+        self._row(f, "JDD populations",
+                  lambda P: self._combo(P, self.v_jdd_components,
+                                        [1, 2, 3]),
+                  info=(
+                      "Number of diffusion populations to fit in the Jump "
+                      "Distance Distribution (JDD).\n\n"
+                      "2 = slow + fast (most common for sptPALM).\n"
+                      "3 = immobile + confined + free (if 3 populations visible).\n"
+                      "1 = single-population control.\n\n"
+                      "JDD fits the distribution of single-frame step sizes "
+                      "across ALL tracks simultaneously, giving population-level "
+                      "D values and fractions — complementary to the per-track "
+                      "MSD analysis above."
+                  ))
+
         # ── ROI Masking ───────────────────────────────────────────────────────
         f = self._section(p, "ROI Masking")
         cb = self._row(f, "ROI mode",
@@ -1717,6 +1733,7 @@ class SPTPalmApp(tk.Tk):
             "max_track_len":   self.v_max_track_len.get(),
             "max_lagtime":     self.v_max_lagtime.get(),
             "n_fit":           self.v_n_fit.get(),
+            "jdd_components":  self.v_jdd_components.get(),
             "roi_mode":        self.v_roi_mode.get(),
             "roi_auto_method": self.v_roi_auto_method.get(),
             "roi_threshold":   self.v_roi_threshold.get(),
@@ -1750,6 +1767,7 @@ class SPTPalmApp(tk.Tk):
         _s(self.v_max_track_len,  "max_track_len")
         _s(self.v_max_lagtime,    "max_lagtime")
         _s(self.v_n_fit,          "n_fit")
+        _s(self.v_jdd_components, "jdd_components")
         _s(self.v_roi_mode,       "roi_mode")
         _s(self.v_roi_auto_method,"roi_auto_method")
         _s(self.v_roi_threshold,  "roi_threshold")
@@ -2138,6 +2156,32 @@ class SPTPalmApp(tk.Tk):
             tk.Label(inner_c, text=f"{pct:.1f}%", bg=CARD, fg=MUTED,
                      font=F(9)).pack(pady=(0, 10))
 
+        # JDD section
+        jdd = data.get("jdd")
+        if jdd:
+            _divider(p1)
+            _section_label(p1, "Jump Distance Distribution")
+            jf = tk.Frame(p1, bg=BG)
+            jf.pack(fill="x", padx=16, pady=(0, 4))
+            _jdd_colors = ["#4ea8ff", "#f78166", "#3fb950"]
+            _jdd_labels = ["Slow", "Medium", "Fast"]
+            for k, (D, f) in enumerate(
+                    zip(jdd["D_values"], jdd["fractions"])):
+                col = _jdd_colors[k]
+                outer_c, inner_c = _bordered_card(jf)
+                outer_c.pack(side="left", expand=True, fill="x", padx=4, pady=4)
+                tk.Frame(inner_c, bg=col, height=3).pack(fill="x")
+                tk.Label(inner_c, text=_jdd_labels[k], bg=CARD, fg=col,
+                         font=F(9, "bold")).pack(pady=(8, 2))
+                tk.Label(inner_c, text=f"{D:.4f}", bg=CARD, fg=TXT,
+                         font=F(14, "bold")).pack()
+                tk.Label(inner_c, text="µm²/s", bg=CARD, fg=MUTED,
+                         font=F(8)).pack()
+                tk.Label(inner_c, text=f"{f*100:.1f}%", bg=CARD, fg=MUTED,
+                         font=F(9)).pack(pady=(2, 10))
+            tk.Label(p1, text=f"{jdd['n_jumps']:,} single-frame jumps fitted",
+                     bg=BG, fg=MUTED, font=F(8)).pack(anchor="w", padx=20)
+
         _divider(p1)
         _FlatButton(p1, text="Open Output Folder",
                     command=lambda: _open_folder(out_dir)
@@ -2165,7 +2209,7 @@ class SPTPalmApp(tk.Tk):
 
         _section_label(p3, "Files")
         file_info = [
-            (f"{stem}_sptpalm_figure.png",    "6-panel analysis figure"),
+            (f"{stem}_sptpalm_figure.png",    "Analysis figure (6 panels + JDD)"),
             (f"{stem}_diffusion_summary.csv", "Per-trajectory D, α, motion class"),
             (f"{stem}_trajectories.csv",      "Full trajectory table"),
             (f"{stem}_localisations.csv",     "Raw localisations"),
@@ -2379,7 +2423,7 @@ class SPTPalmApp(tk.Tk):
 
             from sptpalm_analysis import (
                 load_file, preprocess_and_localise_adaptive,
-                link_trajectories, compute_msd_and_fit,
+                link_trajectories, compute_msd_and_fit, compute_jdd,
                 build_roi_mask, apply_roi_mask, make_figure,
                 correct_drift, _Cancelled,
             )
@@ -2649,13 +2693,32 @@ class SPTPalmApp(tk.Tk):
 
             _check_stop()
 
+            # ── 5b. Jump Distance Distribution ────────────────────────────────
+            _emit_progress("Jump Distance Distribution…", 80)
+            jdd = compute_jdd(tracks, px, fi,
+                              n_components=self.v_jdd_components.get())
+            if jdd:
+                _emit_log(f"  JDD  ({jdd['n_components']} populations, "
+                          f"{jdd['n_jumps']:,} jumps):")
+                labels = ["Slow", "Medium", "Fast"]
+                for k, (D, f) in enumerate(
+                        zip(jdd["D_values"], jdd["fractions"])):
+                    _emit_log(f"    {labels[k]:6s}  D={D:.4f} µm²/s  "
+                              f"({f*100:.1f}%)")
+            else:
+                _emit_log("  JDD: too few jumps to fit.")
+                jdd = None
+
+            _check_stop()
+
             # ── 6. Save ───────────────────────────────────────────────────────
             _emit_progress("Saving outputs…", 85)
             fig_path = os.path.join(out_dir, f"{stem}_sptpalm_figure.png")
             make_figure(proj_sample, tracks, imsd_df, emsd_df, diff_df,
                         px, fi, fig_path, roi_mask=roi_mask,
                         fig_theme=self.v_fig_theme.get(),
-                        proj_cmap=self.v_proj_cmap.get())
+                        proj_cmap=self.v_proj_cmap.get(),
+                        jdd=jdd)
             del proj_sample; gc.collect()
 
             # Preview: the final saved figure
@@ -2687,6 +2750,7 @@ class SPTPalmApp(tk.Tk):
             self._q.put(("done", {
                 "diff_df": diff_df, "fig_path": fig_path,
                 "roi_path": roi_path, "out_dir": out_dir, "stem": stem,
+                "jdd": jdd,
             }))
 
         except (_Stopped, _Cancelled):
