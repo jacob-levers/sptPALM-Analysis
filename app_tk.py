@@ -1800,10 +1800,9 @@ class SPTPalmApp(tk.Tk):
         self._panel_sel_frame.grid(row=_psel_r, column=0, columnspan=2,
                                    sticky="ew", padx=16, pady=(0, 8))
         for i, (ltr, (name, var)) in enumerate(self._export_panel_meta.items()):
-            r, c = divmod(i, 2)
             ttk.Checkbutton(self._panel_sel_frame, text=name, variable=var,
                             style="Card.TCheckbutton").grid(
-                row=r, column=c, padx=(0, 24), pady=2, sticky="w")
+                row=i, column=0, padx=0, pady=2, sticky="w")
         self._toggle_panel_export()
 
         # ── Save Settings ─────────────────────────────────────────────────────
