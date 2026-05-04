@@ -1502,6 +1502,12 @@ def compute_msd_and_fit(tracks, pixel_size, frame_interval,
 
     diff_df = pd.DataFrame([r[2] for r in results])
 
+    # Merge per-track mean localisation precision (pixels → nm)
+    if "ep" in tracks.columns:
+        ep_nm = (tracks.groupby("particle")["ep"].mean() * pixel_size * 1000
+                 ).rename("loc_precision_nm").reset_index()
+        diff_df = diff_df.merge(ep_nm, on="particle", how="left")
+
     return imsd_df, emsd_series, diff_df
 
 
@@ -1686,10 +1692,9 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
         "font.family":      _font})
 
     _has_jdd = jdd is not None
-    _nrows   = 3 if _has_jdd else 2
-    _height  = 20 if _has_jdd else 14
-    fig = plt.figure(figsize=(20, _height), facecolor=BG)
-    gs  = GridSpec(_nrows, 3, figure=fig, hspace=0.40, wspace=0.32,
+    # Always 3 rows: row 2 = density heatmap (col 0) + JDD (cols 1-2, optional)
+    fig = plt.figure(figsize=(20, 20), facecolor=BG)
+    gs  = GridSpec(3, 3, figure=fig, hspace=0.40, wspace=0.32,
                    left=0.06, right=0.97, top=0.91, bottom=0.06)
 
     def sax(ax, ltr, ttl):
@@ -1828,19 +1833,41 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
     ax.grid(True,ls=":",alpha=0.3)
     sax(ax,"F","Anomalous Exponent Alpha Distribution")
 
-    # G — Jump Distance Distribution (only when JDD was computed)
+    # G — Position Density Heatmap (always shown)
+    ax = fig.add_subplot(gs[2, 0])
+    try:
+        x_um = tracks["x"].values * pixel_size
+        y_um = tracks["y"].values * pixel_size
+        h, xe, ye = np.histogram2d(x_um, y_um, bins=120)
+        from scipy.ndimage import gaussian_filter as _gf
+        h_sm = _gf(h, sigma=1.5)
+        ax.imshow(h_sm.T, origin="lower", cmap="hot",
+                  extent=[xe[0], xe[-1], ye[0], ye[-1]],
+                  aspect="equal", interpolation="bilinear")
+        ax.set_xlabel("X  (µm)", fontsize=9)
+        ax.set_ylabel("Y  (µm)", fontsize=9)
+        if roi_mask is not None:
+            H_px, W_px = roi_mask.shape
+            ax.contour(
+                np.linspace(0, W_px * pixel_size, W_px),
+                np.linspace(0, H_px * pixel_size, H_px),
+                roi_mask.astype(float), levels=[0.5],
+                colors=["#58a6ff"], linewidths=[1.0], alpha=0.7)
+    except Exception:
+        pass
+    sax(ax, "G", "Position Density Map")
+
+    # H — Jump Distance Distribution (when JDD was computed)
     if _has_jdd:
         _jdd_colors = ["#58a6ff", "#f78166", "#3fb950", "#d2a8ff"]
-        ax = fig.add_subplot(gs[2, :])   # spans all three columns
+        ax = fig.add_subplot(gs[2, 1:])   # cols 1 and 2
 
-        # Histogram of observed jump distances
         r_max_plot = np.percentile(jdd["jumps"], 99.5)
         bins = np.linspace(0, r_max_plot, 60)
         ax.hist(jdd["jumps"], bins=bins, density=True,
                 color="#8b949e", alpha=0.45, edgecolor="none",
                 label=f"Observed  (n={jdd['n_jumps']:,})")
 
-        # Per-component fitted PDF
         _comp_labels = ["Slow", "Medium", "Fast"]
         for k, (pdf_k, D_k, f_k) in enumerate(
                 zip(jdd["pdfs"], jdd["D_values"], jdd["fractions"])):
@@ -1849,10 +1876,8 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
             ax.plot(jdd["r_range"], pdf_k,
                     color=_jdd_colors[k], lw=2, label=lbl)
 
-        # Total fitted PDF
         ax.plot(jdd["r_range"], jdd["pdf_total"],
                 color=TXT, lw=2.5, ls="--", label="Total fit")
-
         ax.set_xlabel("Jump distance  (µm)", fontsize=9)
         ax.set_ylabel("Probability density", fontsize=9)
         ax.set_xlim(0, r_max_plot)
@@ -1861,7 +1886,7 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
         ax.legend(fontsize=8, framealpha=0.6,
                   facecolor=PNL, edgecolor=GRD, labelcolor=TXT,
                   loc="upper right")
-        sax(ax, "G",
+        sax(ax, "H",
             f"Jump Distance Distribution  "
             f"({jdd['n_components']}-population fit  |  "
             f"{jdd['n_jumps']:,} jumps)")

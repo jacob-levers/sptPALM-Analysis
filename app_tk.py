@@ -1070,6 +1070,11 @@ class SPTPalmApp(tk.Tk):
         self.v_proj_cmap      = tk.StringVar(value="Inferno")
         self.v_jdd_components = tk.IntVar(value=2)
 
+        # Track filtering by D (applied after MSD fitting)
+        self.v_filter_d_enabled = tk.BooleanVar(value=False)
+        self.v_filter_d_min     = tk.DoubleVar(value=0.0)
+        self.v_filter_d_max     = tk.DoubleVar(value=1.0)
+
     # ── Top-level layout ──────────────────────────────────────────────────────
 
     def _build_ui(self):
@@ -1155,17 +1160,21 @@ class SPTPalmApp(tk.Tk):
 
     def _build_bottom_bar(self, parent):
         # Grid layout so the button is always in column 0 and cannot be pushed off
-        parent.columnconfigure(1, weight=1)
+        parent.columnconfigure(2, weight=1)
 
         self._run_btn = ttk.Button(parent, text="▶  Run Analysis",
                                    style="Run.TButton", command=self._on_run,
                                    width=16)
-        self._run_btn.grid(row=0, column=0, padx=18, pady=14, sticky="w")
+        self._run_btn.grid(row=0, column=0, padx=(18, 6), pady=14, sticky="w")
+
+        self._batch_btn = ttk.Button(parent, text="Batch…",
+                                     command=self._on_batch, width=8)
+        self._batch_btn.grid(row=0, column=1, padx=(0, 12), pady=14, sticky="w")
 
         self._status_var = tk.StringVar(value="")
         tk.Label(parent, textvariable=self._status_var,
                  bg=SIDEBAR, fg=MUTED, font=F(11)).grid(
-            row=0, column=1, padx=(6, 12), sticky="w")
+            row=0, column=2, padx=(0, 12), sticky="w")
 
     def _on_stop(self):
         """Signal the worker to stop. Button stays in place, text changes."""
@@ -1557,6 +1566,29 @@ class SPTPalmApp(tk.Tk):
                       "MSD analysis above."
                   ))
 
+        # D filter
+        self._row(f, "Filter by D value",
+                  lambda P: ttk.Checkbutton(P, variable=self.v_filter_d_enabled,
+                                            style="Card.TCheckbutton",
+                                            command=self._toggle_d_filter),
+                  info=(
+                      "After MSD fitting, discard tracks whose diffusion "
+                      "coefficient D falls outside the Min–Max range below.\n\n"
+                      "Useful for isolating a specific population "
+                      "(e.g. only free-diffusing, or only confined).\n\n"
+                      "JDD, motion classification, and the figure are all "
+                      "recomputed on the filtered set."
+                  ))
+        self._d_min_w = self._row(f, "  D min (µm²/s)",
+                  lambda P: self._spin_flt(P, self.v_filter_d_min,
+                                           0.0, 100.0, 0.001),
+                  info="Tracks with D below this value are excluded.")
+        self._d_max_w = self._row(f, "  D max (µm²/s)",
+                  lambda P: self._spin_flt(P, self.v_filter_d_max,
+                                           0.0001, 100.0, 0.001),
+                  info="Tracks with D above this value are excluded.")
+        self._toggle_d_filter()
+
         # ── ROI Masking ───────────────────────────────────────────────────────
         f = self._section(p, "ROI Masking")
         cb = self._row(f, "ROI mode",
@@ -1698,6 +1730,11 @@ class SPTPalmApp(tk.Tk):
         state = "normal" if self.v_drift_correct.get() else "disabled"
         self._drift_seg_w.configure(state=state)
 
+    def _toggle_d_filter(self):
+        state = "normal" if self.v_filter_d_enabled.get() else "disabled"
+        self._d_min_w.configure(state=state)
+        self._d_max_w.configure(state=state)
+
     def _toggle_roi(self):
         mode     = self.v_roi_mode.get()
         auto_s   = "readonly" if mode == "Auto threshold"                      else "disabled"
@@ -1734,6 +1771,9 @@ class SPTPalmApp(tk.Tk):
             "max_lagtime":     self.v_max_lagtime.get(),
             "n_fit":           self.v_n_fit.get(),
             "jdd_components":  self.v_jdd_components.get(),
+            "filter_d_enabled": self.v_filter_d_enabled.get(),
+            "filter_d_min":    self.v_filter_d_min.get(),
+            "filter_d_max":    self.v_filter_d_max.get(),
             "roi_mode":        self.v_roi_mode.get(),
             "roi_auto_method": self.v_roi_auto_method.get(),
             "roi_threshold":   self.v_roi_threshold.get(),
@@ -1767,7 +1807,10 @@ class SPTPalmApp(tk.Tk):
         _s(self.v_max_track_len,  "max_track_len")
         _s(self.v_max_lagtime,    "max_lagtime")
         _s(self.v_n_fit,          "n_fit")
-        _s(self.v_jdd_components, "jdd_components")
+        _s(self.v_jdd_components,   "jdd_components")
+        _s(self.v_filter_d_enabled, "filter_d_enabled")
+        _s(self.v_filter_d_min,     "filter_d_min")
+        _s(self.v_filter_d_max,     "filter_d_max")
         _s(self.v_roi_mode,       "roi_mode")
         _s(self.v_roi_auto_method,"roi_auto_method")
         _s(self.v_roi_threshold,  "roi_threshold")
@@ -2119,16 +2162,21 @@ class SPTPalmApp(tk.Tk):
         mean_D    = diff_df["D"].dropna().mean()
         med_alpha = diff_df["alpha"].dropna().median()
         mc        = diff_df["motion"].value_counts()
+        med_lp    = (diff_df["loc_precision_nm"].dropna().median()
+                     if "loc_precision_nm" in diff_df.columns else None)
 
         _section_label(p1, "Key metrics")
         mf = tk.Frame(p1, bg=BG)
         mf.pack(fill="x", padx=16, pady=(0, 4))
-        for label, val, unit in [
+        _metrics = [
             ("Trajectories", f"{n_tracks:,}",    ""),
             ("Median D",     f"{med_D:.4f}",      "µm²/s"),
             ("Mean D",       f"{mean_D:.4f}",     "µm²/s"),
             ("Median α",     f"{med_alpha:.3f}",  ""),
-        ]:
+        ]
+        if med_lp is not None:
+            _metrics.append(("Loc. precision", f"{med_lp:.1f}", "nm"))
+        for label, val, unit in _metrics:
             outer_c, inner_c = _bordered_card(mf)
             outer_c.pack(side="left", expand=True, fill="x", padx=4, pady=4)
             tk.Label(inner_c, text=label, bg=CARD, fg=MUTED,
@@ -2296,6 +2344,242 @@ class SPTPalmApp(tk.Tk):
         path = filedialog.askdirectory(title="Select output folder")
         if path:
             self.v_outdir.set(path)
+
+    # ── Batch processing ──────────────────────────────────────────────────────
+
+    def _on_batch(self):
+        if self._running:
+            return
+        folder = filedialog.askdirectory(title="Select folder to batch-process")
+        if not folder:
+            return
+
+        exts = (".czi", ".tif", ".tiff")
+        files = sorted(
+            f for f in os.listdir(folder)
+            if os.path.splitext(f)[1].lower() in exts
+            and not f.startswith(".")
+        )
+        if not files:
+            messagebox.showinfo("Batch", "No CZI or TIF files found in that folder.")
+            return
+
+        if not messagebox.askyesno(
+                "Batch Process",
+                f"Found {len(files)} file(s) in:\n{folder}\n\n"
+                f"Run analysis on all of them with current settings?"):
+            return
+
+        self._running = True
+        self._analysis_start = time.monotonic()
+        self._stop_event.clear()
+        self._run_btn.configure(text="■  Stop", command=self._on_stop,
+                                style="Stop.TButton")
+        self._batch_btn.configure(state="disabled")
+        self._show_progress_panel()
+        self._status_var.set(f"Batch: 0 / {len(files)}")
+
+        def _start():
+            threading.Thread(
+                target=self._batch_worker,
+                args=(folder, files),
+                daemon=True).start()
+            self.after(100, self._poll)
+
+        self._collapse_panel(callback=_start)
+
+    def _batch_worker(self, folder, files):
+        import numpy as np
+        import time as _time
+
+        stop  = self._stop_event
+        n     = len(files)
+        rows  = []
+
+        def _emit_log(text):
+            self._q.put(("log", text))
+
+        def _emit_progress(msg, pct):
+            self._q.put(("progress", (msg, pct)))
+
+        def _check_stop():
+            if stop.is_set():
+                raise Exception("Stopped")
+
+        old_stdout = sys.stdout
+
+        class _Cap:
+            def write(self, text):
+                if text.strip():
+                    self._q_ref.put(("log", text.rstrip()))
+            def flush(self): pass
+
+        cap = _Cap()
+        cap._q_ref = self._q
+        sys.stdout = cap
+
+        try:
+            base = (sys._MEIPASS if getattr(sys, "frozen", False)
+                    else os.path.dirname(os.path.abspath(__file__)))
+            if base not in sys.path:
+                sys.path.insert(0, base)
+
+            from sptpalm_analysis import (
+                load_file, preprocess_and_localise_adaptive,
+                link_trajectories, compute_msd_and_fit, compute_jdd,
+                build_roi_mask, apply_roi_mask, make_figure,
+                correct_drift, _Cancelled,
+            )
+
+            px_arg = self.v_pixel_size.get()     if self.v_override_px.get() else None
+            fi_arg = self.v_frame_interval.get() if self.v_override_fi.get() else None
+            _bg_map  = {"Uniform Filter": "uniform_filter", "Rolling Ball": "rolling_ball"}
+            _roi_map = {"Auto": "auto", "Triangle": "triangle", "Li": "li", "Otsu": "otsu"}
+            bg_method_raw       = _bg_map.get(self.v_bg_method.get(), "uniform_filter")
+            roi_auto_method_raw = _roi_map.get(self.v_roi_auto_method.get(), "auto")
+            roi_mode   = self.v_roi_mode.get()
+            roi_auto   = roi_mode == "Auto threshold"
+            roi_manual = roi_mode == "Manual threshold"
+            diameter   = self.v_diameter.get()
+            if diameter % 2 == 0:
+                diameter += 1
+            workers    = self.v_workers.get()
+            chunk_size = self.v_chunk_size.get()
+
+            for i, fname in enumerate(files):
+                _check_stop()
+                fpath = os.path.join(folder, fname)
+                stem  = os.path.splitext(fname)[0]
+                out_dir = os.path.join(folder, "batch_results", stem)
+                os.makedirs(out_dir, exist_ok=True)
+
+                pct_base = int(i / n * 90)
+                _emit_progress(f"[{i+1}/{n}]  {fname}", pct_base)
+                _emit_log(f"\n{'='*50}")
+                _emit_log(f"  [{i+1}/{n}]  {fname}")
+
+                try:
+                    stack, meta_px, meta_fi = load_file(
+                        fpath, channel=self.v_channel.get(), stop_event=stop)
+                    n_frames = len(stack)
+                    px = px_arg or meta_px or 0.104
+                    fi = fi_arg or meta_fi or 0.050
+
+                    proj_idx    = np.linspace(0, n_frames - 1, min(200, n_frames), dtype=int)
+                    proj_sample = stack[proj_idx].copy()
+
+                    roi_mask = None
+                    if roi_auto or roi_manual:
+                        raw_mean = stack.mean(axis=0)
+                        mn, mx   = raw_mean.min(), raw_mean.max()
+                        raw_mean_norm = (raw_mean - mn) / (mx - mn) if mx > mn else raw_mean
+                        thresh = self.v_roi_threshold.get() if roi_manual else None
+                        roi_mask = build_roi_mask(
+                            precomputed_mean_proj=raw_mean_norm,
+                            threshold=thresh, mode="mean",
+                            threshold_method=roi_auto_method_raw if roi_auto else "auto",
+                            save_path=os.path.join(out_dir, f"{stem}_roi_mask.png"))
+
+                    minmass_arg = None if self.v_auto_mm.get() else self.v_minmass.get()
+                    locs, _, _ = preprocess_and_localise_adaptive(
+                        stack, diameter=diameter, minmass=minmass_arg,
+                        bg_radius=self.v_bg_radius.get(),
+                        bg_method=bg_method_raw,
+                        workers=workers, chunk_size=chunk_size,
+                        stop_event=stop)
+                    del stack
+
+                    if roi_mask is not None:
+                        locs = apply_roi_mask(locs, roi_mask)
+
+                    if self.v_drift_correct.get() and len(locs) > 0:
+                        locs, drift_df = correct_drift(
+                            locs, n_seg_frames=self.v_drift_segment.get())
+                        drift_df.to_csv(
+                            os.path.join(out_dir, f"{stem}_drift.csv"), index=False)
+
+                    max_tl = self.v_max_track_len.get()
+                    tracks = link_trajectories(
+                        locs,
+                        search_range=self.v_search_range.get(),
+                        memory=self.v_memory.get(),
+                        min_len=self.v_min_track_len.get(),
+                        max_len=max_tl if max_tl > 0 else None)
+
+                    imsd_df, emsd_df, diff_df = compute_msd_and_fit(
+                        tracks, px, fi,
+                        max_lagtime=self.v_max_lagtime.get(),
+                        n_fit=self.v_n_fit.get(),
+                        workers=workers)
+
+                    if self.v_filter_d_enabled.get():
+                        d_min, d_max = self.v_filter_d_min.get(), self.v_filter_d_max.get()
+                        mask      = diff_df["D"].between(d_min, d_max)
+                        keep_pids = set(diff_df.loc[mask, "particle"])
+                        diff_df   = diff_df[mask].reset_index(drop=True)
+                        tracks    = tracks[tracks["particle"].isin(keep_pids)]
+
+                    jdd = compute_jdd(tracks, px, fi,
+                                      n_components=self.v_jdd_components.get())
+
+                    # Save CSVs
+                    for df, suf in [(locs, "localisations"),
+                                    (tracks, "trajectories"),
+                                    (diff_df, "diffusion_summary")]:
+                        df.to_csv(os.path.join(out_dir, f"{stem}_{suf}.csv"), index=False)
+
+                    fig_path = os.path.join(out_dir, f"{stem}_sptpalm_figure.png")
+                    make_figure(proj_sample, tracks, imsd_df, emsd_df, diff_df,
+                                px, fi, fig_path, roi_mask=roi_mask,
+                                fig_theme=self.v_fig_theme.get(),
+                                proj_cmap=self.v_proj_cmap.get(), jdd=jdd)
+
+                    mc_  = diff_df["motion"].value_counts()
+                    row  = {
+                        "file":         fname,
+                        "n_tracks":     diff_df.shape[0],
+                        "median_D":     diff_df["D"].dropna().median(),
+                        "mean_D":       diff_df["D"].dropna().mean(),
+                        "median_alpha": diff_df["alpha"].dropna().median(),
+                        "immobile_pct": 100 * mc_.get("Immobile", 0) / max(diff_df.shape[0], 1),
+                        "confined_pct": 100 * mc_.get("Confined", 0) / max(diff_df.shape[0], 1),
+                        "brownian_pct": 100 * mc_.get("Brownian", 0) / max(diff_df.shape[0], 1),
+                        "directed_pct": 100 * mc_.get("Directed", 0) / max(diff_df.shape[0], 1),
+                        "pixel_size":   px,
+                        "frame_interval": fi,
+                        "status":       "OK",
+                    }
+                    if jdd:
+                        for k, (D, f) in enumerate(
+                                zip(jdd["D_values"], jdd["fractions"])):
+                            row[f"jdd_D{k+1}"]  = D
+                            row[f"jdd_f{k+1}"]  = f
+                    if "loc_precision_nm" in diff_df.columns:
+                        row["median_loc_precision_nm"] = diff_df["loc_precision_nm"].dropna().median()
+                    rows.append(row)
+                    _emit_log(f"  ✓ Done — {diff_df.shape[0]:,} tracks, "
+                              f"median D={diff_df['D'].dropna().median():.4f} µm²/s")
+
+                except Exception as exc:
+                    if stop.is_set():
+                        raise
+                    _emit_log(f"  ✗ Error: {exc}")
+                    rows.append({"file": fname, "status": f"ERROR: {exc}"})
+
+            # Save batch summary
+            if rows:
+                import pandas as _pd
+                summary_path = os.path.join(folder, "batch_results", "batch_summary.csv")
+                _pd.DataFrame(rows).to_csv(summary_path, index=False)
+                _emit_log(f"\nBatch summary -> {summary_path}")
+
+            _emit_progress(f"Batch complete — {len(files)} files", 100)
+            self._q.put(("batch_done", {"out_dir": os.path.join(folder, "batch_results")}))
+
+        except Exception:
+            self._q.put(("stopped", None))
+        finally:
+            sys.stdout = old_stdout
 
     # ── Run / worker / queue ──────────────────────────────────────────────────
 
@@ -2691,9 +2975,25 @@ class SPTPalmApp(tk.Tk):
             except Exception:
                 pass
 
+            # ── 5b. D-value filter ────────────────────────────────────────────
+            if self.v_filter_d_enabled.get():
+                d_min = self.v_filter_d_min.get()
+                d_max = self.v_filter_d_max.get()
+                mask      = diff_df["D"].between(d_min, d_max, inclusive="both")
+                keep_pids = set(diff_df.loc[mask, "particle"])
+                n_before  = diff_df.shape[0]
+                diff_df   = diff_df[mask].reset_index(drop=True)
+                tracks    = tracks[tracks["particle"].isin(keep_pids)]
+                _emit_log(f"  D filter [{d_min:.4f}–{d_max:.4f} µm²/s]: "
+                          f"{len(keep_pids):,} of {n_before:,} tracks kept")
+                if diff_df.empty:
+                    raise RuntimeError(
+                        "No tracks remain after D-value filter.\n"
+                        "Widen the D min/max range or disable the filter.")
+
             _check_stop()
 
-            # ── 5b. Jump Distance Distribution ────────────────────────────────
+            # ── 5c. Jump Distance Distribution ────────────────────────────────
             _emit_progress("Jump Distance Distribution…", 80)
             jdd = compute_jdd(tracks, px, fi,
                               n_components=self.v_jdd_components.get())
@@ -2779,6 +3079,9 @@ class SPTPalmApp(tk.Tk):
                         self._update_preview(*latest_preview)
                     self._on_done(payload)
                     return
+                elif kind == "batch_done":
+                    self._on_batch_done(payload)
+                    return
                 elif kind == "stopped":
                     self._on_stopped()
                     return
@@ -2800,6 +3103,19 @@ class SPTPalmApp(tk.Tk):
                                 text="▶  Run Analysis",
                                 style="Run.TButton",
                                 command=self._on_run)
+        self._batch_btn.configure(state="normal")
+
+    def _on_batch_done(self, data: dict):
+        self._running = False
+        self._stop_live_timers()
+        self._reset_run_btn()
+        out_dir = data.get("out_dir", "")
+        self._status_var.set("Batch complete!")
+        self._prog_label.configure(text="Batch processing finished.")
+        self._expand_panel()
+        messagebox.showinfo(
+            "Batch Complete",
+            f"All files processed.\n\nResults saved to:\n{out_dir}")
 
     def _on_done(self, data: dict):
         self._running = False
