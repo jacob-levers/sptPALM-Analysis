@@ -2123,7 +2123,7 @@ class SPTPalmApp(tk.Tk):
         self._clear_right()
 
         diff_df  = data["diff_df"]
-        fig_path = data["fig_path"]
+        fig_data = data.get("fig_data", {})
         roi_path = data.get("roi_path")
         out_dir  = data["out_dir"]
         stem     = data["stem"]
@@ -2292,10 +2292,115 @@ class SPTPalmApp(tk.Tk):
         t2 = _add_tab("Figure")
         fig_scroll = _ScrollFrame(t2, bg=BG)
         fig_scroll.pack(fill="both", expand=True)
-        _embed_image(fig_scroll.inner, fig_path)
+        p_fig = fig_scroll.inner
+
+        panel_images = fig_data.get("panels", {})
+        panel_titles = fig_data.get("panel_titles", {})
+
+        # Gallery: 3-column grid of thumbnails with checkboxes
+        _section_label(p_fig, "Analysis Panels  —  select panels to export")
+
+        gallery_frame = tk.Frame(p_fig, bg=BG)
+        gallery_frame.pack(fill="x", padx=16, pady=(4, 8))
+
+        THUMB_W = 260
+        _panel_vars  = {}   # letter -> BooleanVar
+        _panel_imgs  = []   # keep references to avoid GC
+
+        letters_sorted = sorted(panel_images.keys())
+        for col_idx in range(3):
+            gallery_frame.columnconfigure(col_idx, weight=1)
+
+        for i, ltr in enumerate(letters_sorted):
+            pil_img = panel_images[ltr]
+            title   = panel_titles.get(ltr, ltr)
+
+            # Resize thumbnail preserving aspect ratio
+            w, h = pil_img.size
+            th   = int(h * THUMB_W / w)
+            thumb = pil_img.resize((THUMB_W, th), resample=3)  # LANCZOS
+
+            try:
+                from PIL import ImageTk
+                photo = ImageTk.PhotoImage(thumb)
+                _panel_imgs.append(photo)
+            except Exception:
+                continue
+
+            col = i % 3
+            row = i // 3
+            cell = tk.Frame(gallery_frame, bg=CARD, relief="flat", bd=0,
+                            highlightthickness=1, highlightbackground=BORDER)
+            cell.grid(row=row, column=col, padx=6, pady=6, sticky="nsew")
+
+            tk.Label(cell, image=photo, bg=CARD).pack(padx=4, pady=(4, 2))
+
+            var = tk.BooleanVar(value=True)
+            _panel_vars[ltr] = var
+            tk.Checkbutton(cell, text=f"  {ltr}  —  {title[:35]}",
+                           variable=var, bg=CARD, fg=TXT,
+                           activebackground=CARD, activeforeground=ACC,
+                           selectcolor=CARD, font=F(9)).pack(anchor="w", padx=6, pady=(0, 4))
+
+        # Keep thumbnail refs GC-safe by attaching to scroll frame
+        fig_scroll._img_refs = _panel_imgs
+
+        _divider(p_fig)
+
+        # Export controls
+        export_row = tk.Frame(p_fig, bg=BG)
+        export_row.pack(anchor="w", padx=16, pady=(4, 12))
+
+        def _select_all():
+            for v in _panel_vars.values(): v.set(True)
+        def _select_none():
+            for v in _panel_vars.values(): v.set(False)
+
+        _FlatButton(export_row, text="Select All",  command=_select_all ).pack(side="left", padx=(0, 8))
+        _FlatButton(export_row, text="Select None", command=_select_none).pack(side="left", padx=(0, 20))
+
+        def _export_selected():
+            selected = [ltr for ltr, v in _panel_vars.items() if v.get()]
+            if not selected:
+                messagebox.showinfo("Export", "No panels selected.")
+                return
+            self.lift(); self.focus_force(); self.update()
+            folder = filedialog.askdirectory(parent=self, title="Choose export folder")
+            if not folder:
+                return
+            saved = 0
+            for ltr in selected:
+                img = panel_images.get(ltr)
+                if img is None:
+                    continue
+                base = f"{stem}_panel_{ltr}"
+                img.save(os.path.join(folder, f"{base}.png"), dpi=(150, 150))
+                saved += 1
+            messagebox.showinfo("Export", f"Saved {saved} panel(s) to:\n{folder}")
+
+        def _export_combined():
+            combined = fig_data.get("combined")
+            if combined is None:
+                return
+            self.lift(); self.focus_force(); self.update()
+            path = filedialog.asksaveasfilename(
+                parent=self, title="Save combined figure",
+                defaultextension=".png",
+                filetypes=[("PNG", "*.png"), ("All files", "*.*")],
+                initialfile=f"{stem}_sptpalm_figure.png")
+            if path:
+                combined.save(path, dpi=(150, 150))
+                messagebox.showinfo("Saved", f"Figure saved to:\n{path}")
+
+        _FlatButton(export_row, text="Export Selected Panels…",
+                    command=_export_selected).pack(side="left", padx=(0, 8))
+        _FlatButton(export_row, text="Save Combined Figure…",
+                    command=_export_combined).pack(side="left")
+
         if roi_path and os.path.exists(roi_path):
-            _section_label(fig_scroll.inner, "ROI mask preview")
-            _embed_image(fig_scroll.inner, roi_path, max_w=900, max_h=320)
+            _divider(p_fig)
+            _section_label(p_fig, "ROI mask preview")
+            _embed_image(p_fig, roi_path, max_w=900, max_h=320)
 
         # ── Tab: Output Files ─────────────────────────────────────────────────
         t3 = _add_tab("Output Files")
@@ -2308,13 +2413,10 @@ class SPTPalmApp(tk.Tk):
                  font=FM(9), wraplength=680, justify="left",
                  anchor="w").pack(anchor="w", padx=20, pady=(0, 4))
 
-        fig_dir2  = os.path.join(out_dir, "figures")
         data_dir2 = os.path.join(out_dir, "data")
 
         _section_label(p3, "Files")
         file_info = [
-            (f"{stem}_sptpalm_figure.png",    "Analysis figure",              fig_dir2),
-            (f"{stem}_sptpalm_figure.pdf",    "Analysis figure (PDF/vector)", fig_dir2),
             (f"{stem}_diffusion_summary.csv", "Per-trajectory D, α, motion",  data_dir2),
             (f"{stem}_trajectories.csv",      "Full trajectory table",         data_dir2),
             (f"{stem}_localisations.csv",     "Raw localisations",             data_dir2),
@@ -2346,11 +2448,6 @@ class SPTPalmApp(tk.Tk):
         _FlatButton(btn_row, text="Open Output Folder",
                     command=lambda: _open_folder(out_dir)
                     ).pack(side="left", padx=(0, 12))
-        panel_dir = os.path.join(fig_dir2, "panels")
-        if os.path.isdir(panel_dir):
-            _FlatButton(btn_row, text="Open Panels Folder",
-                        command=lambda d=panel_dir: _open_folder(d)
-                        ).pack(side="left")
 
         # activate first tab
         _switch("Summary")
@@ -2626,16 +2723,19 @@ class SPTPalmApp(tk.Tk):
                         b_cluster_stats_df.to_csv(
                             os.path.join(data_dir, f"{stem}_cluster_stats.csv"), index=False)
 
-                    fig_path = os.path.join(fig_dir, f"{stem}_sptpalm_figure.png")
-                    make_figure(proj_sample, tracks, imsd_df, emsd_df, diff_df,
-                                px, fi, fig_path, roi_mask=roi_mask,
-                                fig_theme=self.v_fig_theme.get(),
-                                proj_cmap=self.v_proj_cmap.get(), jdd=jdd,
-                                turning_angles=b_ta, mobile_frac_df=b_mf,
-                                cluster_labels=b_cluster_labels,
-                                cluster_locs=b_cluster_xy,
-                                dwell_df=b_dwell_df,
-                                dwell_tau=b_dwell_tau)
+                    fig_data = make_figure(proj_sample, tracks, imsd_df, emsd_df, diff_df,
+                                          px, fi, roi_mask=roi_mask,
+                                          fig_theme=self.v_fig_theme.get(),
+                                          proj_cmap=self.v_proj_cmap.get(), jdd=jdd,
+                                          turning_angles=b_ta, mobile_frac_df=b_mf,
+                                          cluster_labels=b_cluster_labels,
+                                          cluster_locs=b_cluster_xy,
+                                          dwell_df=b_dwell_df,
+                                          dwell_tau=b_dwell_tau)
+                    # Batch mode: auto-save the combined figure since user isn't watching
+                    fig_data["combined"].save(
+                        os.path.join(fig_dir, f"{stem}_sptpalm_figure.png"),
+                        dpi=(150, 150))
 
                     mc_  = diff_df["motion"].value_counts()
                     row  = {
@@ -3195,31 +3295,29 @@ class SPTPalmApp(tk.Tk):
 
             # ── 6. Save ───────────────────────────────────────────────────────
             _emit_progress("Saving outputs…", 92)
-            fig_path = os.path.join(fig_dir, f"{stem}_sptpalm_figure.png")
-            make_figure(proj_sample, tracks, imsd_df, emsd_df, diff_df,
-                        px, fi, fig_path, roi_mask=roi_mask,
-                        fig_theme=self.v_fig_theme.get(),
-                        proj_cmap=self.v_proj_cmap.get(),
-                        jdd=jdd,
-                        turning_angles=turning_angles,
-                        mobile_frac_df=mobile_frac_df,
-                        cluster_labels=cluster_labels,
-                        cluster_locs=cluster_xy,
-                        dwell_df=dwell_df,
-                        dwell_tau=dwell_tau)
+            fig_data = make_figure(proj_sample, tracks, imsd_df, emsd_df, diff_df,
+                                   px, fi, roi_mask=roi_mask,
+                                   fig_theme=self.v_fig_theme.get(),
+                                   proj_cmap=self.v_proj_cmap.get(),
+                                   jdd=jdd,
+                                   turning_angles=turning_angles,
+                                   mobile_frac_df=mobile_frac_df,
+                                   cluster_labels=cluster_labels,
+                                   cluster_locs=cluster_xy,
+                                   dwell_df=dwell_df,
+                                   dwell_tau=dwell_tau)
             del proj_sample; gc.collect()
 
-            # Preview: the final saved figure
+            # Preview: the combined figure from fig_data
             try:
-                from PIL import Image as _PILImage
-                final_img = np.asarray(_PILImage.open(fig_path).convert("RGB"))
-                fig = Figure(figsize=(5, 4), dpi=90, facecolor="#09090e")
-                ax  = fig.add_axes([0, 0, 1, 1])
-                ax.imshow(final_img, interpolation="lanczos")
-                ax.set_axis_off()
-                ax.set_title("Analysis complete", color="#2ea043", fontsize=9, pad=4)
-                _send_fig(fig, "complete")
-                fig.clear()
+                final_img = np.asarray(fig_data["combined"].convert("RGB"))
+                fig_prev = Figure(figsize=(5, 4), dpi=90, facecolor="#09090e")
+                ax_prev  = fig_prev.add_axes([0, 0, 1, 1])
+                ax_prev.imshow(final_img, interpolation="lanczos")
+                ax_prev.set_axis_off()
+                ax_prev.set_title("Analysis complete", color="#2ea043", fontsize=9, pad=4)
+                _send_fig(fig_prev, "complete")
+                fig_prev.clear()
             except Exception:
                 pass
 
@@ -3239,7 +3337,7 @@ class SPTPalmApp(tk.Tk):
 
             _emit_progress("Complete!", 100)
             self._q.put(("done", {
-                "diff_df": diff_df, "fig_path": fig_path,
+                "diff_df": diff_df, "fig_data": fig_data,
                 "roi_path": roi_path, "out_dir": out_dir, "stem": stem,
                 "jdd": jdd,
             }))

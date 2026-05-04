@@ -1801,7 +1801,7 @@ def _draw_track(grp, color, ax, lw=0.8, alpha=0.6):
 
 
 def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
-                pixel_size, frame_interval, output_path, roi_mask=None,
+                pixel_size, frame_interval, output_path=None, roi_mask=None,
                 fig_theme="Dark", proj_cmap="Inferno", jdd=None,
                 turning_angles=None, mobile_frac_df=None,
                 cluster_labels=None, cluster_locs=None,
@@ -2200,41 +2200,52 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
         f"Median D = {md:.4f} um2/s  |  Median alpha = {ma:.2f}",
         fontsize=13,color=TXT,y=0.97,fontweight="bold")
 
-    plt.savefig(output_path, dpi=180, bbox_inches="tight",
-                facecolor=fig.get_facecolor())
-    print(f"  Figure -> {output_path}")
+    import io as _io
+    from matplotlib.transforms import Bbox as _Bbox
 
-    pdf_path = os.path.splitext(output_path)[0] + ".pdf"
-    plt.savefig(pdf_path, dpi=150, bbox_inches="tight",
+    # Render combined figure to PIL Image (in memory)
+    _buf = _io.BytesIO()
+    fig.savefig(_buf, format="png", dpi=150, bbox_inches="tight",
                 facecolor=fig.get_facecolor())
-    print(f"  Figure (PDF) -> {pdf_path}")
+    _buf.seek(0)
+    from PIL import Image as _PILImage
+    combined_pil = _PILImage.open(_buf).copy()
+    _buf.close()
 
-    # Per-panel export — each labelled panel saved individually
-    try:
-        from matplotlib.transforms import Bbox as _Bbox
-        panel_dir = os.path.join(os.path.dirname(output_path), "panels")
-        os.makedirs(panel_dir, exist_ok=True)
-        fig.canvas.draw()
-        renderer  = fig.canvas.get_renderer()
-        stem_base = os.path.splitext(os.path.basename(output_path))[0]
-        pad_px    = fig.dpi * 0.10   # 0.1 inch padding in display units
-        for ltr, pax in _panels:
-            bbox = pax.get_tightbbox(renderer)
-            if bbox is None:
-                continue
-            bbox_padded = _Bbox([[bbox.x0 - pad_px, bbox.y0 - pad_px],
-                                  [bbox.x1 + pad_px, bbox.y1 + pad_px]])
-            bbox_in = bbox_padded.transformed(fig.dpi_scale_trans.inverted())
-            fig.savefig(os.path.join(panel_dir, f"{stem_base}_panel_{ltr}.png"),
-                        bbox_inches=bbox_in, dpi=180,
-                        facecolor=fig.get_facecolor())
-            fig.savefig(os.path.join(panel_dir, f"{stem_base}_panel_{ltr}.pdf"),
-                        bbox_inches=bbox_in, facecolor=fig.get_facecolor())
-        print(f"  Panels -> {panel_dir}/")
-    except Exception as _pe:
-        print(f"  Per-panel export skipped: {_pe}")
+    # Render each panel individually
+    fig.canvas.draw()
+    _renderer = fig.canvas.get_renderer()
+    _pad_px   = fig.dpi * 0.12
+    panel_images = {}
+    for _ltr, _pax in _panels:
+        _bbox = _pax.get_tightbbox(_renderer)
+        if _bbox is None:
+            continue
+        _bbox_pad = _Bbox([[_bbox.x0 - _pad_px, _bbox.y0 - _pad_px],
+                            [_bbox.x1 + _pad_px, _bbox.y1 + _pad_px]])
+        _bbox_in  = _bbox_pad.transformed(fig.dpi_scale_trans.inverted())
+        _pbuf = _io.BytesIO()
+        fig.savefig(_pbuf, format="png", dpi=150, bbox_inches=_bbox_in,
+                    facecolor=fig.get_facecolor())
+        _pbuf.seek(0)
+        panel_images[_ltr] = _PILImage.open(_pbuf).copy()
+        _pbuf.close()
+
+    # Save to disk only if output_path explicitly provided (CLI / legacy callers)
+    if output_path:
+        combined_pil.save(output_path, dpi=(150, 150))
+        print(f"  Figure -> {output_path}")
+        _pdf = os.path.splitext(output_path)[0] + ".pdf"
+        fig.savefig(_pdf, bbox_inches="tight", facecolor=fig.get_facecolor())
+        print(f"  Figure (PDF) -> {_pdf}")
 
     plt.close(fig)
+    print("  Figure rendered.")
+    return {
+        "combined":     combined_pil,
+        "panels":       panel_images,
+        "panel_titles": {ltr: ax.get_title().strip() for ltr, ax in _panels},
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
