@@ -267,64 +267,108 @@ def FM(size=10, weight="normal"):
 
 def _generate_icon(size: int = 256):
     """
-    Draw the app icon programmatically: dark circle, crosshair reticle,
-    and a glowing single-particle trajectory — matching the UI palette.
+    App icon: a palm tree made of glowing particle traces on a dark circle.
+    Trunk and fronds are drawn as localisation dots connected by trajectory
+    lines, matching the UI colour palette.
     Returns a PIL Image, or None if Pillow is unavailable.
     """
     try:
         from PIL import Image, ImageDraw, ImageFilter
+        import math
     except ImportError:
         return None
 
-    s = size
-    m = s // 18                                     # margin from edge
-    cx, cy = s // 2, s // 2
+    s  = size
+    m  = s // 18
+    AC = (88, 166, 255)       # accent blue
+    BR = (210, 230, 255)      # bright white-blue for dots
 
-    # ── Layer 1: base shapes ──────────────────────────────────────────────────
+    def p(fx, fy):
+        return (int(fx * s), int(fy * s))
+
+    def bezier(p0, p1, p2, n=7):
+        """Sample n points along a quadratic bezier curve."""
+        pts = []
+        for i in range(n):
+            t  = i / (n - 1)
+            u  = 1 - t
+            x  = u*u*p0[0] + 2*u*t*p1[0] + t*t*p2[0]
+            y  = u*u*p0[1] + 2*u*t*p1[1] + t*t*p2[1]
+            pts.append((int(x), int(y)))
+        return pts
+
+    # Trunk: gentle S-curve from base to crown
+    trunk = [
+        p(0.500, 0.900),
+        p(0.498, 0.820),
+        p(0.496, 0.740),
+        p(0.497, 0.660),
+        p(0.500, 0.580),
+        p(0.504, 0.510),
+        p(0.508, 0.450),
+        p(0.510, 0.390),   # crown
+    ]
+    crown = trunk[-1]
+
+    # Fronds: quadratic bezier (start=crown, control, tip)
+    # each tuple is (control_frac, tip_frac)
+    frond_defs = [
+        (p(0.36, 0.29), p(0.14, 0.33)),   # far left, drooping
+        (p(0.40, 0.22), p(0.27, 0.16)),   # mid left, upswept
+        (p(0.50, 0.20), p(0.50, 0.10)),   # straight up centre
+        (p(0.61, 0.22), p(0.74, 0.16)),   # mid right, upswept
+        (p(0.65, 0.29), p(0.87, 0.33)),   # far right, drooping
+    ]
+    fronds = [bezier(crown, ctrl, tip, n=7) for ctrl, tip in frond_defs]
+
+    # Collect all particle positions
+    all_pts = list(trunk)
+    for frond in fronds:
+        all_pts.extend(frond[1:])  # crown already in trunk
+
+    # ── Base circle ──────────────────────────────────────────────────────────
     base = Image.new("RGBA", (s, s), (0, 0, 0, 0))
     d    = ImageDraw.Draw(base)
+    d.ellipse([m, m, s - m, s - m], fill=(13, 17, 23, 255))
 
-    d.ellipse([m, m, s - m, s - m], fill=(13, 17, 23, 255))         # dark bg
-    grid = (35, 50, 70, 255)
-    d.line([(m + 4, cy), (s - m - 4, cy)], fill=grid, width=1)      # h-reticle
-    d.line([(cx, m + 4), (cx, s - m - 4)], fill=grid, width=1)      # v-reticle
-    ri = s // 4
-    d.ellipse([cx - ri, cy - ri, cx + ri, cy + ri], outline=grid, width=1)  # ring
-
-    # ── Layer 2: trajectory & glow (blurred separately) ───────────────────────
-    glow = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-    g    = ImageDraw.Draw(glow)
-
-    tpts = [(0.28, 0.64), (0.40, 0.42), (0.53, 0.57), (0.65, 0.35), (0.74, 0.50)]
-    coords = [(int(x * s), int(y * s)) for x, y in tpts]
-    spot_r = max(5, s // 24)
-
-    for i, (x, y) in enumerate(coords):
+    # ── Glow layer ───────────────────────────────────────────────────────────
+    glow   = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    g      = ImageDraw.Draw(glow)
+    spot_r = max(4, s // 30)
+    for x, y in all_pts:
         for gr in range(spot_r * 4, 0, -1):
-            a = int(130 * (1 - gr / (spot_r * 4)) ** 1.8)
-            g.ellipse([x - gr, y - gr, x + gr, y + gr], fill=(88, 166, 255, a))
+            a = int(110 * (1 - gr / (spot_r * 4)) ** 2.0)
+            g.ellipse([x - gr, y - gr, x + gr, y + gr], fill=(*AC, a))
+    glow_blur = glow.filter(ImageFilter.GaussianBlur(radius=max(2, s // 36)))
 
-    glow_blur = glow.filter(ImageFilter.GaussianBlur(radius=max(2, s // 40)))
-
-    # ── Layer 3: sharp elements on top of glow ────────────────────────────────
+    # ── Sharp layer ──────────────────────────────────────────────────────────
     sharp = Image.new("RGBA", (s, s), (0, 0, 0, 0))
     sh    = ImageDraw.Draw(sharp)
 
-    lw = max(1, s // 64)
-    for i in range(len(coords) - 1):
-        t = i / max(len(coords) - 2, 1)
-        a = int(140 + 100 * t)
-        sh.line([coords[i], coords[i + 1]], fill=(88, 166, 255, a), width=lw)
+    tlw = max(2, s // 56)   # trunk line width
+    flw = max(1, s // 80)   # frond line width
 
-    cr = max(3, s // 42)
-    for x, y in coords:
-        sh.ellipse([x - cr, y - cr, x + cr, y + cr], fill=(230, 240, 255, 255))
+    # Trunk lines (slightly brighter, thicker)
+    for i in range(len(trunk) - 1):
+        sh.line([trunk[i], trunk[i + 1]], fill=(*AC, 200), width=tlw)
 
-    # Blue border ring (drawn sharp)
+    # Frond lines (fade toward tip)
+    for frond in fronds:
+        n = len(frond)
+        for i in range(n - 1):
+            a = int(220 - 120 * (i / (n - 1)))
+            sh.line([frond[i], frond[i + 1]], fill=(*AC, a), width=flw)
+
+    # Particle dots
+    cr = max(2, s // 56)
+    for x, y in all_pts:
+        sh.ellipse([x - cr, y - cr, x + cr, y + cr], fill=(*BR, 255))
+
+    # Border ring
     bw = max(2, s // 70)
-    sh.ellipse([m, m, s - m, s - m], outline=(88, 166, 255, 210), width=bw)
+    sh.ellipse([m, m, s - m, s - m], outline=(*AC, 210), width=bw)
 
-    # ── Composite ─────────────────────────────────────────────────────────────
+    # ── Composite ────────────────────────────────────────────────────────────
     final = base.copy()
     final = Image.alpha_composite(final, glow_blur)
     final = Image.alpha_composite(final, sharp)
