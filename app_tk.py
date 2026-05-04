@@ -1562,7 +1562,11 @@ class SPTPalmApp(tk.Tk):
                       "Useful for isolating a specific population "
                       "(e.g. only free-diffusing, or only confined).\n\n"
                       "JDD, motion classification, and the figure are all "
-                      "recomputed on the filtered set."
+                      "recomputed on the filtered set.\n\n"
+                      "To replicate PALMTracer's immobile cutoff, enable this "
+                      "and set D min to ~0.01–0.05 µm²/s (PALMTracer typically "
+                      "uses 0.02 µm²/s by default). Leave D max at a high value "
+                      "to pass all mobile tracks through."
                   ))
         self._d_min_w = self._row(f, "  D min (µm²/s)",
                   lambda P: self._spin_flt(P, self.v_filter_d_min,
