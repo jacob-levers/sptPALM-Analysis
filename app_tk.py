@@ -2547,7 +2547,7 @@ class SPTPalmApp(tk.Tk):
                         window_frames=max(50, int(0.1 * tracks["frame"].max()))
                         if len(tracks) else 100)
 
-                    b_cluster_labels, b_cluster_stats_df, b_n_clusters = compute_clusters(
+                    b_cluster_labels, b_cluster_stats_df, b_n_clusters, b_cluster_xy = compute_clusters(
                         locs, px,
                         eps_um=self.v_cluster_eps_nm.get() / 1000.0,
                         min_samples=self.v_cluster_min_samples.get())
@@ -2578,7 +2578,7 @@ class SPTPalmApp(tk.Tk):
                                 proj_cmap=self.v_proj_cmap.get(), jdd=jdd,
                                 turning_angles=b_ta, mobile_frac_df=b_mf,
                                 cluster_labels=b_cluster_labels,
-                                cluster_locs=locs,
+                                cluster_locs=b_cluster_xy,
                                 dwell_df=b_dwell_df,
                                 dwell_tau=b_dwell_tau)
 
@@ -3119,7 +3119,7 @@ class SPTPalmApp(tk.Tk):
                 window_frames=max(50, int(0.1 * tracks["frame"].max())) if len(tracks) else 100)
 
             _emit_progress("Cluster analysis…", 88)
-            cluster_labels, cluster_stats_df, n_clusters = compute_clusters(
+            cluster_labels, cluster_stats_df, n_clusters, cluster_xy = compute_clusters(
                 locs, px,
                 eps_um=self.v_cluster_eps_nm.get() / 1000.0,
                 min_samples=self.v_cluster_min_samples.get())
@@ -3149,7 +3149,7 @@ class SPTPalmApp(tk.Tk):
                         turning_angles=turning_angles,
                         mobile_frac_df=mobile_frac_df,
                         cluster_labels=cluster_labels,
-                        cluster_locs=locs,
+                        cluster_locs=cluster_xy,
                         dwell_df=dwell_df,
                         dwell_tau=dwell_tau)
             del proj_sample; gc.collect()

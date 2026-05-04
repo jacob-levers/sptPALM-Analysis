@@ -1696,10 +1696,16 @@ def compute_mobile_fraction_over_time(tracks, diff_df, frame_interval,
 #  CLUSTER ANALYSIS  (DBSCAN)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def compute_clusters(locs, pixel_size_um, eps_um=0.05, min_samples=5):
+def compute_clusters(locs, pixel_size_um, eps_um=0.05, min_samples=5,
+                     max_locs=250_000):
     from sklearn.cluster import DBSCAN
     from scipy.spatial import ConvexHull
     xy = locs[["x", "y"]].values * pixel_size_um
+    subsampled = len(xy) > max_locs
+    if subsampled:
+        rng = np.random.default_rng(42)
+        idx = rng.choice(len(xy), max_locs, replace=False)
+        xy = xy[idx]
     labels = DBSCAN(eps=eps_um, min_samples=min_samples).fit_predict(xy)
     n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
     rows = []
@@ -1717,7 +1723,7 @@ def compute_clusters(locs, pixel_size_um, eps_um=0.05, min_samples=5):
                      "area_um2": area, "density_locs_per_um2": density,
                      "centroid_x_um": pts[:,0].mean(),
                      "centroid_y_um": pts[:,1].mean()})
-    return labels, pd.DataFrame(rows), int(n_clusters)
+    return labels, pd.DataFrame(rows), int(n_clusters), xy
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2118,22 +2124,23 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
     # L — Cluster Map
     ax = fig.add_subplot(gs[4, 0])
     if cluster_labels is not None and cluster_locs is not None and len(cluster_locs) > 0:
-        xy_um = cluster_locs[["x", "y"]].values * pixel_size
+        xy_um = cluster_locs  # already in µm, subsampled to match labels
         noise = cluster_labels == -1
         if noise.any():
             ax.scatter(xy_um[noise, 0], xy_um[noise, 1],
                        s=0.5, c="#444", alpha=0.3, linewidths=0, rasterized=True)
         clustered = ~noise
         if clustered.any():
-            n_c = cluster_labels.max() + 1
-            cmap_c = plt.cm.get_cmap("tab20", max(n_c, 1))
+            n_c = max(cluster_labels.max() + 1, 1)
+            cmap_c = plt.cm.get_cmap("tab20", n_c)
             ax.scatter(xy_um[clustered, 0], xy_um[clustered, 1],
                        s=1.5, c=cluster_labels[clustered], cmap=cmap_c,
                        alpha=0.7, linewidths=0, rasterized=True,
-                       vmin=0, vmax=max(n_c - 1, 1))
+                       vmin=0, vmax=n_c - 1)
         ax.set_xlabel("X  (µm)", fontsize=9)
         ax.set_ylabel("Y  (µm)", fontsize=9)
-        ax.text(0.02, 0.98, f"n={cluster_labels.max()+1 if cluster_labels.max()>=0 else 0} clusters",
+        n_shown = int(cluster_labels.max()) + 1 if cluster_labels.max() >= 0 else 0
+        ax.text(0.02, 0.98, f"n={n_shown} clusters",
                 transform=ax.transAxes, fontsize=8, color=TXT, va="top")
     else:
         ax.text(0.5, 0.5, "Cluster analysis\nnot computed",
