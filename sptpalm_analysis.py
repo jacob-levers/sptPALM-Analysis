@@ -1856,16 +1856,18 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
     gs  = GridSpec(5, 3, figure=fig, hspace=0.42, wspace=0.32,
                    left=0.06, right=0.97, top=0.94, bottom=0.04)
 
-    _panels = []   # (letter, axes) collected for per-panel export
+    _panels          = []   # (letter, axes) collected for per-panel export
+    _letter_artists  = []   # text objects for letter labels (hidden for panel renders)
 
     def sax(ax, ltr, ttl):
         ax.set_facecolor(PNL)
         for sp in ax.spines.values(): sp.set_edgecolor(GRD)
         ax.set_title(f"  {ttl}", loc="left", fontsize=11,
                      color=TXT, pad=8, fontweight="bold")
-        ax.text(-0.04,1.06,ltr,transform=ax.transAxes,fontsize=14,
-                color=ACC,fontweight="bold",va="top",ha="right")
+        txt = ax.text(-0.04, 1.06, ltr, transform=ax.transAxes, fontsize=14,
+                      color=ACC, fontweight="bold", va="top", ha="right")
         _panels.append((ltr, ax))
+        _letter_artists.append(txt)
 
     # Use up to 200 evenly-spaced frames for the max projection to save memory
     idx  = np.linspace(0, len(stack)-1, min(200, len(stack)), dtype=int)
@@ -2203,16 +2205,11 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
     import io as _io
     from matplotlib.transforms import Bbox as _Bbox
 
-    # Render combined figure to PIL Image (in memory)
-    _buf = _io.BytesIO()
-    fig.savefig(_buf, format="png", dpi=150, bbox_inches="tight",
-                facecolor=fig.get_facecolor())
-    _buf.seek(0)
     from PIL import Image as _PILImage
-    combined_pil = _PILImage.open(_buf).copy()
-    _buf.close()
 
-    # Render each panel individually
+    # Render individual panels WITHOUT letter labels
+    for _txt in _letter_artists:
+        _txt.set_visible(False)
     fig.canvas.draw()
     _renderer = fig.canvas.get_renderer()
     _pad_px   = fig.dpi * 0.12
@@ -2230,6 +2227,17 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
         _pbuf.seek(0)
         panel_images[_ltr] = _PILImage.open(_pbuf).copy()
         _pbuf.close()
+
+    # Restore letter labels then render combined figure
+    for _txt in _letter_artists:
+        _txt.set_visible(True)
+    fig.canvas.draw()
+    _buf = _io.BytesIO()
+    fig.savefig(_buf, format="png", dpi=150, bbox_inches="tight",
+                facecolor=fig.get_facecolor())
+    _buf.seek(0)
+    combined_pil = _PILImage.open(_buf).copy()
+    _buf.close()
 
     # Save to disk only if output_path explicitly provided (CLI / legacy callers)
     if output_path:

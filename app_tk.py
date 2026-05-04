@@ -1123,6 +1123,16 @@ class SPTPalmApp(tk.Tk):
         self.v_cluster_eps_nm      = tk.DoubleVar(value=50.0)
         self.v_cluster_min_samples = tk.IntVar(value=10)
 
+        # Export settings
+        self.v_export_png      = tk.BooleanVar(value=True)
+        self.v_export_pdf      = tk.BooleanVar(value=False)
+        self.v_export_combined = tk.BooleanVar(value=True)
+        self.v_export_panels   = tk.BooleanVar(value=False)
+        self._export_panel_vars = {
+            ltr: tk.BooleanVar(value=True)
+            for ltr in "ABCDEFGHIJKLMN"
+        }
+
     # ── Top-level layout ──────────────────────────────────────────────────────
 
     def _build_ui(self):
@@ -1752,6 +1762,33 @@ class SPTPalmApp(tk.Tk):
                       "Greys — greyscale; clean for publication."
                   ))
 
+        # ── Export Settings ───────────────────────────────────────────────────
+        f = self._section(p, "Export Settings")
+        self._row(f, "File formats",
+                  lambda P: self._fmt_checks(P),
+                  info="PNG — raster image, good for reports and presentations.\n"
+                       "PDF — vector format, editable in Illustrator or Affinity Designer.")
+        self._row(f, "Save combined figure",
+                  lambda P: ttk.Checkbutton(P, variable=self.v_export_combined,
+                                            style="Card.TCheckbutton"),
+                  info="Save the full multi-panel summary figure to the figures/ folder.")
+        self._row(f, "Save individual panels",
+                  lambda P: ttk.Checkbutton(P, variable=self.v_export_panels,
+                                            style="Card.TCheckbutton",
+                                            command=self._toggle_panel_export),
+                  info="Save each panel as a separate file without letter labels.\n"
+                       "Saved to figures/panels/ inside the output folder.")
+        # Panel selector grid
+        self._panel_sel_frame = tk.Frame(f, bg=CARD)
+        self._panel_sel_frame.pack(fill="x", padx=10, pady=(0, 6))
+        for i, ltr in enumerate("ABCDEFGHIJKLMN"):
+            r, c = divmod(i, 7)
+            ttk.Checkbutton(self._panel_sel_frame, text=ltr,
+                            variable=self._export_panel_vars[ltr],
+                            style="Card.TCheckbutton").grid(
+                row=r, column=c, padx=4, pady=2, sticky="w")
+        self._toggle_panel_export()
+
         # ── Save Settings ─────────────────────────────────────────────────────
         # Thin divider
         tk.Frame(p, bg=BORDER, height=1).pack(fill="x", padx=16, pady=(12, 4))
@@ -1783,6 +1820,20 @@ class SPTPalmApp(tk.Tk):
         state = "normal" if self.v_filter_d_enabled.get() else "disabled"
         self._d_min_w.configure(state=state)
         self._d_max_w.configure(state=state)
+
+    def _fmt_checks(self, parent):
+        f = tk.Frame(parent, bg=CARD)
+        ttk.Checkbutton(f, text="PNG", variable=self.v_export_png,
+                        style="Card.TCheckbutton").pack(side="left", padx=(0, 14))
+        ttk.Checkbutton(f, text="PDF", variable=self.v_export_pdf,
+                        style="Card.TCheckbutton").pack(side="left")
+        return f
+
+    def _toggle_panel_export(self):
+        state = "normal" if self.v_export_panels.get() else "disabled"
+        for w in self._panel_sel_frame.winfo_children():
+            try: w.configure(state=state)
+            except Exception: pass
 
     def _toggle_roi(self):
         mode     = self.v_roi_mode.get()
@@ -1835,6 +1886,11 @@ class SPTPalmApp(tk.Tk):
             "proj_cmap":       self.v_proj_cmap.get(),
             "cluster_eps_nm":      self.v_cluster_eps_nm.get(),
             "cluster_min_samples": self.v_cluster_min_samples.get(),
+            "export_png":      self.v_export_png.get(),
+            "export_pdf":      self.v_export_pdf.get(),
+            "export_combined": self.v_export_combined.get(),
+            "export_panels":   self.v_export_panels.get(),
+            "export_panels_sel": {k: v.get() for k, v in self._export_panel_vars.items()},
         }
 
     def _apply_settings_dict(self, d: dict):
@@ -1874,6 +1930,14 @@ class SPTPalmApp(tk.Tk):
         _s(self.v_proj_cmap,      "proj_cmap")
         _s(self.v_cluster_eps_nm,      "cluster_eps_nm")
         _s(self.v_cluster_min_samples, "cluster_min_samples")
+        _s(self.v_export_png,      "export_png")
+        _s(self.v_export_pdf,      "export_pdf")
+        _s(self.v_export_combined, "export_combined")
+        _s(self.v_export_panels,   "export_panels")
+        if "export_panels_sel" in d:
+            for k, v in d["export_panels_sel"].items():
+                if k in self._export_panel_vars:
+                    self._export_panel_vars[k].set(v)
         # Refresh dependent widget states
         self._toggle_px()
         self._toggle_fi()
@@ -2292,115 +2356,22 @@ class SPTPalmApp(tk.Tk):
         t2 = _add_tab("Figure")
         fig_scroll = _ScrollFrame(t2, bg=BG)
         fig_scroll.pack(fill="both", expand=True)
-        p_fig = fig_scroll.inner
-
-        panel_images = fig_data.get("panels", {})
-        panel_titles = fig_data.get("panel_titles", {})
-
-        # Gallery: 3-column grid of thumbnails with checkboxes
-        _section_label(p_fig, "Analysis Panels  —  select panels to export")
-
-        gallery_frame = tk.Frame(p_fig, bg=BG)
-        gallery_frame.pack(fill="x", padx=16, pady=(4, 8))
-
-        THUMB_W = 260
-        _panel_vars  = {}   # letter -> BooleanVar
-        _panel_imgs  = []   # keep references to avoid GC
-
-        letters_sorted = sorted(panel_images.keys())
-        for col_idx in range(3):
-            gallery_frame.columnconfigure(col_idx, weight=1)
-
-        for i, ltr in enumerate(letters_sorted):
-            pil_img = panel_images[ltr]
-            title   = panel_titles.get(ltr, ltr)
-
-            # Resize thumbnail preserving aspect ratio
-            w, h = pil_img.size
-            th   = int(h * THUMB_W / w)
-            thumb = pil_img.resize((THUMB_W, th), resample=3)  # LANCZOS
-
+        combined = fig_data.get("combined")
+        if combined is not None:
             try:
-                from PIL import ImageTk
-                photo = ImageTk.PhotoImage(thumb)
-                _panel_imgs.append(photo)
+                from PIL import ImageTk as _ITk
+                w, h  = combined.size
+                scale = min(1200 / w, 1.0)
+                disp  = combined.resize((int(w*scale), int(h*scale)), resample=1)
+                photo = _ITk.PhotoImage(disp)
+                lbl   = tk.Label(fig_scroll.inner, image=photo, bg=BG)
+                lbl.image = photo
+                lbl.pack(padx=8, pady=8)
             except Exception:
-                continue
-
-            col = i % 3
-            row = i // 3
-            cell = tk.Frame(gallery_frame, bg=CARD, relief="flat", bd=0,
-                            highlightthickness=1, highlightbackground=BORDER)
-            cell.grid(row=row, column=col, padx=6, pady=6, sticky="nsew")
-
-            tk.Label(cell, image=photo, bg=CARD).pack(padx=4, pady=(4, 2))
-
-            var = tk.BooleanVar(value=True)
-            _panel_vars[ltr] = var
-            tk.Checkbutton(cell, text=f"  {ltr}  —  {title[:35]}",
-                           variable=var, bg=CARD, fg=TXT,
-                           activebackground=CARD, activeforeground=ACC,
-                           selectcolor=CARD, font=F(9)).pack(anchor="w", padx=6, pady=(0, 4))
-
-        # Keep thumbnail refs GC-safe by attaching to scroll frame
-        fig_scroll._img_refs = _panel_imgs
-
-        _divider(p_fig)
-
-        # Export controls
-        export_row = tk.Frame(p_fig, bg=BG)
-        export_row.pack(anchor="w", padx=16, pady=(4, 12))
-
-        def _select_all():
-            for v in _panel_vars.values(): v.set(True)
-        def _select_none():
-            for v in _panel_vars.values(): v.set(False)
-
-        _FlatButton(export_row, text="Select All",  command=_select_all ).pack(side="left", padx=(0, 8))
-        _FlatButton(export_row, text="Select None", command=_select_none).pack(side="left", padx=(0, 20))
-
-        def _export_selected():
-            selected = [ltr for ltr, v in _panel_vars.items() if v.get()]
-            if not selected:
-                messagebox.showinfo("Export", "No panels selected.")
-                return
-            self.lift(); self.focus_force(); self.update()
-            folder = filedialog.askdirectory(parent=self, title="Choose export folder")
-            if not folder:
-                return
-            saved = 0
-            for ltr in selected:
-                img = panel_images.get(ltr)
-                if img is None:
-                    continue
-                base = f"{stem}_panel_{ltr}"
-                img.save(os.path.join(folder, f"{base}.png"), dpi=(150, 150))
-                saved += 1
-            messagebox.showinfo("Export", f"Saved {saved} panel(s) to:\n{folder}")
-
-        def _export_combined():
-            combined = fig_data.get("combined")
-            if combined is None:
-                return
-            self.lift(); self.focus_force(); self.update()
-            path = filedialog.asksaveasfilename(
-                parent=self, title="Save combined figure",
-                defaultextension=".png",
-                filetypes=[("PNG", "*.png"), ("All files", "*.*")],
-                initialfile=f"{stem}_sptpalm_figure.png")
-            if path:
-                combined.save(path, dpi=(150, 150))
-                messagebox.showinfo("Saved", f"Figure saved to:\n{path}")
-
-        _FlatButton(export_row, text="Export Selected Panels…",
-                    command=_export_selected).pack(side="left", padx=(0, 8))
-        _FlatButton(export_row, text="Save Combined Figure…",
-                    command=_export_combined).pack(side="left")
-
+                pass
         if roi_path and os.path.exists(roi_path):
-            _divider(p_fig)
-            _section_label(p_fig, "ROI mask preview")
-            _embed_image(p_fig, roi_path, max_w=900, max_h=320)
+            _section_label(fig_scroll.inner, "ROI mask preview")
+            _embed_image(fig_scroll.inner, roi_path, max_w=900, max_h=320)
 
         # ── Tab: Output Files ─────────────────────────────────────────────────
         t3 = _add_tab("Output Files")
@@ -2734,10 +2705,29 @@ class SPTPalmApp(tk.Tk):
                                           cluster_locs=b_cluster_xy,
                                           dwell_df=b_dwell_df,
                                           dwell_tau=b_dwell_tau)
-                    # Batch mode: auto-save the combined figure since user isn't watching
-                    fig_data["combined"].save(
-                        os.path.join(fig_dir, f"{stem}_sptpalm_figure.png"),
-                        dpi=(150, 150))
+                    # Batch: respect export settings, default to PNG if nothing chosen
+                    _b_png = self.v_export_png.get()
+                    _b_pdf = self.v_export_pdf.get()
+                    if not _b_png and not _b_pdf:
+                        _b_png = True   # always save something in batch
+                    if self.v_export_combined.get() or True:   # always save combined in batch
+                        if _b_png:
+                            fig_data["combined"].save(
+                                os.path.join(fig_dir, f"{stem}_sptpalm_figure.png"), dpi=(150,150))
+                        if _b_pdf:
+                            fig_data["combined"].save(
+                                os.path.join(fig_dir, f"{stem}_sptpalm_figure.pdf"), "PDF", resolution=150)
+                    if self.v_export_panels.get():
+                        _b_sel  = {k for k, v in self._export_panel_vars.items() if v.get()}
+                        _b_pdir = os.path.join(fig_dir, "panels")
+                        os.makedirs(_b_pdir, exist_ok=True)
+                        for _ltr, _pimg in fig_data.get("panels", {}).items():
+                            if _ltr not in _b_sel:
+                                continue
+                            if _b_png:
+                                _pimg.save(os.path.join(_b_pdir, f"{stem}_panel_{_ltr}.png"), dpi=(150,150))
+                            if _b_pdf:
+                                _pimg.save(os.path.join(_b_pdir, f"{stem}_panel_{_ltr}.pdf"), "PDF", resolution=150)
 
                     mc_  = diff_df["motion"].value_counts()
                     row  = {
@@ -3323,6 +3313,30 @@ class SPTPalmApp(tk.Tk):
             except Exception:
                 pass
 
+            # Save figures based on export settings
+            _emit_progress("Saving outputs…", 93)
+            _do_png = self.v_export_png.get()
+            _do_pdf = self.v_export_pdf.get()
+            if self.v_export_combined.get():
+                if _do_png:
+                    fig_data["combined"].save(
+                        os.path.join(fig_dir, f"{stem}_sptpalm_figure.png"), dpi=(150,150))
+                if _do_pdf:
+                    fig_data["combined"].save(
+                        os.path.join(fig_dir, f"{stem}_sptpalm_figure.pdf"), "PDF", resolution=150)
+            if self.v_export_panels.get():
+                _sel  = {k for k, v in self._export_panel_vars.items() if v.get()}
+                _pdir = os.path.join(fig_dir, "panels")
+                os.makedirs(_pdir, exist_ok=True)
+                for _ltr, _pimg in fig_data.get("panels", {}).items():
+                    if _ltr not in _sel:
+                        continue
+                    if _do_png:
+                        _pimg.save(os.path.join(_pdir, f"{stem}_panel_{_ltr}.png"), dpi=(150,150))
+                    if _do_pdf:
+                        _pimg.save(os.path.join(_pdir, f"{stem}_panel_{_ltr}.pdf"), "PDF", resolution=150)
+
+            # Save CSVs
             locs.to_csv(
                 os.path.join(data_dir, f"{stem}_localisations.csv"), index=False)
             tracks.to_csv(
