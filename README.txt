@@ -2,7 +2,6 @@ sptPALM Analysis Pipeline — By Jacob Levers
 ============================================
 Single-particle tracking PALM analysis for Zeiss Elyra CZI and TIFF files.
 Compatible with PC12 cells, Drosophila neurons, and other cell types.
-Developed at the University of Queensland, 2026.
 
 
 ================================================================
