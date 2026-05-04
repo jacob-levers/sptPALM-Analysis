@@ -68,6 +68,7 @@ jobs:
   # ──────────────────────────────────────────────────────────────────────────
   build-windows:
     runs-on: windows-latest
+    needs: build-macos   # ensures macOS creates the release first; Windows then uploads to it
 
     steps:
       - name: Checkout
