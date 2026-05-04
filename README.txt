@@ -163,6 +163,29 @@ only tracks with D inside [D min, D max] are passed to JDD and summary stats.
 
 
 ================================================================
+CLUSTER ANALYSIS  (DBSCAN)
+================================================================
+
+DBSCAN groups raw localisations into spatial clusters (e.g. receptor
+nanodomains). Results are shown in figure panel L and saved to
+*_cluster_stats.csv (one row per cluster — n_locs, area µm², density,
+centroid position).
+
+Settings in Settings → Cluster Analysis (DBSCAN):
+  - DBSCAN radius (nm)      Search radius. Typical values: 30–80 nm.
+                            Smaller = tighter clusters, larger = merges
+                            nearby clusters together.
+  - Min localisations       Minimum points to form a cluster. Increase
+                            to reject noise, decrease to find small clusters.
+
+Performance note: DBSCAN is capped at 250,000 localisations. On larger
+datasets a random subsample is used, which reliably reproduces the spatial
+cluster pattern with much faster processing. If your dataset is sparse and
+you are concerned about missing small clusters, reduce the acquisition
+density or run dedicated cluster analysis software (e.g. SR-Tesseler).
+
+
+================================================================
 DRIFT CORRECTION
 ================================================================
 
