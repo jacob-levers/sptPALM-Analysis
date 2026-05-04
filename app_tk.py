@@ -1145,7 +1145,7 @@ class SPTPalmApp(tk.Tk):
                  relief="flat", bd=0, font=F(11),
                  highlightthickness=1, highlightbackground=BORDER,
                  highlightcolor=ACC).pack(side="left", **pad)
-        ttk.Button(parent, text="Browse…",
+        ttk.Button(parent, text="Browse",
                    command=self._browse_file).pack(side="left", padx=(0, 20))
 
         tk.Label(parent, text="Output folder", bg=SIDEBAR, fg=MUTED, font=F(11)).pack(
@@ -1155,7 +1155,7 @@ class SPTPalmApp(tk.Tk):
                  relief="flat", bd=0, font=F(11),
                  highlightthickness=1, highlightbackground=BORDER,
                  highlightcolor=ACC).pack(side="left", **pad)
-        ttk.Button(parent, text="Browse…",
+        ttk.Button(parent, text="Browse",
                    command=self._browse_outdir).pack(side="left", padx=(0, 14))
         self._batch_btn = ttk.Button(parent, text="Batch",
                                      command=self._on_batch, width=7)
