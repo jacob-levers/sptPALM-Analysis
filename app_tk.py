@@ -1249,6 +1249,7 @@ class SPTPalmApp(tk.Tk):
     def _on_stop(self):
         """Signal the worker to stop. Button stays in place, text changes."""
         self._stop_event.set()
+        self._stop_requested_at = time.monotonic()
         self._run_btn.configure(state="disabled", text="■  Stopping…",
                                 style="Stop.TButton")
 
@@ -2830,7 +2831,10 @@ class SPTPalmApp(tk.Tk):
             self._q.put(("batch_done", {"out_dir": batch_root}))
 
         except Exception:
-            self._q.put(("stopped", None))
+            if stop.is_set():
+                self._q.put(("stopped", None))
+            else:
+                self._q.put(("error", traceback.format_exc()))
         finally:
             sys.stdout = old_stdout
 
@@ -3407,6 +3411,13 @@ class SPTPalmApp(tk.Tk):
             self._update_preview(*latest_preview)
 
         if self._running:
+            # Safety net: if stop was requested >60 s ago and thread hasn't
+            # responded, force-reset the UI so it doesn't stay stuck.
+            if (self._stop_event.is_set()
+                    and hasattr(self, "_stop_requested_at")
+                    and time.monotonic() - self._stop_requested_at > 60):
+                self._on_stopped()
+                return
             self.after(100, self._poll)
 
     def _reset_run_btn(self):
