@@ -1637,7 +1637,7 @@ def compute_turning_angles(tracks):
     """
     all_angles = []
     for pid, grp in tracks.groupby("particle"):
-        grp = grp.sort_values("frame")
+        grp = grp.reset_index(drop=True).sort_values("frame")
         xy  = grp[["x", "y"]].values
         if len(xy) < 3:
             continue
