@@ -16,3 +16,4 @@ tifffile
 imageio
 Pillow
 psutil
+scikit-learn
