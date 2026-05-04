@@ -1528,7 +1528,7 @@ def compute_jdd(tracks, pixel_size_um, frame_interval_s, n_components=2):
     jumps = []
 
     for pid, grp in tracks.groupby("particle"):
-        grp    = grp.sort_values("frame")
+        grp    = grp.reset_index(drop=True).sort_values("frame")
         frames = grp["frame"].values
         x      = grp["x"].values * pixel_size_um
         y      = grp["y"].values * pixel_size_um
