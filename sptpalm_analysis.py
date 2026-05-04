@@ -1693,6 +1693,90 @@ def compute_mobile_fraction_over_time(tracks, diff_df, frame_interval,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  CLUSTER ANALYSIS  (DBSCAN)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compute_clusters(locs, pixel_size_um, eps_um=0.05, min_samples=5):
+    from sklearn.cluster import DBSCAN
+    from scipy.spatial import ConvexHull
+    xy = locs[["x", "y"]].values * pixel_size_um
+    labels = DBSCAN(eps=eps_um, min_samples=min_samples).fit_predict(xy)
+    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+    rows = []
+    for c in sorted(set(labels)):
+        if c == -1:
+            continue
+        pts = xy[labels == c]
+        n = len(pts)
+        try:
+            area = ConvexHull(pts).volume if n >= 3 else np.nan
+        except Exception:
+            area = np.nan
+        density = n / area if (area and area > 0) else np.nan
+        rows.append({"cluster_id": int(c), "n_locs": int(n),
+                     "area_um2": area, "density_locs_per_um2": density,
+                     "centroid_x_um": pts[:,0].mean(),
+                     "centroid_y_um": pts[:,1].mean()})
+    return labels, pd.DataFrame(rows), int(n_clusters)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DWELL TIME ANALYSIS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compute_dwell_times(tracks, diff_df, frame_interval):
+    confined_pids = diff_df[diff_df["motion"].isin(["Confined", "Immobile"])]["particle"]
+    rows = []
+    for pid in confined_pids:
+        n = len(tracks[tracks["particle"] == pid])
+        if n > 0:
+            rows.append({"particle": int(pid), "dwell_time_s": n * frame_interval})
+    dwell_df = pd.DataFrame(rows)
+    tau = np.nan
+    if len(dwell_df) >= 10:
+        try:
+            dt = np.sort(dwell_df["dwell_time_s"].values)
+            cdf = np.arange(1, len(dt) + 1) / len(dt)
+            popt, _ = curve_fit(lambda t, tau: 1 - np.exp(-t / tau),
+                                dt, cdf, p0=[dt.mean()], bounds=(1e-6, np.inf),
+                                maxfev=2000)
+            tau = float(popt[0])
+        except Exception:
+            pass
+    return dwell_df, tau
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MOMENT SCALING SPECTRUM  (MSS)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compute_mss(tracks, pixel_size_um, frame_interval, max_lagtime=10):
+    q_values = [1, 2, 3, 4]
+    results = []
+    for pid, grp in (tracks.reset_index(drop=True)
+                          .sort_values("frame").groupby("particle")):
+        xy = grp[["x", "y"]].values * pixel_size_um
+        n = len(xy)
+        if n < max(max_lagtime + 2, 6):
+            continue
+        gammas = []
+        lag_arr = list(range(1, min(max_lagtime + 1, n // 2)))
+        if len(lag_arr) < 3:
+            continue
+        for q in q_values:
+            moments = []
+            for lag in lag_arr:
+                r = np.sqrt(np.sum((xy[lag:] - xy[:-lag]) ** 2, axis=1))
+                moments.append(np.mean(r ** q))
+            log_t = np.log(np.array(lag_arr, dtype=float) * frame_interval)
+            log_m = np.log(np.array(moments) + 1e-15)
+            gammas.append(np.polyfit(log_t, log_m, 1)[0])
+        mss_slope = np.polyfit(q_values, gammas, 1)[0]
+        results.append({"particle": int(pid), "mss_slope": float(mss_slope)})
+    return pd.DataFrame(results)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  FIGURE
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1713,7 +1797,9 @@ def _draw_track(grp, color, ax, lw=0.8, alpha=0.6):
 def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
                 pixel_size, frame_interval, output_path, roi_mask=None,
                 fig_theme="Dark", proj_cmap="Inferno", jdd=None,
-                turning_angles=None, mobile_frac_df=None):
+                turning_angles=None, mobile_frac_df=None,
+                cluster_labels=None, cluster_locs=None,
+                dwell_df=None, dwell_tau=None):
     print("  Rendering figure ...")
 
     # ── Theme palettes ─────────────────────────────────────────────────────────
@@ -1760,9 +1846,9 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
         "font.family":      _font})
 
     _has_jdd = jdd is not None
-    fig = plt.figure(figsize=(20, 26), facecolor=BG)
-    gs  = GridSpec(4, 3, figure=fig, hspace=0.42, wspace=0.32,
-                   left=0.06, right=0.97, top=0.93, bottom=0.05)
+    fig = plt.figure(figsize=(20, 32), facecolor=BG)
+    gs  = GridSpec(5, 3, figure=fig, hspace=0.42, wspace=0.32,
+                   left=0.06, right=0.97, top=0.94, bottom=0.04)
 
     def sax(ax, ltr, ttl):
         ax.set_facecolor(PNL)
@@ -2029,6 +2115,74 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
                 ha="center", va="center", color=TXT, fontsize=12)
         sax(ax, "K", "Jump Distance Distribution")
 
+    # L — Cluster Map
+    ax = fig.add_subplot(gs[4, 0])
+    if cluster_labels is not None and cluster_locs is not None and len(cluster_locs) > 0:
+        xy_um = cluster_locs[["x", "y"]].values * pixel_size
+        noise = cluster_labels == -1
+        if noise.any():
+            ax.scatter(xy_um[noise, 0], xy_um[noise, 1],
+                       s=0.5, c="#444", alpha=0.3, linewidths=0, rasterized=True)
+        clustered = ~noise
+        if clustered.any():
+            n_c = cluster_labels.max() + 1
+            cmap_c = plt.cm.get_cmap("tab20", max(n_c, 1))
+            ax.scatter(xy_um[clustered, 0], xy_um[clustered, 1],
+                       s=1.5, c=cluster_labels[clustered], cmap=cmap_c,
+                       alpha=0.7, linewidths=0, rasterized=True,
+                       vmin=0, vmax=max(n_c - 1, 1))
+        ax.set_xlabel("X  (µm)", fontsize=9)
+        ax.set_ylabel("Y  (µm)", fontsize=9)
+        ax.text(0.02, 0.98, f"n={cluster_labels.max()+1 if cluster_labels.max()>=0 else 0} clusters",
+                transform=ax.transAxes, fontsize=8, color=TXT, va="top")
+    else:
+        ax.text(0.5, 0.5, "Cluster analysis\nnot computed",
+                transform=ax.transAxes, ha="center", va="center", color=MUTED, fontsize=10)
+    sax(ax, "L", "Cluster Map  (DBSCAN)")
+
+    # M — Dwell Time Distribution
+    ax = fig.add_subplot(gs[4, 1])
+    if dwell_df is not None and len(dwell_df) >= 5:
+        dt_vals = dwell_df["dwell_time_s"].values
+        ax.hist(dt_vals, bins=30, color=ACC, alpha=0.75, edgecolor="none", density=True)
+        if np.isfinite(dwell_tau):
+            t_fit = np.linspace(0, dt_vals.max(), 200)
+            ax.plot(t_fit, (1/dwell_tau) * np.exp(-t_fit / dwell_tau),
+                    "--", color="#f78166", lw=2,
+                    label=f"τ = {dwell_tau:.2f} s")
+            ax.legend(fontsize=8, framealpha=0.6, facecolor=PNL,
+                      edgecolor=GRD, labelcolor=TXT)
+        ax.set_xlabel("Dwell time  (s)", fontsize=9)
+        ax.set_ylabel("Probability density", fontsize=9)
+        ax.grid(True, ls=":", alpha=0.3)
+    else:
+        ax.text(0.5, 0.5, "Insufficient data\n(need confined/immobile tracks)",
+                transform=ax.transAxes, ha="center", va="center", color=MUTED, fontsize=10)
+    sax(ax, "M", "Dwell Time Distribution")
+
+    # N — MSS Slope Distribution
+    ax = fig.add_subplot(gs[4, 2])
+    if "mss_slope" in diff_df.columns and diff_df["mss_slope"].notna().sum() >= 5:
+        ms = diff_df["mss_slope"].dropna()
+        ms = ms[ms.between(-0.5, 1.5)]
+        bins = np.linspace(ms.min(), ms.max(), 40)
+        for m in MORD:
+            sub = diff_df[(diff_df["motion"] == m) & diff_df["mss_slope"].notna()]
+            sub = sub[sub["mss_slope"].between(-0.5, 1.5)]
+            if len(sub):
+                ax.hist(sub["mss_slope"], bins=bins, color=MC[m],
+                        alpha=0.7, label=m, edgecolor="none")
+        for xv, lb, ls_ in [(0.25, "Confined", ":"), (0.5, "Brownian", "--"), (0.75, "Directed", ":")]:
+            ax.axvline(xv, color=GRD, ls=ls_, lw=1.2, label=lb)
+        ax.set_xlabel("MSS slope  (ν)", fontsize=9)
+        ax.set_ylabel("Count", fontsize=9)
+        ax.legend(fontsize=7, framealpha=0.6, facecolor=PNL, edgecolor=GRD, labelcolor=TXT)
+        ax.grid(True, ls=":", alpha=0.3)
+    else:
+        ax.text(0.5, 0.5, "MSS not computed\n(tracks too short)",
+                transform=ax.transAxes, ha="center", va="center", color=MUTED, fontsize=10)
+    sax(ax, "N", "Moment Scaling Spectrum  (MSS slope)")
+
     md = diff_df["D"].dropna().median()
     ma = diff_df["alpha"].dropna().median()
     fig.suptitle(
@@ -2225,7 +2379,9 @@ def main():
     make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
                 pixel_size, frame_interval, fig_path,
                 roi_mask=roi_mask, jdd=jdd,
-                turning_angles=None, mobile_frac_df=None)
+                turning_angles=None, mobile_frac_df=None,
+                cluster_labels=None, cluster_locs=None,
+                dwell_df=None, dwell_tau=None)
 
     # Summary
     total = time.perf_counter() - t_start

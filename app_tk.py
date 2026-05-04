@@ -1075,6 +1075,10 @@ class SPTPalmApp(tk.Tk):
         self.v_filter_d_min     = tk.DoubleVar(value=0.0)
         self.v_filter_d_max     = tk.DoubleVar(value=1.0)
 
+        # Cluster Analysis (DBSCAN)
+        self.v_cluster_eps_nm      = tk.DoubleVar(value=50.0)
+        self.v_cluster_min_samples = tk.IntVar(value=10)
+
     # ── Top-level layout ──────────────────────────────────────────────────────
 
     def _build_ui(self):
@@ -1578,6 +1582,18 @@ class SPTPalmApp(tk.Tk):
                   info="Tracks with D above this value are excluded.")
         self._toggle_d_filter()
 
+        # ── Cluster Analysis (DBSCAN) ─────────────────────────────────────────
+        f = self._section(p, "Cluster Analysis  (DBSCAN)")
+        self._row(f, "DBSCAN radius (nm)",
+                  lambda P: self._spin_flt(P, self.v_cluster_eps_nm, 10.0, 500.0, 5.0),
+                  info=("Search radius for DBSCAN clustering of raw localisations (nm). "
+                        "Typical values: 30–80 nm for membrane receptor clusters. "
+                        "Smaller = tighter/more clusters, larger = merges nearby clusters."))
+        self._row(f, "Min localisations",
+                  lambda P: self._spin_int(P, self.v_cluster_min_samples, 3, 200),
+                  info=("Minimum number of localisations in a neighbourhood to form a cluster. "
+                        "Typical values: 5–20. Increase to reject noise, decrease to find small clusters."))
+
         # ── ROI Masking ───────────────────────────────────────────────────────
         f = self._section(p, "ROI Masking")
         cb = self._row(f, "ROI mode",
@@ -1773,6 +1789,8 @@ class SPTPalmApp(tk.Tk):
             "chunk_size":      self.v_chunk_size.get(),
             "fig_theme":       self.v_fig_theme.get(),
             "proj_cmap":       self.v_proj_cmap.get(),
+            "cluster_eps_nm":      self.v_cluster_eps_nm.get(),
+            "cluster_min_samples": self.v_cluster_min_samples.get(),
         }
 
     def _apply_settings_dict(self, d: dict):
@@ -1810,6 +1828,8 @@ class SPTPalmApp(tk.Tk):
         _s(self.v_chunk_size,     "chunk_size")
         _s(self.v_fig_theme,      "fig_theme")
         _s(self.v_proj_cmap,      "proj_cmap")
+        _s(self.v_cluster_eps_nm,      "cluster_eps_nm")
+        _s(self.v_cluster_min_samples, "cluster_min_samples")
         # Refresh dependent widget states
         self._toggle_px()
         self._toggle_fi()
@@ -2255,6 +2275,7 @@ class SPTPalmApp(tk.Tk):
             (f"{stem}_trajectories.csv",      "Full trajectory table",         data_dir2),
             (f"{stem}_localisations.csv",     "Raw localisations",             data_dir2),
             (f"{stem}_ensemble_msd.csv",      "Ensemble MSD curve",            data_dir2),
+            (f"{stem}_cluster_stats.csv",     "DBSCAN cluster statistics",     data_dir2),
         ]
         if roi_path and os.path.exists(roi_path):
             file_info.append((os.path.basename(roi_path), "ROI mask preview", data_dir2))
@@ -2420,6 +2441,8 @@ class SPTPalmApp(tk.Tk):
             from sptpalm_analysis import (
                 load_file, preprocess_and_localise_adaptive,
                 link_trajectories, compute_msd_and_fit, compute_jdd,
+                compute_turning_angles, compute_mobile_fraction_over_time,
+                compute_clusters, compute_dwell_times, compute_mss,
                 build_roi_mask, apply_roi_mask, make_figure,
                 correct_drift, _Cancelled,
             )
@@ -2524,18 +2547,40 @@ class SPTPalmApp(tk.Tk):
                         window_frames=max(50, int(0.1 * tracks["frame"].max()))
                         if len(tracks) else 100)
 
+                    b_cluster_labels, b_cluster_stats_df, b_n_clusters = compute_clusters(
+                        locs, px,
+                        eps_um=self.v_cluster_eps_nm.get() / 1000.0,
+                        min_samples=self.v_cluster_min_samples.get())
+                    _emit_log(f"  Clusters: {b_n_clusters} found")
+
+                    b_dwell_df, b_dwell_tau = compute_dwell_times(tracks, diff_df, fi)
+
+                    b_mss_df = compute_mss(tracks, px, fi,
+                                           max_lagtime=self.v_max_lagtime.get())
+                    if len(b_mss_df):
+                        diff_df = diff_df.merge(
+                            b_mss_df[["particle", "mss_slope"]], on="particle", how="left")
+
                     # Save CSVs
                     for df, suf in [(locs, "localisations"),
                                     (tracks, "trajectories"),
                                     (diff_df, "diffusion_summary")]:
                         df.to_csv(os.path.join(data_dir, f"{stem}_{suf}.csv"), index=False)
 
+                    if len(b_cluster_stats_df):
+                        b_cluster_stats_df.to_csv(
+                            os.path.join(data_dir, f"{stem}_cluster_stats.csv"), index=False)
+
                     fig_path = os.path.join(fig_dir, f"{stem}_sptpalm_figure.png")
                     make_figure(proj_sample, tracks, imsd_df, emsd_df, diff_df,
                                 px, fi, fig_path, roi_mask=roi_mask,
                                 fig_theme=self.v_fig_theme.get(),
                                 proj_cmap=self.v_proj_cmap.get(), jdd=jdd,
-                                turning_angles=b_ta, mobile_frac_df=b_mf)
+                                turning_angles=b_ta, mobile_frac_df=b_mf,
+                                cluster_labels=b_cluster_labels,
+                                cluster_locs=locs,
+                                dwell_df=b_dwell_df,
+                                dwell_tau=b_dwell_tau)
 
                     mc_  = diff_df["motion"].value_counts()
                     row  = {
@@ -2762,6 +2807,7 @@ class SPTPalmApp(tk.Tk):
                 load_file, preprocess_and_localise_adaptive,
                 link_trajectories, compute_msd_and_fit, compute_jdd,
                 compute_turning_angles, compute_mobile_fraction_over_time,
+                compute_clusters, compute_dwell_times, compute_mss,
                 build_roi_mask, apply_roi_mask, make_figure,
                 correct_drift, _Cancelled,
             )
@@ -3072,10 +3118,28 @@ class SPTPalmApp(tk.Tk):
                 tracks, diff_df, fi,
                 window_frames=max(50, int(0.1 * tracks["frame"].max())) if len(tracks) else 100)
 
+            _emit_progress("Cluster analysis…", 88)
+            cluster_labels, cluster_stats_df, n_clusters = compute_clusters(
+                locs, px,
+                eps_um=self.v_cluster_eps_nm.get() / 1000.0,
+                min_samples=self.v_cluster_min_samples.get())
+            _emit_log(f"  Clusters: {n_clusters} found")
+
+            dwell_df, dwell_tau = compute_dwell_times(tracks, diff_df, fi)
+            if len(dwell_df):
+                _emit_log(f"  Dwell time: τ = {dwell_tau:.3f} s  (n={len(dwell_df)} confined/immobile tracks)"
+                          if np.isfinite(dwell_tau) else
+                          f"  Dwell time: {len(dwell_df)} confined/immobile tracks (too few to fit τ)")
+
+            mss_df = compute_mss(tracks, px, fi, max_lagtime=self.v_max_lagtime.get())
+            if len(mss_df):
+                diff_df = diff_df.merge(mss_df[["particle", "mss_slope"]], on="particle", how="left")
+                _emit_log(f"  MSS: computed for {mss_df.shape[0]:,} tracks")
+
             _check_stop()
 
             # ── 6. Save ───────────────────────────────────────────────────────
-            _emit_progress("Saving outputs…", 85)
+            _emit_progress("Saving outputs…", 92)
             fig_path = os.path.join(fig_dir, f"{stem}_sptpalm_figure.png")
             make_figure(proj_sample, tracks, imsd_df, emsd_df, diff_df,
                         px, fi, fig_path, roi_mask=roi_mask,
@@ -3083,7 +3147,11 @@ class SPTPalmApp(tk.Tk):
                         proj_cmap=self.v_proj_cmap.get(),
                         jdd=jdd,
                         turning_angles=turning_angles,
-                        mobile_frac_df=mobile_frac_df)
+                        mobile_frac_df=mobile_frac_df,
+                        cluster_labels=cluster_labels,
+                        cluster_locs=locs,
+                        dwell_df=dwell_df,
+                        dwell_tau=dwell_tau)
             del proj_sample; gc.collect()
 
             # Preview: the final saved figure
@@ -3110,6 +3178,9 @@ class SPTPalmApp(tk.Tk):
                     .reset_index(names="lag_frame")
                     .to_csv(os.path.join(data_dir, f"{stem}_ensemble_msd.csv"),
                             index=False))
+            if len(cluster_stats_df):
+                cluster_stats_df.to_csv(
+                    os.path.join(data_dir, f"{stem}_cluster_stats.csv"), index=False)
 
             _emit_progress("Complete!", 100)
             self._q.put(("done", {
