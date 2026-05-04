@@ -2483,13 +2483,15 @@ class SPTPalmApp(tk.Tk):
 
     def _browse_file(self):
         self.lift(); self.focus_force(); self.update()
+        import platform as _platform
+        _sep = ";" if _platform.system() == "Windows" else " "
         path = filedialog.askopenfilename(
             parent=self,
             title="Select CZI or TIF microscopy file",
             filetypes=[
-                ("Microscopy files", "*.czi;*.tif;*.tiff"),
+                ("Microscopy files", _sep.join(["*.czi", "*.tif", "*.tiff"])),
                 ("CZI files", "*.czi"),
-                ("TIFF files", "*.tif;*.tiff"),
+                ("TIFF files", _sep.join(["*.tif", "*.tiff"])),
                 ("All files", "*.*"),
             ])
         if path:
