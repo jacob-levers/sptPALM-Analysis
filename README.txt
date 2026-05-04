@@ -69,13 +69,24 @@ automatically. This takes 3–5 minutes. Subsequent launches are instant.
 USING THE APP
 ================================================================
 
-1. Click "Browse" and select your .czi or .tif file
+Single file
+-----------
+1. Click "Browse" next to Input file and select your .czi or .tif file
 2. Set an output folder (defaults to same folder as input)
 3. Review the settings panel on the left — hover over any ⓘ icon
    for a description of that parameter and suggested values
 4. Click "▶ Run Analysis"
 5. Watch the live preview and progress log on the right
 6. When done, click "Open Output Folder" to see results
+
+Batch processing (multiple files)
+----------------------------------
+1. Set your analysis parameters as normal in the settings panel
+2. Click "Batch" (next to the input file field)
+3. Select a folder containing your .czi or .tif files
+4. Confirm the file list and click OK
+5. Results for each file are saved to a batch_results/ sub-folder
+   inside the selected folder, plus a batch_summary.csv summary table
 
 Key settings to check before your first run:
   - Pixel size (µm/px)     Auto-read from CZI. Verify it is correct.
@@ -91,9 +102,10 @@ OUTPUT FILES
 
 After the run completes, a results folder appears containing:
 
-   *_sptpalm_figure.png      6-panel results figure. Open this first.
-   *_diffusion_summary.csv   D coefficient, alpha, and motion type per
-                             trajectory. Open in Excel.
+   *_sptpalm_figure.png      Results figure (see Figure Contents below).
+   *_diffusion_summary.csv   D coefficient, alpha, motion type, confinement
+                             radius, and localisation precision per track.
+                             Open in Excel.
    *_trajectories.csv        Full x/y trajectory data for every particle.
    *_localisations.csv       Raw molecule positions for every frame.
    *_ensemble_msd.csv        Ensemble-averaged MSD curve data.
@@ -101,6 +113,54 @@ After the run completes, a results folder appears containing:
                              was enabled).
    *_roi_mask.png            Preview of the ROI mask (if ROI masking was
                              enabled).
+
+Figure contents
+---------------
+Row 1:  A — Track overlay on mean projection
+        B — MSD curve (ensemble)
+        C — Diffusion coefficient histogram
+Row 2:  D — Alpha (anomalous exponent) histogram
+        E — Motion-type pie chart
+        F — Track length histogram
+Row 3:  G — Localisation density heatmap (all track positions in µm)
+        H — Jump Distance Distribution (JDD) with population fits
+
+Batch output
+------------
+Inside batch_results/:
+   <filename>/            Per-file sub-folder with the same files as above
+   batch_summary.csv      One row per file — n_tracks, mean D, mobile
+                          fraction, mean confinement radius, JDD populations
+
+
+================================================================
+JUMP DISTANCE DISTRIBUTION (JDD)
+================================================================
+
+JDD analysis fits the cumulative distribution of single-step displacements
+to a multi-population diffusion model. It is more robust than MSD-based
+methods for short tracks and gives the diffusion coefficient and fractional
+population of each mobility state.
+
+Set the number of JDD populations (1, 2, or 3) in Settings → MSD & JDD.
+Two populations (mobile + immobile) is recommended for most sptPALM datasets.
+
+The JDD panel in the figure shows the step-size histogram with the fitted
+PDF overlaid. Population D values and fractions are shown in the results
+panel and saved to *_diffusion_summary.csv.
+
+
+================================================================
+D-VALUE FILTER
+================================================================
+
+Enable "Filter by D" in Settings → MSD & JDD to restrict JDD fitting and
+downstream statistics to tracks within a specific diffusion coefficient range.
+Useful for isolating a mobility population of interest (e.g. only mobile
+molecules, or only those above a confinement threshold).
+
+The filter does not alter MSD fitting — all tracks are fitted first, then
+only tracks with D inside [D min, D max] are passed to JDD and summary stats.
 
 
 ================================================================
@@ -148,6 +208,31 @@ Always check the *_roi_mask.png preview before trusting filtered results.
 
 
 ================================================================
+COMING FROM PALMTRACER (FIJI)
+================================================================
+
+sptPALM Analysis uses the same localisation algorithm (Crocker & Grier)
+and the same nearest-neighbour linker as PALMTracer, so results should
+be comparable with equivalent settings.
+
+Key differences to be aware of:
+
+- PALMTracer applies a hard MSD cutoff that removes slow/immobile molecules.
+  This pipeline retains them, so your immobile fraction may appear higher.
+  Those molecules are real — they were not artefacts, just filtered out.
+
+- JDD analysis here uses CDF fitting, which is more robust for short tracks
+  than the histogram fitting used in some PALMTracer versions.
+
+- Confinement radius is reported per track in *_diffusion_summary.csv.
+  This is the mean distance of all positions from the track centroid (µm),
+  equivalent to the confinement radius from PALMTracer's confined motion mode.
+
+- Localisation precision (nm) is reported per track if your acquisition
+  software wrote it into the CZI metadata (trackpy ep column).
+
+
+================================================================
 TROUBLESHOOTING
 ================================================================
 
@@ -170,11 +255,10 @@ Pixel size or frame interval shows as WARNING
    The CZI metadata could not be read. Tick "Set manually" and
    enter the correct values from your acquisition settings.
 
-Results look different from PALMTracer
-   Different localisation algorithms and filtering produce different
-   results. PALMTracer applies a hard MSD cutoff that removes slow
-   molecules. This pipeline retains them, which is why the immobile
-   fraction may appear higher — those molecules are real, not artefacts.
+JDD fit does not converge / populations look wrong
+   Try reducing the number of JDD populations to 1 or 2.
+   Ensure min track length is at least 3 frames (more steps = better JDD).
+   If using the D filter, widen the D range and re-run.
 
 Out of memory during localisation
    Reduce Chunk size in Settings → Performance (try 200–300 frames).
@@ -182,6 +266,11 @@ Out of memory during localisation
 Analysis is slow
    Increase CPU workers in Settings → Performance.
    Use "Uniform Filter" background method (much faster than Rolling Ball).
+
+Batch run stops partway through
+   Check the log panel — a specific file likely failed. That file's
+   sub-folder in batch_results/ will be incomplete or absent. Fix the
+   file or exclude it and re-run batch on the remaining files.
 
 
 ================================================================
