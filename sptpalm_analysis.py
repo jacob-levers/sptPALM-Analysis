@@ -1455,7 +1455,13 @@ def _msd_and_fit_one(xy_um, frames, pid, lag_times, max_lagtime, n_fit):
         except: pass
 
     motion = classify_motion(alpha) if np.isfinite(alpha) else "Unknown"
-    return pid, msd_vals, dict(particle=pid, D=D, alpha=alpha, motion=motion)
+
+    # Confinement radius: mean distance of all positions from the track centroid
+    centroid       = xy_um.mean(axis=0)
+    conf_radius_um = float(np.mean(np.sqrt(np.sum((xy_um - centroid) ** 2, axis=1))))
+
+    return pid, msd_vals, dict(particle=pid, D=D, alpha=alpha, motion=motion,
+                               confinement_radius_um=conf_radius_um)
 
 
 def compute_msd_and_fit(tracks, pixel_size, frame_interval,
