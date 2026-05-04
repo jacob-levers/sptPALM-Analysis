@@ -1856,6 +1856,8 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
     gs  = GridSpec(5, 3, figure=fig, hspace=0.42, wspace=0.32,
                    left=0.06, right=0.97, top=0.94, bottom=0.04)
 
+    _panels = []   # (letter, axes) collected for per-panel export
+
     def sax(ax, ltr, ttl):
         ax.set_facecolor(PNL)
         for sp in ax.spines.values(): sp.set_edgecolor(GRD)
@@ -1863,6 +1865,7 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
                      color=TXT, pad=8, fontweight="bold")
         ax.text(-0.04,1.06,ltr,transform=ax.transAxes,fontsize=14,
                 color=ACC,fontweight="bold",va="top",ha="right")
+        _panels.append((ltr, ax))
 
     # Use up to 200 evenly-spaced frames for the max projection to save memory
     idx  = np.linspace(0, len(stack)-1, min(200, len(stack)), dtype=int)
@@ -2205,6 +2208,31 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
     plt.savefig(pdf_path, dpi=150, bbox_inches="tight",
                 facecolor=fig.get_facecolor())
     print(f"  Figure (PDF) -> {pdf_path}")
+
+    # Per-panel export — each labelled panel saved individually
+    try:
+        from matplotlib.transforms import Bbox as _Bbox
+        panel_dir = os.path.join(os.path.dirname(output_path), "panels")
+        os.makedirs(panel_dir, exist_ok=True)
+        fig.canvas.draw()
+        renderer  = fig.canvas.get_renderer()
+        stem_base = os.path.splitext(os.path.basename(output_path))[0]
+        pad_px    = fig.dpi * 0.10   # 0.1 inch padding in display units
+        for ltr, pax in _panels:
+            bbox = pax.get_tightbbox(renderer)
+            if bbox is None:
+                continue
+            bbox_padded = _Bbox([[bbox.x0 - pad_px, bbox.y0 - pad_px],
+                                  [bbox.x1 + pad_px, bbox.y1 + pad_px]])
+            bbox_in = bbox_padded.transformed(fig.dpi_scale_trans.inverted())
+            fig.savefig(os.path.join(panel_dir, f"{stem_base}_panel_{ltr}.png"),
+                        bbox_inches=bbox_in, dpi=180,
+                        facecolor=fig.get_facecolor())
+            fig.savefig(os.path.join(panel_dir, f"{stem_base}_panel_{ltr}.pdf"),
+                        bbox_inches=bbox_in, facecolor=fig.get_facecolor())
+        print(f"  Panels -> {panel_dir}/")
+    except Exception as _pe:
+        print(f"  Per-panel export skipped: {_pe}")
 
     plt.close(fig)
 

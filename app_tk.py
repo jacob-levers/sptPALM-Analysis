@@ -2341,9 +2341,16 @@ class SPTPalmApp(tk.Tk):
                      font=F(9)).pack(side="left")
 
         _divider(p3)
-        _FlatButton(p3, text="Open Output Folder",
+        btn_row = tk.Frame(p3, bg=BG)
+        btn_row.pack(anchor="w", padx=20, pady=(0, 16))
+        _FlatButton(btn_row, text="Open Output Folder",
                     command=lambda: _open_folder(out_dir)
-                    ).pack(anchor="w", padx=20, pady=(0, 16))
+                    ).pack(side="left", padx=(0, 12))
+        panel_dir = os.path.join(fig_dir2, "panels")
+        if os.path.isdir(panel_dir):
+            _FlatButton(btn_row, text="Open Panels Folder",
+                        command=lambda d=panel_dir: _open_folder(d)
+                        ).pack(side="left")
 
         # activate first tab
         _switch("Summary")
