@@ -239,8 +239,50 @@ def load_projection_fast(path, channel=0, max_frames=100):
     return (proj - lo) / (hi - lo) if hi > lo else np.zeros_like(proj)
 
 
-def load_czi(path, channel=0):
-    print(f"  Loading CZI: {path}")
+def _find_czi_series(path):
+    """
+    Zeiss splits long acquisitions into companion files named:
+        experiment.czi
+        experiment(1).czi
+        experiment(2).czi  …
+
+    Given the primary path, return an ordered list of all files in that
+    series (including the primary itself).  If no companions are found the
+    list contains only the original path.
+    """
+    import glob, re
+    directory = os.path.dirname(path) or "."
+    basename  = os.path.splitext(os.path.basename(path))[0]
+
+    # Strip any trailing "(N)" so we get the root name
+    root = re.sub(r"\(\d+\)$", "", basename).rstrip()
+
+    # Collect all matching files
+    pattern  = os.path.join(directory, glob.escape(root) + "*.czi")
+    candidates = sorted(glob.glob(pattern))
+
+    # Keep only: root.czi  and  root(N).czi  (not unrelated names)
+    series_re = re.compile(
+        r"^" + re.escape(root) + r"(\(\d+\))?\.czi$", re.IGNORECASE)
+    series = [f for f in candidates
+              if series_re.match(os.path.basename(f))]
+
+    # Natural sort so (1) < (2) < (10)
+    def _nat_key(s):
+        m = re.search(r"\((\d+)\)\.czi$", s, re.IGNORECASE)
+        return int(m.group(1)) if m else -1
+
+    series.sort(key=_nat_key)
+
+    if len(series) > 1:
+        print(f"  Multi-file CZI series detected ({len(series)} files):")
+        for f in series:
+            print(f"    {os.path.basename(f)}")
+    return series if series else [path]
+
+
+def _load_single_czi(path, channel=0):
+    """Load a single CZI file and return (stack, pixel_size_um, frame_interval_s)."""
     if HAS_AICS:
         czi  = aicspylibczi.CziFile(path)
         xml  = czi.meta if hasattr(czi, "meta") else None
@@ -267,7 +309,6 @@ def load_czi(path, channel=0):
             stack[t] = frame.astype(np.float32)
             if t % 1000 == 0:
                 print(f"  Loading: {t}/{n_t} frames...", flush=True)
-        print(f"  Shape: {stack.shape}  (T x Y x X)", flush=True)
         return stack, meta["pixel_size_um"], meta["frame_interval_s"]
 
     if HAS_CZIFILE:
@@ -314,7 +355,6 @@ def load_czi(path, channel=0):
                     "Or:  pip install aicspylibczi"
                     + hint)
             data = np.stack(frames)
-        print(f"  Shape: {data.shape}  (T x Y x X)", flush=True)
         return data, meta["pixel_size_um"], meta["frame_interval_s"]
 
     raise RuntimeError(
@@ -322,16 +362,195 @@ def load_czi(path, channel=0):
         "Run:  pip install aicspylibczi imagecodecs")
 
 
+def load_czi(path, channel=0):
+    # Detect multi-file series (Zeiss splits large datasets into companion files)
+    series = _find_czi_series(path)
+
+    if len(series) == 1:
+        # Single file — straightforward load
+        print(f"  Loading CZI: {path}")
+        stack, px_um, fi_s = _load_single_czi(path, channel)
+        print(f"  Shape: {stack.shape}  (T x Y x X)", flush=True)
+        return stack, px_um, fi_s
+
+    # Multi-file series — load each file and concatenate along time axis.
+    # Metadata (pixel size, frame interval) is taken from the first file.
+    print(f"  Loading CZI series: {len(series)} files", flush=True)
+    stacks   = []
+    px_um_out  = None
+    fi_s_out   = None
+    for i, fpath in enumerate(series):
+        print(f"  [{i+1}/{len(series)}] {os.path.basename(fpath)}", flush=True)
+        st, px, fi = _load_single_czi(fpath, channel)
+        stacks.append(st)
+        if i == 0:
+            px_um_out = px
+            fi_s_out  = fi
+
+    combined = np.concatenate(stacks, axis=0)
+    print(f"  Combined shape: {combined.shape}  (T x Y x X)", flush=True)
+    return combined, px_um_out, fi_s_out
+
+
+def _parse_ome_metadata(tif):
+    """
+    Extract pixel size (µm) and frame interval (s) from a tifffile.TiffFile.
+
+    Checks in priority order:
+      1. OME-XML embedded in the first page (OME-TIFF standard)
+      2. ImageJ metadata dict (files saved by Fiji/ImageJ)
+      3. XResolution TIFF tag (gives pixels per unit; combined with ResolutionUnit)
+
+    Returns (pixel_size_um, frame_interval_s) — either value may be None if
+    the corresponding metadata is absent.
+    """
+    px_um = None
+    fi_s  = None
+
+    # ── 1. OME-XML ────────────────────────────────────────────────────────────
+    try:
+        ome = tif.ome_metadata          # returns XML string or None
+        if ome:
+            root = ET.fromstring(ome)
+            # Strip namespace: '{http://www.openmicroscopy.org/Schemas/OME/...}Pixels'
+            ns = root.tag.split("}")[0].lstrip("{") if "}" in root.tag else ""
+            prefix = f"{{{ns}}}" if ns else ""
+
+            def _find_el(tag):
+                # Try with and without namespace
+                el = root.find(f".//{prefix}{tag}")
+                if el is None:
+                    el = root.find(f".//{tag}")
+                return el
+
+            pixels = _find_el("Pixels")
+            if pixels is not None:
+                # PhysicalSizeX is stored in µm by OME convention
+                psx = pixels.get("PhysicalSizeX")
+                psx_unit = pixels.get("PhysicalSizeXUnit", "µm")
+                if psx:
+                    try:
+                        v = float(psx)
+                        # Convert to µm if necessary
+                        unit_lc = psx_unit.lower().replace("μ", "u").replace("µ", "u")
+                        if unit_lc in ("nm", "nanometer", "nanometre"):
+                            v /= 1000.0
+                        elif unit_lc in ("mm", "millimeter", "millimetre"):
+                            v *= 1000.0
+                        if 0.001 < v < 100:
+                            px_um = round(v, 6)
+                    except (TypeError, ValueError):
+                        pass
+
+                ti = pixels.get("TimeIncrement")
+                ti_unit = pixels.get("TimeIncrementUnit", "s")
+                if ti:
+                    try:
+                        v = float(ti)
+                        unit_lc = ti_unit.lower()
+                        if unit_lc in ("ms", "millisecond", "milliseconds"):
+                            v /= 1000.0
+                        elif unit_lc in ("min", "minute", "minutes"):
+                            v *= 60.0
+                        if 1e-6 < v < 3600:
+                            fi_s = round(v, 6)
+                    except (TypeError, ValueError):
+                        pass
+    except Exception:
+        pass
+
+    # ── 2. ImageJ metadata ────────────────────────────────────────────────────
+    try:
+        ij = tif.imagej_metadata        # dict or None
+        if ij:
+            if px_um is None:
+                # ImageJ stores resolution as pixels/unit in TIFF XResolution tag.
+                # We read it from the tag below; here we can get unit from ij dict.
+                pass  # handled in section 3
+
+            if fi_s is None:
+                finterval = ij.get("finterval")  # seconds
+                if finterval is not None:
+                    try:
+                        v = float(finterval)
+                        if 1e-6 < v < 3600:
+                            fi_s = round(v, 6)
+                    except (TypeError, ValueError):
+                        pass
+
+                # Some ImageJ files store frame rate instead
+                if fi_s is None:
+                    fps = ij.get("fps")
+                    if fps is not None:
+                        try:
+                            v = float(fps)
+                            if v > 0:
+                                fi_s = round(1.0 / v, 6)
+                        except (TypeError, ValueError):
+                            pass
+    except Exception:
+        pass
+
+    # ── 3. XResolution TIFF tag (works for ImageJ TIFFs) ─────────────────────
+    try:
+        if px_um is None and tif.pages:
+            page = tif.pages[0]
+            xres = page.tags.get("XResolution")
+            runit = page.tags.get("ResolutionUnit")
+            if xres is not None:
+                val = xres.value
+                # Value is a rational (numerator, denominator) or plain float
+                if isinstance(val, tuple) and len(val) == 2 and val[1] != 0:
+                    pixels_per_unit = val[0] / val[1]
+                else:
+                    pixels_per_unit = float(val)
+                if pixels_per_unit > 0:
+                    # ResolutionUnit: 1=no units, 2=inch, 3=cm
+                    unit_code = runit.value if runit is not None else 2
+                    if unit_code == 3:          # centimetres
+                        um_per_pixel = 1e4 / pixels_per_unit
+                    elif unit_code == 2:        # inches
+                        um_per_pixel = 25400.0 / pixels_per_unit
+                    else:
+                        um_per_pixel = None
+
+                    # ImageJ often uses µm as "unit" and encodes pixels/µm
+                    # by hacking the ResolutionUnit.  Check ij metadata unit.
+                    try:
+                        ij = tif.imagej_metadata or {}
+                        ij_unit = ij.get("unit", "")
+                        if ij_unit.lower() in ("um", "µm", "μm", "micron"):
+                            um_per_pixel = 1.0 / pixels_per_unit
+                    except Exception:
+                        pass
+
+                    if um_per_pixel and 0.001 < um_per_pixel < 100:
+                        px_um = round(um_per_pixel, 6)
+    except Exception:
+        pass
+
+    return px_um, fi_s
+
+
 def load_tif(path):
     if not HAS_TIFFFILE:
         raise RuntimeError("Run: pip install tifffile")
     print(f"  Loading TIF: {path}")
-    stack = tifffile.imread(path).astype(np.float32)
+    with tifffile.TiffFile(path) as tif:
+        px_um, fi_s = _parse_ome_metadata(tif)
+        stack = tif.asarray().astype(np.float32)
+
     if   stack.ndim == 2: stack = stack[np.newaxis]
     elif stack.ndim == 4:
         stack = stack[:, 0] if stack.shape[1] == 1 else stack.mean(axis=1)
     print(f"  Shape: {stack.shape}  (T x Y x X)")
-    return stack, None, None
+
+    if px_um is not None:
+        print(f"  Pixel size  : {px_um} µm  (from file metadata)")
+    if fi_s is not None:
+        print(f"  Frame interval: {fi_s} s  (from file metadata)")
+
+    return stack, px_um, fi_s
 
 
 def load_file(path, channel=0):

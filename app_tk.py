@@ -1296,7 +1296,10 @@ class SPTPalmApp(tk.Tk):
                   lambda P: self._spin_flt(P, self.v_pixel_size, 0.001, 2.0, 0.001),
                   info=(
                       "Physical size of one camera pixel in µm.\n\n"
-                      "Auto-read from CZI metadata when available.\n\n"
+                      "Auto-read from file metadata when available:\n"
+                      "  • CZI  — always present in Zeiss metadata\n"
+                      "  • OME-TIFF — PhysicalSizeX from OME-XML\n"
+                      "  • ImageJ TIFF — XResolution + unit tag\n\n"
                       "Typical values:\n"
                       "  • Zeiss Elyra 7, 63× oil (1.4 NA): ~0.106 µm/px\n"
                       "  • 100× oil (1.46 NA): ~0.067 µm/px\n\n"
@@ -1309,8 +1312,8 @@ class SPTPalmApp(tk.Tk):
                                             command=self._toggle_px),
                   info=(
                       "Tick to override the pixel size read from file metadata.\n\n"
-                      "Use this for TIFF files (which carry no calibration) or "
-                      "when the CZI metadata is incorrect."
+                      "Use this when the file has no calibration metadata, or "
+                      "when the embedded value is incorrect."
                   ))
 
         # Frame interval row: spinbox + independent override checkbox
@@ -1318,7 +1321,10 @@ class SPTPalmApp(tk.Tk):
                   lambda P: self._spin_flt(P, self.v_frame_interval, 0.001, 60.0, 0.001),
                   info=(
                       "Time between consecutive frames in seconds.\n\n"
-                      "Auto-read from CZI metadata when available.\n\n"
+                      "Auto-read from file metadata when available:\n"
+                      "  • CZI  — always present in Zeiss metadata\n"
+                      "  • OME-TIFF — TimeIncrement from OME-XML\n"
+                      "  • ImageJ TIFF — finterval / fps tag\n\n"
                       "Typical values:\n"
                       "  • Fast sptPALM (50 Hz): 0.020 s\n"
                       "  • Standard (10 Hz): 0.100 s\n\n"
@@ -1331,7 +1337,8 @@ class SPTPalmApp(tk.Tk):
                                             command=self._toggle_fi),
                   info=(
                       "Tick to override the frame interval read from file metadata.\n\n"
-                      "Use this for TIFF files or when the CZI time-stamp is wrong."
+                      "Use this when the file has no timing metadata, or "
+                      "when the embedded value is incorrect."
                   ))
 
         self._row(f, "Channel index",
