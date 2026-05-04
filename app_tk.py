@@ -1124,14 +1124,27 @@ class SPTPalmApp(tk.Tk):
         self.v_cluster_min_samples = tk.IntVar(value=10)
 
         # Export settings
-        self.v_export_png      = tk.BooleanVar(value=True)
-        self.v_export_pdf      = tk.BooleanVar(value=False)
+        self.v_export_format   = tk.StringVar(value="PNG only")
         self.v_export_combined = tk.BooleanVar(value=True)
         self.v_export_panels   = tk.BooleanVar(value=False)
-        self._export_panel_vars = {
-            ltr: tk.BooleanVar(value=True)
-            for ltr in "ABCDEFGHIJKLMN"
+        # Maps letter → (short display name, BooleanVar)
+        self._export_panel_meta = {
+            "A": ("Max Projection",        tk.BooleanVar(value=True)),
+            "B": ("Trajectories",          tk.BooleanVar(value=True)),
+            "C": ("Trajectories by D",     tk.BooleanVar(value=True)),
+            "D": ("MSD Curves",            tk.BooleanVar(value=True)),
+            "E": ("Diffusion Coeff",       tk.BooleanVar(value=True)),
+            "F": ("Motion Types",          tk.BooleanVar(value=True)),
+            "G": ("Alpha Distribution",    tk.BooleanVar(value=True)),
+            "H": ("Density Map",           tk.BooleanVar(value=True)),
+            "I": ("Turning Angles",        tk.BooleanVar(value=True)),
+            "J": ("Mobile Fraction",       tk.BooleanVar(value=True)),
+            "K": ("Jump Distance",         tk.BooleanVar(value=True)),
+            "L": ("Cluster Map",           tk.BooleanVar(value=True)),
+            "M": ("Dwell Time",            tk.BooleanVar(value=True)),
+            "N": ("MSS Slope",             tk.BooleanVar(value=True)),
         }
+        self._export_panel_vars = {k: v for k, (_, v) in self._export_panel_meta.items()}
 
     # ── Top-level layout ──────────────────────────────────────────────────────
 
@@ -1764,8 +1777,10 @@ class SPTPalmApp(tk.Tk):
 
         # ── Export Settings ───────────────────────────────────────────────────
         f = self._section(p, "Export Settings")
-        self._row(f, "File formats",
-                  lambda P: self._fmt_checks(P),
+        self._row(f, "File format",
+                  lambda P: ttk.Combobox(P, textvariable=self.v_export_format,
+                                         values=["PNG only", "PDF only", "PNG + PDF"],
+                                         state="readonly", width=14),
                   info="PNG — raster image, good for reports and presentations.\n"
                        "PDF — vector format, editable in Illustrator or Affinity Designer.")
         self._row(f, "Save combined figure",
@@ -1778,18 +1793,17 @@ class SPTPalmApp(tk.Tk):
                                             command=self._toggle_panel_export),
                   info="Save each panel as a separate file without letter labels.\n"
                        "Saved to figures/panels/ inside the output folder.")
-        # Panel selector grid
+        # Panel selector — named checkboxes in 2-column layout
         self._panel_sel_frame = tk.Frame(f, bg=CARD)
         _psel_r = getattr(f, "_row_count", 0)
         f._row_count = _psel_r + 1
         self._panel_sel_frame.grid(row=_psel_r, column=0, columnspan=2,
-                                   sticky="ew", padx=10, pady=(0, 6))
-        for i, ltr in enumerate("ABCDEFGHIJKLMN"):
-            r, c = divmod(i, 7)
-            ttk.Checkbutton(self._panel_sel_frame, text=ltr,
-                            variable=self._export_panel_vars[ltr],
+                                   sticky="ew", padx=16, pady=(0, 8))
+        for i, (ltr, (name, var)) in enumerate(self._export_panel_meta.items()):
+            r, c = divmod(i, 2)
+            ttk.Checkbutton(self._panel_sel_frame, text=name, variable=var,
                             style="Card.TCheckbutton").grid(
-                row=r, column=c, padx=4, pady=2, sticky="w")
+                row=r, column=c, padx=(0, 24), pady=2, sticky="w")
         self._toggle_panel_export()
 
         # ── Save Settings ─────────────────────────────────────────────────────
@@ -1824,13 +1838,10 @@ class SPTPalmApp(tk.Tk):
         self._d_min_w.configure(state=state)
         self._d_max_w.configure(state=state)
 
-    def _fmt_checks(self, parent):
-        f = tk.Frame(parent, bg=CARD)
-        ttk.Checkbutton(f, text="PNG", variable=self.v_export_png,
-                        style="Card.TCheckbutton").pack(side="left", padx=(0, 14))
-        ttk.Checkbutton(f, text="PDF", variable=self.v_export_pdf,
-                        style="Card.TCheckbutton").pack(side="left")
-        return f
+    def _export_formats(self):
+        """Return (do_png, do_pdf) derived from the format combobox selection."""
+        fmt = self.v_export_format.get()
+        return fmt in ("PNG only", "PNG + PDF"), fmt in ("PDF only", "PNG + PDF")
 
     def _toggle_panel_export(self):
         state = "normal" if self.v_export_panels.get() else "disabled"
@@ -1889,8 +1900,7 @@ class SPTPalmApp(tk.Tk):
             "proj_cmap":       self.v_proj_cmap.get(),
             "cluster_eps_nm":      self.v_cluster_eps_nm.get(),
             "cluster_min_samples": self.v_cluster_min_samples.get(),
-            "export_png":      self.v_export_png.get(),
-            "export_pdf":      self.v_export_pdf.get(),
+            "export_format":   self.v_export_format.get(),
             "export_combined": self.v_export_combined.get(),
             "export_panels":   self.v_export_panels.get(),
             "export_panels_sel": {k: v.get() for k, v in self._export_panel_vars.items()},
@@ -1933,8 +1943,7 @@ class SPTPalmApp(tk.Tk):
         _s(self.v_proj_cmap,      "proj_cmap")
         _s(self.v_cluster_eps_nm,      "cluster_eps_nm")
         _s(self.v_cluster_min_samples, "cluster_min_samples")
-        _s(self.v_export_png,      "export_png")
-        _s(self.v_export_pdf,      "export_pdf")
+        _s(self.v_export_format,   "export_format")
         _s(self.v_export_combined, "export_combined")
         _s(self.v_export_panels,   "export_panels")
         if "export_panels_sel" in d:
@@ -2708,12 +2717,9 @@ class SPTPalmApp(tk.Tk):
                                           cluster_locs=b_cluster_xy,
                                           dwell_df=b_dwell_df,
                                           dwell_tau=b_dwell_tau)
-                    # Batch: respect export settings, default to PNG if nothing chosen
-                    _b_png = self.v_export_png.get()
-                    _b_pdf = self.v_export_pdf.get()
-                    if not _b_png and not _b_pdf:
-                        _b_png = True   # always save something in batch
-                    if self.v_export_combined.get() or True:   # always save combined in batch
+                    # Batch: respect export settings
+                    _b_png, _b_pdf = self._export_formats()
+                    if self.v_export_combined.get():
                         if _b_png:
                             fig_data["combined"].save(
                                 os.path.join(fig_dir, f"{stem}_sptpalm_figure.png"), dpi=(150,150))
@@ -3318,8 +3324,7 @@ class SPTPalmApp(tk.Tk):
 
             # Save figures based on export settings
             _emit_progress("Saving outputs…", 93)
-            _do_png = self.v_export_png.get()
-            _do_pdf = self.v_export_pdf.get()
+            _do_png, _do_pdf = self._export_formats()
             if self.v_export_combined.get():
                 if _do_png:
                     fig_data["combined"].save(
