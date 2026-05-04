@@ -2334,7 +2334,9 @@ class SPTPalmApp(tk.Tk):
     # ── File dialogs ──────────────────────────────────────────────────────────
 
     def _browse_file(self):
+        self.lift(); self.focus_force(); self.update()
         path = filedialog.askopenfilename(
+            parent=self,
             title="Select CZI or TIF microscopy file",
             filetypes=[
                 ("Microscopy files", "*.czi *.tif *.tiff"),
@@ -2355,7 +2357,8 @@ class SPTPalmApp(tk.Tk):
                 self._show_placeholder(ready=True)
 
     def _browse_outdir(self):
-        path = filedialog.askdirectory(title="Select output folder")
+        self.lift(); self.focus_force(); self.update()
+        path = filedialog.askdirectory(parent=self, title="Select output folder")
         if path:
             self.v_outdir.set(path)
 
@@ -2364,7 +2367,8 @@ class SPTPalmApp(tk.Tk):
     def _on_batch(self):
         if self._running:
             return
-        folder = filedialog.askdirectory(title="Select folder to batch-process")
+        self.lift(); self.focus_force(); self.update()
+        folder = filedialog.askdirectory(parent=self, title="Select folder to batch-process")
         if not folder:
             return
 
