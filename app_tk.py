@@ -1157,24 +1157,23 @@ class SPTPalmApp(tk.Tk):
                  highlightcolor=ACC).pack(side="left", **pad)
         ttk.Button(parent, text="Browse…",
                    command=self._browse_outdir).pack(side="left", padx=(0, 14))
+        self._batch_btn = ttk.Button(parent, text="Batch",
+                                     command=self._on_batch, width=7)
+        self._batch_btn.pack(side="left", padx=(0, 14))
 
     def _build_bottom_bar(self, parent):
         # Grid layout so the button is always in column 0 and cannot be pushed off
-        parent.columnconfigure(2, weight=1)
+        parent.columnconfigure(1, weight=1)
 
         self._run_btn = ttk.Button(parent, text="▶  Run Analysis",
                                    style="Run.TButton", command=self._on_run,
                                    width=16)
         self._run_btn.grid(row=0, column=0, padx=(18, 6), pady=14, sticky="w")
 
-        self._batch_btn = ttk.Button(parent, text="Batch…",
-                                     command=self._on_batch, width=8)
-        self._batch_btn.grid(row=0, column=1, padx=(0, 12), pady=14, sticky="w")
-
         self._status_var = tk.StringVar(value="")
         tk.Label(parent, textvariable=self._status_var,
                  bg=SIDEBAR, fg=MUTED, font=F(11)).grid(
-            row=0, column=2, padx=(0, 12), sticky="w")
+            row=0, column=1, padx=(0, 12), sticky="w")
 
     def _on_stop(self):
         """Signal the worker to stop. Button stays in place, text changes."""
@@ -1192,24 +1191,10 @@ class SPTPalmApp(tk.Tk):
         if not self._panel_visible:
             if callback: callback()
             return
-        DURATION = 0.22          # seconds — fixed wall-clock duration
-        PANEL_W  = 340
-        t0 = time.monotonic()
-
-        def _step():
-            progress = min((time.monotonic() - t0) / DURATION, 1.0)
-            # Smooth-step ease-in-out: feels natural for a slide-away
-            ease = progress * progress * (3.0 - 2.0 * progress)
-            if progress < 1.0:
-                self._left_panel.configure(width=max(1, int(PANEL_W * (1.0 - ease))))
-                self.after(4, _step)          # ~250 fps target — scales to any monitor
-            else:
-                self._left_panel.pack_forget()
-                self._panel_visible = False
-                self._toggle_lbl.configure(text="▶")
-                if callback: callback()
-
-        _step()
+        self._left_panel.pack_forget()
+        self._panel_visible = False
+        self._toggle_lbl.configure(text="▶")
+        if callback: callback()
 
     def _expand_panel(self, callback=None):
         if self._panel_visible:
