@@ -2339,9 +2339,9 @@ class SPTPalmApp(tk.Tk):
             parent=self,
             title="Select CZI or TIF microscopy file",
             filetypes=[
-                ("Microscopy files", "*.czi *.tif *.tiff"),
+                ("Microscopy files", "*.czi;*.tif;*.tiff"),
                 ("CZI files", "*.czi"),
-                ("TIFF files", "*.tif *.tiff"),
+                ("TIFF files", "*.tif;*.tiff"),
                 ("All files", "*.*"),
             ])
         if path:
