@@ -85,6 +85,17 @@ from scipy.stats import gaussian_kde
 from skimage import filters, exposure
 from tqdm import tqdm
 
+# On Windows with console=False (PyInstaller GUI build), sys.stderr is None.
+# tqdm writes to sys.stderr by default and crashes with AttributeError.
+# Point it at a safe no-op stream instead.
+import io as _io
+_TQDM_FILE = sys.stderr if (sys.stderr is not None) else _io.StringIO()
+
+def _tqdm(*args, **kwargs):
+    """tqdm wrapper that always uses a valid output stream."""
+    kwargs.setdefault("file", _TQDM_FILE)
+    return tqdm(*args, **kwargs)
+
 # Optional readers
 try:
     import aicspylibczi
@@ -601,11 +612,11 @@ def preprocess_stack(stack, bg_radius=50, bg_method="uniform_filter",
 
     if workers == 1:
         processed = [fn(f, bg_radius) for f in
-                     tqdm(stack, desc="  Preprocessing", unit="fr", ncols=70)]
+                     _tqdm(stack, desc="  Preprocessing", unit="fr", ncols=70)]
     else:
         processed = Parallel(n_jobs=workers, prefer="threads")(
             delayed(fn)(f, bg_radius)
-            for f in tqdm(stack, desc="  Preprocessing", unit="fr", ncols=70))
+            for f in _tqdm(stack, desc="  Preprocessing", unit="fr", ncols=70))
 
     elapsed = time.perf_counter() - t0
     print(f"  Done in {elapsed:.1f}s  ({elapsed/n*1000:.1f} ms/frame)")
@@ -726,8 +737,8 @@ def build_roi_mask_perframe(stack, threshold=0.15, smooth_sigma=5):
     from skimage.morphology import binary_closing, disk
     T = len(stack)
     masks = np.zeros(stack.shape, dtype=bool)
-    for t in tqdm(range(T), desc="  Building per-frame masks",
-                  unit="fr", ncols=70):
+    for t in _tqdm(range(T), desc="  Building per-frame masks",
+                   unit="fr", ncols=70):
         smoothed = filters.gaussian(stack[t], sigma=smooth_sigma,
                                     preserve_range=True)
         # Normalise each frame to [0,1] before thresholding
@@ -1200,7 +1211,7 @@ def preprocess_and_localise_stream(stack, diameter=7, minmass=None, percentile=6
     gc.collect()
 
     # Remaining chunks
-    for i in tqdm(range(1, n_chunks), desc="  Streaming", unit="chunk", ncols=70):
+    for i in _tqdm(range(1, n_chunks), desc="  Streaming", unit="chunk", ncols=70):
         # Honour a stop request between chunks
         if stop_event is not None and stop_event.is_set():
             print("  Streaming stopped by user.")
@@ -1287,7 +1298,7 @@ def localise_particles(stack, diameter=7, minmass=0.1, percentile=64,
     if preview_cb is None:
         chunk_results = Parallel(n_jobs=workers, prefer="threads")(
             delayed(_localise_chunk)(chunk, diameter, minmass, percentile, offset)
-            for chunk, offset in tqdm(
+            for chunk, offset in _tqdm(
                 zip(chunks, offsets), total=n_chunks,
                 desc="  Localising", unit="chunk", ncols=70))
     else:
@@ -1295,8 +1306,8 @@ def localise_particles(stack, diameter=7, minmass=0.1, percentile=64,
         # We still parallelise inside each chunk via tp.batch (processes=1
         # but trackpy releases the GIL during heavy NumPy work).
         chunk_results = []
-        for chunk, offset in tqdm(zip(chunks, offsets), total=n_chunks,
-                                  desc="  Localising", unit="chunk", ncols=70):
+        for chunk, offset in _tqdm(zip(chunks, offsets), total=n_chunks,
+                                   desc="  Localising", unit="chunk", ncols=70):
             df = _localise_chunk(chunk, diameter, minmass, percentile, offset)
             chunk_results.append(df)
             try:
@@ -1427,7 +1438,7 @@ def compute_msd_and_fit(tracks, pixel_size, frame_interval,
             grouped.get_group(pid)[["x", "y"]].values * pixel_size,
             grouped.get_group(pid)["frame"].values,
             pid, lag_times, max_lagtime, n_fit)
-        for pid in tqdm(pid_list, desc="  MSD + fitting", unit="track", ncols=70))
+        for pid in _tqdm(pid_list, desc="  MSD + fitting", unit="track", ncols=70))
 
     elapsed = time.perf_counter() - t0
     rate    = n_tracks / elapsed
