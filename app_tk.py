@@ -3037,6 +3037,7 @@ class SPTPalmApp(tk.Tk):
             _check_stop()
 
             # ── 2. Sample frames for figure projection ─────────────────────────
+            _emit_progress("Sampling projection frames…", 10)
             proj_idx    = np.linspace(0, n_frames - 1, min(200, n_frames), dtype=int)
             proj_sample = stack[proj_idx].copy()
 
