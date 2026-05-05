@@ -3114,6 +3114,8 @@ class SPTPalmApp(tk.Tk):
             _check_stop()
 
             # ── 3. Preprocess + localise ───────────────────────────────────────
+            # preview_cb=None → fully parallel localisation on all cores.
+            # A static preview is sent after localisation completes instead.
             _emit_progress("Localising particles…", 20)
             minmass_arg = None if self.v_auto_mm.get() else self.v_minmass.get()
             locs, mean_proj, _minmass = preprocess_and_localise_adaptive(
@@ -3124,8 +3126,32 @@ class SPTPalmApp(tk.Tk):
                 bg_method=bg_method_raw,
                 workers=workers,
                 chunk_size=chunk_size,
-                preview_cb=_preview_cb,
+                preview_cb=None,
                 stop_event=stop)
+
+            # Post-localisation preview: mean projection with all detected spots.
+            try:
+                _mp = mean_proj.astype(np.float32)
+                _lo, _hi = float(np.percentile(_mp, 1)), float(np.percentile(_mp, 99.5))
+                if _hi > _lo:
+                    _mp = np.clip((_mp - _lo) / (_hi - _lo), 0, 1)
+                _fig = Figure(figsize=(5, 4), dpi=90, facecolor="#09090e")
+                _ax  = _fig.add_axes([0, 0, 1, 1])
+                _ax.set_facecolor("#09090e")
+                _ax.imshow(_mp, cmap="inferno", origin="upper", interpolation="nearest")
+                if len(locs) > 0:
+                    _sub = locs.sample(min(len(locs), 3000), random_state=42)
+                    _ax.scatter(_sub["x"].values, _sub["y"].values,
+                                s=30, facecolors="none", edgecolors="#4ea8ff",
+                                linewidths=0.8, alpha=0.7)
+                _ax.set_axis_off()
+                _ax.set_title(f"Localised  —  {len(locs):,} spots  |  "
+                              f"minmass={_minmass:.3f}",
+                              color="#79c0ff", fontsize=9, pad=4)
+                _send_fig(_fig, f"{len(locs):,} localisations")
+                _fig.clear()
+            except Exception:
+                pass
 
             del stack; gc.collect()
             _check_stop()

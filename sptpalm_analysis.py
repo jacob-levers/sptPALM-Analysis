@@ -1336,37 +1336,15 @@ def localise_particles(stack, diameter=7, minmass=0.1, percentile=64,
     # tp.batch internally uses NumPy/SciPy which release the GIL, so
     # thread-level parallelism gives real speedup.
     chunk_pairs = list(zip(chunks, offsets))
-    if preview_cb is None:
-        # No preview: fully parallel across all chunks.
-        chunk_results = Parallel(n_jobs=workers, prefer="threads")(
-            delayed(_localise_chunk)(chunk, diameter, minmass, percentile, offset)
-            for chunk, offset in _tqdm(
-                chunk_pairs, total=n_chunks,
-                desc="  Localising", unit="chunk", ncols=70))
-    else:
-        # With preview: process chunks sequentially so we can emit live
-        # previews after each one and avoid a joblib thread-pool deadlock
-        # that occurs in frozen Windows apps when spawning parallel workers
-        # from a background thread over a memory-mapped stack.
-        # Note: the preprocessing pass in preprocess_and_localise_adaptive
-        # still uses all CPU cores, so multi-core benefit is retained there.
-        chunk_results = []
-        for idx, (chunk, offset) in enumerate(chunk_pairs):
-            print(f"  Chunk {idx+1}/{n_chunks}  (frames {offset}–{offset+len(chunk)-1})")
-            df = _localise_chunk(chunk, diameter, minmass, percentile, offset)
-            chunk_results.append(df)
-            try:
-                mid_local  = len(chunk) // 2
-                mid_global = offset + mid_local
-                preview_frame = chunk[mid_local]
-                if df is not None and len(df) > 0:
-                    sel = df[df["frame"] == mid_global]
-                    xs, ys = sel["x"].values, sel["y"].values
-                else:
-                    xs, ys = [], []
-                preview_cb(mid_global, preview_frame, xs, ys, n_frames)
-            except Exception:
-                pass
+    # Always parallel — preview_cb is intentionally unused here.
+    # The GUI sends a static post-localisation preview instead of per-chunk
+    # live frames, which allows full multi-core use without deadlocking the
+    # joblib thread pool inside a frozen Windows background thread.
+    chunk_results = Parallel(n_jobs=workers, prefer="threads")(
+        delayed(_localise_chunk)(chunk, diameter, minmass, percentile, offset)
+        for chunk, offset in _tqdm(
+            chunk_pairs, total=n_chunks,
+            desc="  Localising", unit="chunk", ncols=70))
 
     valid = [df for df in chunk_results if df is not None and len(df) > 0]
     result = pd.concat(valid, ignore_index=True) if valid else pd.DataFrame()
