@@ -1364,10 +1364,12 @@ def localise_particles(stack, diameter=7, minmass=0.1, percentile=64,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def link_trajectories(locs, search_range=5, memory=3, min_len=5, max_len=None):
-    print(f"  Linking (search_range={search_range}px, memory={memory}) ...")
+    print(f"  Linking {len(locs):,} localisations  "
+          f"(search_range={search_range}px, memory={memory}) ...")
     t0 = time.perf_counter()
     try:
         linked = tp.link(locs, search_range=search_range, memory=memory)
+        print(f"  tp.link done — filtering stubs (min_len={min_len}) ...")
     except Exception as exc:
         if "SubnetOversizeException" in type(exc).__name__ or "Subnetwork" in str(exc):
             # Particle density is too high for the recursive solver at this

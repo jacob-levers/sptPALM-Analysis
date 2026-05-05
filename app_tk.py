@@ -3218,7 +3218,9 @@ class SPTPalmApp(tk.Tk):
                 pass
 
             _emit_log(f"  → {len(locs):,} localisations  |  minmass={_minmass:.4f}")
+            _emit_log("  Freeing stack memory…")
             del stack; gc.collect()
+            _emit_log("  Memory freed.")
             _check_stop()
 
             if len(locs) == 0:
@@ -3271,6 +3273,7 @@ class SPTPalmApp(tk.Tk):
             # ── 4. Link ───────────────────────────────────────────────────────
             _emit_log(f"\n── Linking ───────────────────────")
             _emit_progress("Linking trajectories…", 55)
+            _emit_log(f"  Linking {len(locs):,} localisations — this may take several minutes for large datasets…")
             max_tl = self.v_max_track_len.get()
             tracks = link_trajectories(
                 locs,
