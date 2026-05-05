@@ -2343,7 +2343,13 @@ class SPTPalmApp(tk.Tk):
             jf = tk.Frame(p1, bg=BG)
             jf.pack(fill="x", padx=16, pady=(0, 4))
             _jdd_colors = ["#4ea8ff", "#f78166", "#3fb950"]
-            _jdd_labels = ["Slow", "Medium", "Fast"]
+            _n_pop = len(jdd["D_values"])
+            if _n_pop == 1:
+                _jdd_labels = ["All molecules"]
+            elif _n_pop == 2:
+                _jdd_labels = ["Immobile", "Mobile"]
+            else:
+                _jdd_labels = ["Immobile", "Mobile", "Fast"]
             for k, (D, f) in enumerate(
                     zip(jdd["D_values"], jdd["fractions"])):
                 col = _jdd_colors[k]
@@ -3266,10 +3272,13 @@ class SPTPalmApp(tk.Tk):
             if jdd:
                 _emit_log(f"  JDD  ({jdd['n_components']} populations, "
                           f"{jdd['n_jumps']:,} jumps):")
-                labels = ["Slow", "Medium", "Fast"]
+                _n = jdd["n_components"]
+                labels = (["All molecules"] if _n == 1 else
+                          ["Immobile", "Mobile"] if _n == 2 else
+                          ["Immobile", "Mobile", "Fast"])
                 for k, (D, f) in enumerate(
                         zip(jdd["D_values"], jdd["fractions"])):
-                    _emit_log(f"    {labels[k]:6s}  D={D:.4f} µm²/s  "
+                    _emit_log(f"    {labels[k]:12s}  D={D:.4f} µm²/s  "
                               f"({f*100:.1f}%)")
             else:
                 _emit_log("  JDD: too few jumps to fit.")

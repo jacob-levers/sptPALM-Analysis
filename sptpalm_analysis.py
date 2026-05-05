@@ -1344,23 +1344,34 @@ def localise_particles(stack, diameter=7, minmass=0.1, percentile=64,
                 chunk_pairs, total=n_chunks,
                 desc="  Localising", unit="chunk", ncols=70))
     else:
-        # With preview: run each chunk sequentially so we can emit a live
-        # preview after each one.  The preprocessing step (in
-        # preprocess_and_localise_adaptive) already uses all CPU cores, so
-        # the overall pipeline is still highly parallel — we just avoid
-        # spawning a second thread pool from inside the background thread,
-        # which can deadlock in frozen Windows apps.
+        # With preview: process in parallel batches (batch_size = workers).
+        # IMPORTANT: each chunk is materialised to a concrete numpy array in
+        # the calling thread BEFORE being dispatched to workers.  This avoids
+        # multiple threads concurrently seeking a memory-mapped file, which
+        # can deadlock in frozen Windows apps.  The GIL is released during the
+        # heavy NumPy/SciPy work inside tp.batch, so all cores are used.
+        batch_size    = max(1, workers)
+        batches       = [chunk_pairs[i:i + batch_size]
+                         for i in range(0, len(chunk_pairs), batch_size)]
         chunk_results = []
-        for chunk, offset in _tqdm(chunk_pairs, total=n_chunks,
-                                   desc="  Localising", unit="chunk", ncols=70):
-            df = _localise_chunk(chunk, diameter, minmass, percentile, offset)
-            chunk_results.append(df)
+        for batch in _tqdm(batches, total=len(batches),
+                           desc="  Localising", unit="batch", ncols=70):
+            # Step 1 — sequential read: force each chunk into a concrete array.
+            mat_batch = [(np.array(ch, copy=False), off) for ch, off in batch]
+            # Step 2 — parallel compute: pure CPU work, no file I/O.
+            batch_res = Parallel(n_jobs=len(mat_batch), prefer="threads")(
+                delayed(_localise_chunk)(ch, diameter, minmass, percentile, off)
+                for ch, off in mat_batch)
+            chunk_results.extend(batch_res)
+            # Emit preview from last chunk of this batch.
             try:
-                mid_local  = len(chunk) // 2
-                mid_global = offset + mid_local
-                preview_frame = chunk[mid_local]
-                if df is not None and len(df) > 0:
-                    sel = df[df["frame"] == mid_global]
+                last_chunk, last_offset = mat_batch[-1]
+                last_df    = batch_res[-1]
+                mid_local  = len(last_chunk) // 2
+                mid_global = last_offset + mid_local
+                preview_frame = last_chunk[mid_local]
+                if last_df is not None and len(last_df) > 0:
+                    sel = last_df[last_df["frame"] == mid_global]
                     xs, ys = sel["x"].values, sel["y"].values
                 else:
                     xs, ys = [], []
