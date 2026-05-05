@@ -2844,6 +2844,10 @@ class SPTPalmApp(tk.Tk):
             else:
                 self._q.put(("error", traceback.format_exc()))
         finally:
+            try:
+                sys.stdout.flush()
+            except Exception:
+                pass
             sys.stdout = old_stdout
 
     # ── Run / worker / queue ──────────────────────────────────────────────────
@@ -2953,10 +2957,42 @@ class SPTPalmApp(tk.Tk):
                 pass
 
         class _StdoutCapture:
+            """Redirect stdout to the log panel.
+
+            tqdm writes repeated \\r-prefixed lines to overwrite the terminal
+            progress bar in place.  We collapse those into a single log entry:
+            the last \\r-line is buffered; only when a real newline arrives (or
+            flush() is called) is it emitted — so the log shows one clean final
+            progress line per tqdm loop rather than hundreds of intermediate ones.
+            """
+            def __init__(self):
+                self._pending = ""   # last \r-overwrite candidate
+
             def write(self, text):
-                if text.strip():
-                    _emit_log(text.rstrip())
-            def flush(self): pass
+                if not text:
+                    return
+                # Split on newlines first
+                parts = text.split("\n")
+                for i, part in enumerate(parts):
+                    last = (i == len(parts) - 1)
+                    if "\r" in part:
+                        # Keep only the content after the final \r (last overwrite)
+                        part = part.rsplit("\r", 1)[-1]
+                    combined = self._pending + part
+                    if last:
+                        # No trailing newline — buffer for later
+                        self._pending = combined
+                    else:
+                        # Newline terminated — emit if non-empty
+                        if combined.strip():
+                            _emit_log(combined.rstrip())
+                        self._pending = ""
+
+            def flush(self):
+                # Flush any buffered tqdm final-line
+                if self._pending.strip():
+                    _emit_log(self._pending.rstrip())
+                    self._pending = ""
 
         old_stdout = sys.stdout
         sys.stdout = _StdoutCapture()
@@ -3023,11 +3059,13 @@ class SPTPalmApp(tk.Tk):
             _emit_log(f"  Frames: {n_frames:,}  |  px={px} µm  fi={fi} s")
 
             # Preview: first raw frame
+            _raw0_norm = None   # kept for re-use as "localising" preview
             try:
                 raw0 = stack[0].astype(np.float32)
                 lo, hi = float(np.percentile(raw0, 1)), float(np.percentile(raw0, 99.9))
                 if hi > lo:
                     raw0 = np.clip((raw0 - lo) / (hi - lo), 0, 1)
+                _raw0_norm = raw0
                 fig = Figure(figsize=(5, 4), dpi=90, facecolor="#09090e")
                 ax  = fig.add_axes([0, 0, 1, 1])
                 ax.set_facecolor("#09090e")
@@ -3065,6 +3103,7 @@ class SPTPalmApp(tk.Tk):
                     lo, hi = float(np.percentile(raw0, 1)), float(np.percentile(raw0, 99.9))
                     if hi > lo:
                         raw0 = np.clip((raw0 - lo) / (hi - lo), 0, 1)
+                    _raw0_norm = raw0
                     fig = Figure(figsize=(5, 4), dpi=90, facecolor="#09090e")
                     ax  = fig.add_axes([0, 0, 1, 1])
                     ax.set_facecolor("#09090e")
@@ -3116,6 +3155,22 @@ class SPTPalmApp(tk.Tk):
             # ── 3. Preprocess + localise ───────────────────────────────────────
             # preview_cb=None → fully parallel localisation on all cores.
             # A static preview is sent after localisation completes instead.
+            # Update the preview label so the panel doesn't look frozen.
+            try:
+                if _raw0_norm is not None:
+                    _fig2 = Figure(figsize=(5, 4), dpi=90, facecolor="#09090e")
+                    _ax2  = _fig2.add_axes([0, 0, 1, 1])
+                    _ax2.set_facecolor("#09090e")
+                    _ax2.imshow(_raw0_norm, cmap="inferno", origin="upper",
+                                interpolation="nearest")
+                    _ax2.set_axis_off()
+                    _ax2.set_title("Localising particles…  (using all CPU cores)",
+                                   color="#f0a020", fontsize=9, pad=4)
+                    _send_fig(_fig2, "localising…")
+                    _fig2.clear()
+            except Exception:
+                pass
+            _emit_log(f"\n── Localisation ──────────────────")
             _emit_progress("Localising particles…", 20)
             minmass_arg = None if self.v_auto_mm.get() else self.v_minmass.get()
             locs, mean_proj, _minmass = preprocess_and_localise_adaptive(
@@ -3153,6 +3208,7 @@ class SPTPalmApp(tk.Tk):
             except Exception:
                 pass
 
+            _emit_log(f"  → {len(locs):,} localisations  |  minmass={_minmass:.4f}")
             del stack; gc.collect()
             _check_stop()
 
@@ -3204,6 +3260,7 @@ class SPTPalmApp(tk.Tk):
             _check_stop()
 
             # ── 4. Link ───────────────────────────────────────────────────────
+            _emit_log(f"\n── Linking ───────────────────────")
             _emit_progress("Linking trajectories…", 55)
             max_tl = self.v_max_track_len.get()
             tracks = link_trajectories(
@@ -3217,6 +3274,8 @@ class SPTPalmApp(tk.Tk):
                 raise RuntimeError(
                     "No trajectories after filtering.\n"
                     "Try lowering Min track length.")
+            _emit_log(f"  → {tracks['particle'].nunique():,} trajectories  "
+                      f"|  {len(tracks):,} localisations linked")
 
             # Preview: trajectory overlay on mean projection
             try:
@@ -3246,6 +3305,7 @@ class SPTPalmApp(tk.Tk):
             _check_stop()
 
             # ── 5. MSD + diffusion ─────────────────────────────────────────────
+            _emit_log(f"\n── MSD & diffusion ───────────────")
             _emit_progress("Computing MSD & diffusion…", 70)
             imsd_df, emsd_df, diff_df = compute_msd_and_fit(
                 tracks, px, fi,
@@ -3273,6 +3333,8 @@ class SPTPalmApp(tk.Tk):
             except Exception:
                 pass
 
+            _emit_log(f"  → D range: {diff_df['D'].min():.4f} – {diff_df['D'].max():.4f} µm²/s  "
+                      f"|  median={diff_df['D'].median():.4f}")
             # ── 5b. D-value filter ────────────────────────────────────────────
             if self.v_filter_d_enabled.get():
                 d_min = self.v_filter_d_min.get()
@@ -3292,6 +3354,7 @@ class SPTPalmApp(tk.Tk):
             _check_stop()
 
             # ── 5c. Jump Distance Distribution ────────────────────────────────
+            _emit_log(f"\n── Secondary analyses ────────────")
             _emit_progress("Jump Distance Distribution…", 80)
             jdd = compute_jdd(tracks, px, fi,
                               n_components=self.v_jdd_components.get())
@@ -3336,6 +3399,7 @@ class SPTPalmApp(tk.Tk):
             _check_stop()
 
             # ── 6. Save ───────────────────────────────────────────────────────
+            _emit_log(f"\n── Saving ────────────────────────")
             _emit_progress("Saving outputs…", 92)
             fig_data = make_figure(proj_sample, tracks, imsd_df, emsd_df, diff_df,
                                    px, fi, roi_mask=roi_mask,
@@ -3388,10 +3452,13 @@ class SPTPalmApp(tk.Tk):
             # Save CSVs
             locs.to_csv(
                 os.path.join(data_dir, f"{stem}_localisations.csv"), index=False)
+            _emit_log(f"  Saved: localisations.csv  ({len(locs):,} rows)")
             tracks.to_csv(
                 os.path.join(data_dir, f"{stem}_trajectories.csv"), index=False)
+            _emit_log(f"  Saved: trajectories.csv  ({len(tracks):,} rows)")
             diff_df.to_csv(
                 os.path.join(data_dir, f"{stem}_diffusion_summary.csv"), index=False)
+            _emit_log(f"  Saved: diffusion_summary.csv  ({diff_df.shape[0]:,} tracks)")
             (emsd_df.to_frame("msd_um2")
                     .reset_index(names="lag_frame")
                     .to_csv(os.path.join(data_dir, f"{stem}_ensemble_msd.csv"),
@@ -3400,6 +3467,7 @@ class SPTPalmApp(tk.Tk):
                 cluster_stats_df.to_csv(
                     os.path.join(data_dir, f"{stem}_cluster_stats.csv"), index=False)
 
+            _emit_log(f"  Output folder: {out_dir}")
             _emit_progress("Complete!", 100)
             self._q.put(("done", {
                 "diff_df": diff_df, "fig_data": fig_data,
@@ -3412,6 +3480,10 @@ class SPTPalmApp(tk.Tk):
         except Exception:
             self._q.put(("error", traceback.format_exc()))
         finally:
+            try:
+                sys.stdout.flush()
+            except Exception:
+                pass
             sys.stdout = old_stdout
 
     def _poll(self):

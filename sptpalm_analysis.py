@@ -99,13 +99,17 @@ from tqdm import tqdm
 
 # On Windows with console=False (PyInstaller GUI build), sys.stderr is None.
 # tqdm writes to sys.stderr by default and crashes with AttributeError.
-# Point it at a safe no-op stream instead.
+# Use sys.stdout instead — the GUI redirects stdout to its log panel, so
+# tqdm progress lines will appear there in real time.
 import io as _io
-_TQDM_FILE = sys.stderr if (sys.stderr is not None) else _io.StringIO()
 
 def _tqdm(*args, **kwargs):
-    """tqdm wrapper that always uses a valid output stream."""
-    kwargs.setdefault("file", _TQDM_FILE)
+    """tqdm wrapper that writes to stdout (captured by the GUI log panel).
+    Falls back to a no-op StringIO if stdout is somehow invalid."""
+    out = sys.stdout if (sys.stdout is not None) else _io.StringIO()
+    kwargs.setdefault("file", out)
+    # Disable ANSI colour codes — the log panel is plain text.
+    kwargs.setdefault("colour", None)
     return tqdm(*args, **kwargs)
 
 # Optional readers
@@ -1519,6 +1523,8 @@ def compute_jdd(tracks, pixel_size_um, frame_interval_s, n_components=2):
     -------
     dict or None (if too few jumps to fit)
     """
+    print(f"  JDD analysis      : {n_components} component(s)  "
+          f"|  {tracks['particle'].nunique():,} tracks")
     dt = frame_interval_s
     jumps = []
 
@@ -1618,6 +1624,7 @@ def compute_turning_angles(tracks):
 
     Returns a flat np.array of all angles across all tracks.
     """
+    print(f"  Turning angles    : {tracks['particle'].nunique():,} tracks")
     all_angles = []
     for pid, grp in tracks.groupby("particle"):
         grp = grp.reset_index(drop=True).sort_values("frame")
@@ -1689,6 +1696,10 @@ def compute_clusters(locs, pixel_size_um, eps_um=0.05, min_samples=5,
         rng = np.random.default_rng(42)
         idx = rng.choice(len(xy), max_locs, replace=False)
         xy = xy[idx]
+        print(f"  Cluster analysis  : sub-sampled to {max_locs:,} localisations")
+    else:
+        print(f"  Cluster analysis  : {len(xy):,} localisations  "
+              f"(eps={eps_um*1000:.0f} nm, min_samples={min_samples})")
     labels = DBSCAN(eps=eps_um, min_samples=min_samples).fit_predict(xy)
     n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
     rows = []
@@ -1715,6 +1726,7 @@ def compute_clusters(locs, pixel_size_um, eps_um=0.05, min_samples=5,
 
 def compute_dwell_times(tracks, diff_df, frame_interval):
     confined_pids = diff_df[diff_df["motion"].isin(["Confined", "Immobile"])]["particle"]
+    print(f"  Dwell times       : {len(confined_pids):,} confined/immobile tracks")
     rows = []
     for pid in confined_pids:
         n = len(tracks[tracks["particle"] == pid])
@@ -1740,6 +1752,8 @@ def compute_dwell_times(tracks, diff_df, frame_interval):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compute_mss(tracks, pixel_size_um, frame_interval, max_lagtime=10):
+    n_tracks = tracks["particle"].nunique()
+    print(f"  MSS analysis      : {n_tracks:,} tracks")
     q_values = [1, 2, 3, 4]
     results = []
     for pid, grp in (tracks.reset_index(drop=True)
