@@ -120,25 +120,13 @@ jobs:
           $internal = "dist\sptPALM\_internal"
 
           foreach ($dll in @("vcruntime140.dll", "vcruntime140_1.dll")) {
-            if (Test-Path (Join-Path $internal $dll)) {
-              Write-Host "$dll already in bundle — skipping"
-              continue
-            }
-            $src = python -c "
-import ctypes, ctypes.wintypes, os
-try:
-    lib = ctypes.WinDLL('$dll')
-    buf = ctypes.create_unicode_buffer(32768)
-    ctypes.windll.kernel32.GetModuleFileNameW(lib._handle, buf, 32768)
-    print(buf.value)
-except Exception as e:
-    print('')
-"
+            if (Test-Path (Join-Path $internal $dll)) { Write-Host "$dll already in bundle"; continue }
+            $src = python -c "import ctypes,ctypes.wintypes; lib=ctypes.WinDLL('$dll'); buf=ctypes.create_unicode_buffer(32768); ctypes.windll.kernel32.GetModuleFileNameW(lib._handle,buf,32768); print(buf.value)"
             if ($src -and (Test-Path $src)) {
               Copy-Item $src $internal -Force
               Write-Host "Copied $dll from $src"
             } else {
-              Write-Warning "$dll not found via ctypes — users may need to install VC++ Redistributable"
+              Write-Warning "$dll not found — users may need VC++ Redistributable"
             }
           }
 
