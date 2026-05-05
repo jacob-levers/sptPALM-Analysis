@@ -62,16 +62,29 @@ datas += [("sptpalm_analysis.py", ".")]
 # startup.  We find the directories ourselves and inject them explicitly.
 if sys.platform == "win32":
     _python_dir = os.path.dirname(sys.executable)
-    _tcl_root   = os.path.join(_python_dir, "tcl")
-    if os.path.isdir(_tcl_root):
+    # Try the standard location, then one level up (setup-python varies)
+    for _candidate in [os.path.join(_python_dir, "tcl"),
+                       os.path.join(os.path.dirname(_python_dir), "tcl")]:
+        if os.path.isdir(_candidate):
+            _tcl_root = _candidate
+            break
+    else:
+        _tcl_root = None
+
+    print(f"[spec] Python dir : {_python_dir}")
+    print(f"[spec] Tcl root   : {_tcl_root}")
+
+    if _tcl_root:
         for _entry in os.listdir(_tcl_root):
             _full = os.path.join(_tcl_root, _entry)
             if not os.path.isdir(_full):
                 continue
             _lo = _entry.lower()
             if _lo.startswith("tcl"):
+                print(f"[spec] Adding _tcl_data <- {_full}")
                 datas.append((_full, "_tcl_data"))
             elif _lo.startswith("tk"):
+                print(f"[spec] Adding _tk_data  <- {_full}")
                 datas.append((_full, "_tk_data"))
 
 # ── VC++ runtime binaries (Windows only) ──────────────────────────────────────

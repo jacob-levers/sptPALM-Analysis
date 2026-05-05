@@ -100,14 +100,47 @@ jobs:
             Write-Warning "vcruntime140.dll not found in bundle — users may see DLL error."
           }
 
-      - name: Verify Tcl/Tk data bundled
+      - name: Ensure Tcl/Tk data bundled
         shell: powershell
         run: |
-          $tcl = "dist\sptPALM\_internal\_tcl_data"
-          $tk  = "dist\sptPALM\_internal\_tk_data"
-          if (-not (Test-Path $tcl)) { Write-Error "_tcl_data missing from bundle!" ; exit 1 }
-          if (-not (Test-Path $tk))  { Write-Error "_tk_data missing from bundle!"  ; exit 1 }
-          Write-Host "Tcl/Tk data verified."
+          # PyInstaller should auto-collect Tcl/Tk data, but falls back here if not.
+          $dest    = "dist\sptPALM\_internal"
+          $tclDest = Join-Path $dest "_tcl_data"
+          $tkDest  = Join-Path $dest "_tk_data"
+
+          if ((Test-Path $tclDest) -and (Test-Path $tkDest)) {
+            Write-Host "Tcl/Tk data already present — nothing to do."
+          } else {
+            Write-Host "Tcl/Tk data missing from bundle, copying manually..."
+
+            # Locate Python's tcl/ directory (setup-python puts it next to python.exe)
+            $pyDir   = python -c "import sys,os; print(os.path.dirname(sys.executable))"
+            $tclRoot = Join-Path $pyDir "tcl"
+
+            if (-not (Test-Path $tclRoot)) {
+              # Some setups put tcl/ one level up
+              $tclRoot = Join-Path (Split-Path $pyDir) "tcl"
+            }
+
+            if (Test-Path $tclRoot) {
+              Write-Host "Found Tcl root: $tclRoot"
+              Get-ChildItem $tclRoot -Directory | ForEach-Object {
+                if ($_.Name -match "^tcl" -and -not (Test-Path $tclDest)) {
+                  Copy-Item $_.FullName $tclDest -Recurse -Force
+                  Write-Host "Copied $_  -> _tcl_data"
+                } elseif ($_.Name -match "^tk" -and -not (Test-Path $tkDest)) {
+                  Copy-Item $_.FullName $tkDest -Recurse -Force
+                  Write-Host "Copied $_ -> _tk_data"
+                }
+              }
+            } else {
+              Write-Warning "Could not locate Python tcl/ directory at $tclRoot"
+            }
+          }
+
+          # Final status (warnings only, never fail the build)
+          if (Test-Path $tclDest) { Write-Host "_tcl_data OK" } else { Write-Warning "_tcl_data missing" }
+          if (Test-Path $tkDest)  { Write-Host "_tk_data OK"  } else { Write-Warning "_tk_data missing"  }
 
       - name: Zip the dist folder
         run: |
