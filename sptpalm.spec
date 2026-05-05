@@ -13,11 +13,8 @@ Outputs:
 
 from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 import sys
-import os
 
 # ── Hidden imports ─────────────────────────────────────────────────────────────
-# PyInstaller's static analysis misses many scientific-Python sub-packages.
-
 hidden = []
 hidden += collect_submodules("trackpy")
 hidden += collect_submodules("scipy")
@@ -27,24 +24,17 @@ hidden += collect_submodules("joblib")
 hidden += collect_submodules("aicspylibczi")
 hidden += collect_submodules("imagecodecs")
 hidden += [
-    # CZI readers
     "czifile", "aicspylibczi", "imagecodecs",
-    # TIFF
     "tifffile",
-    # Tkinter backends
     "matplotlib.backends.backend_tkagg",
     "matplotlib.backends._backend_tk",
-    # PIL
     "PIL._tkinter_finder", "PIL.Image", "PIL.ImageTk",
-    # pandas / numpy internals
     "pandas._libs.tslibs.np_datetime",
     "pandas._libs.tslibs.nattype",
     "pandas._libs.tslibs.timedeltas",
     "pandas._libs.tslibs.timestamps",
-    # multiprocessing (spawn support)
     "multiprocessing.pool",
     "multiprocessing.managers",
-    # memory management (conditionally imported inside function)
     "psutil",
 ]
 
@@ -53,65 +43,13 @@ datas = []
 datas += collect_data_files("skimage")
 datas += collect_data_files("matplotlib")
 datas += collect_data_files("aicspylibczi")
-# Include the science engine alongside the GUI
 datas += [("sptpalm_analysis.py", ".")]
-
-# ── Tcl/Tk data (Windows) ──────────────────────────────────────────────────────
-# PyInstaller sometimes fails to auto-collect the Tcl/Tk library data on
-# Windows, producing a "Tcl data directory _tcl_data not found" crash at
-# startup.  We find the directories ourselves and inject them explicitly.
-if sys.platform == "win32":
-    _python_dir = os.path.dirname(sys.executable)
-    # Try the standard location, then one level up (setup-python varies)
-    for _candidate in [os.path.join(_python_dir, "tcl"),
-                       os.path.join(os.path.dirname(_python_dir), "tcl")]:
-        if os.path.isdir(_candidate):
-            _tcl_root = _candidate
-            break
-    else:
-        _tcl_root = None
-
-    print(f"[spec] Python dir : {_python_dir}")
-    print(f"[spec] Tcl root   : {_tcl_root}")
-
-    if _tcl_root:
-        for _entry in os.listdir(_tcl_root):
-            _full = os.path.join(_tcl_root, _entry)
-            if not os.path.isdir(_full):
-                continue
-            _lo = _entry.lower()
-            if _lo.startswith("tcl"):
-                print(f"[spec] Adding _tcl_data <- {_full}")
-                datas.append((_full, "_tcl_data"))
-            elif _lo.startswith("tk"):
-                print(f"[spec] Adding _tk_data  <- {_full}")
-                datas.append((_full, "_tk_data"))
-
-# ── VC++ runtime binaries (Windows only) ──────────────────────────────────────
-# python312.dll depends on vcruntime140.dll / vcruntime140_1.dll.  These are
-# NOT installed by default on every Windows machine.  We bundle them so the
-# app works without the user installing the Visual C++ Redistributable.
-# PyInstaller places binaries in _internal\ where python312.dll can find them.
-if sys.platform == "win32":
-    _py_dir  = os.path.dirname(sys.executable)
-    _sys32   = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
-    _rt_dlls = []
-    for _dll in ["vcruntime140.dll", "vcruntime140_1.dll",
-                 "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll"]:
-        # Python's own install directory has these alongside python.exe
-        for _search in [_py_dir, _sys32]:
-            _path = os.path.join(_search, _dll)
-            if os.path.isfile(_path):
-                _rt_dlls.append((_path, "."))
-                break
-else:
-    _rt_dlls = []
 
 # ── Analysis ──────────────────────────────────────────────────────────────────
 a = Analysis(
     ["app_tk.py"],
     pathex=["."],
-    binaries=_rt_dlls,
+    binaries=[],
     datas=datas,
     hiddenimports=hidden,
     hookspath=[],
@@ -133,8 +71,8 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=False,          # UPX can corrupt scientific binaries; leave off
-    console=False,      # no terminal window
+    upx=False,
+    console=False,
     argv_emulation=False,
     codesign_identity=None,
     entitlements_file=None,
@@ -156,7 +94,7 @@ if sys.platform == "darwin":
     app = BUNDLE(
         coll,
         name="sptPALM.app",
-        icon=None,                          # swap in an .icns file here if you have one
+        icon=None,
         bundle_identifier="com.jacoblevers.sptpalm",
         info_plist={
             "CFBundleName": "sptPALM",
@@ -165,7 +103,6 @@ if sys.platform == "darwin":
             "CFBundleShortVersionString": "1.0.0",
             "NSHighResolutionCapable": True,
             "LSMinimumSystemVersion": "11.0",
-            # Allow spawning child processes without the macOS sandbox blocking them
             "NSAppleEventsUsageDescription": "Required for analysis.",
         },
     )
