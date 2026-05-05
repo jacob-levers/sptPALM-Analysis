@@ -112,6 +112,15 @@ jobs:
             }
           }
 
+      - name: Verify Tcl/Tk data bundled
+        shell: powershell
+        run: |
+          $tcl = "dist\sptPALM\_internal\_tcl_data"
+          $tk  = "dist\sptPALM\_internal\_tk_data"
+          if (-not (Test-Path $tcl)) { Write-Error "_tcl_data missing from bundle!" ; exit 1 }
+          if (-not (Test-Path $tk))  { Write-Error "_tk_data missing from bundle!"  ; exit 1 }
+          Write-Host "Tcl/Tk data verified."
+
       - name: Zip the dist folder
         run: |
           Compress-Archive -Path dist\sptPALM -DestinationPath dist\sptPALM-Windows.zip

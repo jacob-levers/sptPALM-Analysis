@@ -13,6 +13,7 @@ Outputs:
 
 from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 import sys
+import os
 
 # ── Hidden imports ─────────────────────────────────────────────────────────────
 # PyInstaller's static analysis misses many scientific-Python sub-packages.
@@ -54,6 +55,24 @@ datas += collect_data_files("matplotlib")
 datas += collect_data_files("aicspylibczi")
 # Include the science engine alongside the GUI
 datas += [("sptpalm_analysis.py", ".")]
+
+# ── Tcl/Tk data (Windows) ──────────────────────────────────────────────────────
+# PyInstaller sometimes fails to auto-collect the Tcl/Tk library data on
+# Windows, producing a "Tcl data directory _tcl_data not found" crash at
+# startup.  We find the directories ourselves and inject them explicitly.
+if sys.platform == "win32":
+    _python_dir = os.path.dirname(sys.executable)
+    _tcl_root   = os.path.join(_python_dir, "tcl")
+    if os.path.isdir(_tcl_root):
+        for _entry in os.listdir(_tcl_root):
+            _full = os.path.join(_tcl_root, _entry)
+            if not os.path.isdir(_full):
+                continue
+            _lo = _entry.lower()
+            if _lo.startswith("tcl"):
+                datas.append((_full, "_tcl_data"))
+            elif _lo.startswith("tk"):
+                datas.append((_full, "_tk_data"))
 
 # ── Analysis ──────────────────────────────────────────────────────────────────
 a = Analysis(
