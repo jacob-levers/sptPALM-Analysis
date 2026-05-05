@@ -1335,27 +1335,39 @@ def localise_particles(stack, diameter=7, minmass=0.1, percentile=64,
     # Parallelise across chunks using threads (safe on macOS — no fork).
     # tp.batch internally uses NumPy/SciPy which release the GIL, so
     # thread-level parallelism gives real speedup.
+    chunk_pairs = list(zip(chunks, offsets))
     if preview_cb is None:
+        # No preview: fully parallel across all chunks.
         chunk_results = Parallel(n_jobs=workers, prefer="threads")(
             delayed(_localise_chunk)(chunk, diameter, minmass, percentile, offset)
             for chunk, offset in _tqdm(
-                zip(chunks, offsets), total=n_chunks,
+                chunk_pairs, total=n_chunks,
                 desc="  Localising", unit="chunk", ncols=70))
     else:
-        # Sequential collection so we can emit preview frames as we go.
-        # We still parallelise inside each chunk via tp.batch (processes=1
-        # but trackpy releases the GIL during heavy NumPy work).
+        # With preview: process in parallel batches (batch_size = workers).
+        # Each batch runs fully parallel so all cores are used, then we emit
+        # one preview frame after each batch — live feedback without losing
+        # multi-core throughput.
+        batch_size   = max(1, workers)
+        batches      = [chunk_pairs[i:i + batch_size]
+                        for i in range(0, len(chunk_pairs), batch_size)]
         chunk_results = []
-        for chunk, offset in _tqdm(zip(chunks, offsets), total=n_chunks,
-                                   desc="  Localising", unit="chunk", ncols=70):
-            df = _localise_chunk(chunk, diameter, minmass, percentile, offset)
-            chunk_results.append(df)
+        chunks_done   = 0
+        for batch in batches:
+            batch_res = Parallel(n_jobs=len(batch), prefer="threads")(
+                delayed(_localise_chunk)(ch, diameter, minmass, percentile, off)
+                for ch, off in batch)
+            chunk_results.extend(batch_res)
+            chunks_done += len(batch)
+            # Emit a preview from the middle frame of the last chunk in this batch
             try:
-                mid_local  = len(chunk) // 2
-                mid_global = offset + mid_local
-                preview_frame = chunk[mid_local]
-                if df is not None and len(df) > 0:
-                    sel = df[df["frame"] == mid_global]
+                last_chunk, last_offset = batch[-1]
+                last_df    = batch_res[-1]
+                mid_local  = len(last_chunk) // 2
+                mid_global = last_offset + mid_local
+                preview_frame = last_chunk[mid_local]
+                if last_df is not None and len(last_df) > 0:
+                    sel = last_df[last_df["frame"] == mid_global]
                     xs, ys = sel["x"].values, sel["y"].values
                 else:
                     xs, ys = [], []

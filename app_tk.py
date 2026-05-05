@@ -2264,14 +2264,16 @@ class SPTPalmApp(tk.Tk):
                 _btns[prev].configure(bg=SIDEBAR, fg=MUTED)
             _active.set(name)
             _btns[name].configure(bg=BG, fg=TXT)
-            for n, f in _tabs.items():
-                if n == name:
-                    f.place(relx=0, rely=0, relwidth=1, relheight=1)
-                else:
-                    f.place_forget()
+            # tkraise() brings one frame to the front without re-laying out
+            # the others — much faster than place()/place_forget().
+            _tabs[name].tkraise()
 
         def _add_tab(name):
+            # All tab frames share the same grid cell; tkraise() selects which
+            # one is visible.  We use place with fixed geometry so that frames
+            # that haven't been raised yet don't collapse to zero size.
             f = tk.Frame(content, bg=BG)
+            f.place(relx=0, rely=0, relwidth=1, relheight=1)
             _tabs[name] = f
             btn = tk.Label(tab_bar, text=name, bg=SIDEBAR, fg=MUTED,
                            font=F(10), padx=18, pady=8, cursor="hand2")
