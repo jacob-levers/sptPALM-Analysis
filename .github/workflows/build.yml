@@ -86,18 +86,28 @@ jobs:
           pip install pyinstaller
 
       - name: Build exe bundle
+        run: pyinstaller sptpalm.spec --noconfirm --clean
+
+      - name: Bundle Tcl/Tk data
         shell: pwsh
         run: |
-          # Locate Tcl/Tk dirs: {sys.prefix}\tcl\tcl8.x and tk8.x
-          $tclSrc = python -c "import sys,os,glob; h=sorted(glob.glob(os.path.join(sys.prefix,'tcl','tcl8*'))); print(h[-1] if h else '')"
-          $tkSrc  = python -c "import sys,os,glob; h=sorted(glob.glob(os.path.join(sys.prefix,'tcl','tk8*'))); print(h[-1] if h else '')"
+          $internal = "dist\sptPALM\_internal"
+          $tclDest  = Join-Path $internal "_tcl_data"
+          $tkDest   = Join-Path $internal "_tk_data"
+
+          # Filter glob results to directories only — .lib files also match tcl8* / tk8*
+          $tclSrc = python -c "import sys,os,glob; h=[d for d in glob.glob(os.path.join(sys.prefix,'tcl','tcl8*')) if os.path.isdir(d)]; print(sorted(h)[-1] if h else '')"
+          $tkSrc  = python -c "import sys,os,glob; h=[d for d in glob.glob(os.path.join(sys.prefix,'tcl','tk8*'))  if os.path.isdir(d)]; print(sorted(h)[-1] if h else '')"
           Write-Host "TCL dir : $tclSrc"
           Write-Host "TK  dir : $tkSrc"
-          if (-not $tclSrc -or -not (Test-Path $tclSrc)) { Write-Error "tcl8.x not found"; exit 1 }
-          if (-not $tkSrc  -or -not (Test-Path $tkSrc))  { Write-Error "tk8.x not found";  exit 1 }
-          pyinstaller sptpalm.spec --noconfirm --clean `
-            --add-data "$tclSrc;_tcl_data" `
-            --add-data "$tkSrc;_tk_data"
+
+          if (-not $tclSrc -or -not (Test-Path $tclSrc)) { Write-Error "tcl8.x directory not found"; exit 1 }
+          if (-not $tkSrc  -or -not (Test-Path $tkSrc))  { Write-Error "tk8.x directory not found";  exit 1 }
+
+          if (-not (Test-Path $tclDest)) { Copy-Item $tclSrc $tclDest -Recurse -Force; Write-Host "Copied _tcl_data" }
+          if (-not (Test-Path $tkDest))  { Copy-Item $tkSrc  $tkDest  -Recurse -Force; Write-Host "Copied _tk_data"  }
+          Write-Host "_tcl_data exists: $(Test-Path $tclDest)"
+          Write-Host "_tk_data  exists: $(Test-Path $tkDest)"
 
       - name: Bundle VC++ runtime DLLs
         shell: pwsh
