@@ -74,11 +74,31 @@ if sys.platform == "win32":
             elif _lo.startswith("tk"):
                 datas.append((_full, "_tk_data"))
 
+# ── VC++ runtime binaries (Windows only) ──────────────────────────────────────
+# python312.dll depends on vcruntime140.dll / vcruntime140_1.dll.  These are
+# NOT installed by default on every Windows machine.  We bundle them so the
+# app works without the user installing the Visual C++ Redistributable.
+# PyInstaller places binaries in _internal\ where python312.dll can find them.
+if sys.platform == "win32":
+    _py_dir  = os.path.dirname(sys.executable)
+    _sys32   = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
+    _rt_dlls = []
+    for _dll in ["vcruntime140.dll", "vcruntime140_1.dll",
+                 "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll"]:
+        # Python's own install directory has these alongside python.exe
+        for _search in [_py_dir, _sys32]:
+            _path = os.path.join(_search, _dll)
+            if os.path.isfile(_path):
+                _rt_dlls.append((_path, "."))
+                break
+else:
+    _rt_dlls = []
+
 # ── Analysis ──────────────────────────────────────────────────────────────────
 a = Analysis(
     ["app_tk.py"],
     pathex=["."],
-    binaries=[],
+    binaries=_rt_dlls,
     datas=datas,
     hiddenimports=hidden,
     hookspath=[],

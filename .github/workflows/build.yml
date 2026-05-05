@@ -88,28 +88,16 @@ jobs:
       - name: Build exe bundle
         run: pyinstaller sptpalm.spec --noconfirm --clean
 
-      - name: Bundle VC++ runtime DLLs
+      - name: Verify VC++ runtime DLLs bundled
         shell: powershell
         run: |
-          # Copy the Visual C++ and Universal CRT runtime DLLs into the bundle
-          # so the app runs on machines without Visual C++ Redistributable installed.
-          $dest = "dist\sptPALM\_internal"
-          $sys32 = "$env:SystemRoot\System32"
-          $dlls = @(
-            "vcruntime140.dll",
-            "vcruntime140_1.dll",
-            "msvcp140.dll",
-            "msvcp140_1.dll",
-            "msvcp140_2.dll"
-          )
-          foreach ($dll in $dlls) {
-            $src = Join-Path $sys32 $dll
-            if (Test-Path $src) {
-              Copy-Item $src $dest -Force
-              Write-Host "Bundled $dll"
-            } else {
-              Write-Host "Not found (skipped): $dll"
-            }
+          # The spec file injects vcruntime140.dll etc. as binaries.
+          # Verify at least the critical one made it into the bundle.
+          $dll = "dist\sptPALM\_internal\vcruntime140.dll"
+          if (Test-Path $dll) {
+            Write-Host "vcruntime140.dll present."
+          } else {
+            Write-Warning "vcruntime140.dll not found in bundle — users may see DLL error."
           }
 
       - name: Verify Tcl/Tk data bundled
