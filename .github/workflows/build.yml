@@ -86,25 +86,34 @@ jobs:
           pip install pyinstaller
 
       - name: Build exe bundle
-        run: pyinstaller sptpalm.spec --noconfirm --clean
-
-      - name: Fix Windows runtime dependencies
         shell: pwsh
         run: |
+          # Ask Python where its Tcl/Tk libraries live, then pass them into
+          # PyInstaller as --add-data so they are bundled during the build itself.
+          # This is more reliable than post-processing because PyInstaller resolves
+          # paths and handles duplicates internally.
+          $tclSrc = python -c "import _tkinter; print(_tkinter.TCL_LIBRARY)"
+          $tkSrc  = python -c "import _tkinter; print(_tkinter.TK_LIBRARY)"
+          Write-Host "TCL_LIBRARY : $tclSrc"
+          Write-Host "TK_LIBRARY  : $tkSrc"
+          pyinstaller sptpalm.spec --noconfirm --clean `
+            --add-data "$tclSrc;_tcl_data" `
+            --add-data "$tkSrc;_tk_data"
+
+      - name: Bundle VC++ runtime DLLs
+        shell: pwsh
+        run: |
+          # python312.dll depends on vcruntime140.dll etc., which are not
+          # guaranteed to be present on end-user Windows machines.
           $internal = "dist\sptPALM\_internal"
           $pyDir    = python -c "import sys,os; print(os.path.dirname(sys.executable))"
-          Write-Host "Python dir: $pyDir"
-          Write-Host "Bundle internal dir exists: $(Test-Path $internal)"
-
-          # ── 1. VC++ runtime DLLs ────────────────────────────────────────────
-          # python312.dll needs these; they are NOT present on all Windows machines.
-          $dllSources = @($pyDir, "$env:SystemRoot\System32")
+          $sources  = @($pyDir, "$env:SystemRoot\System32")
           foreach ($dll in @("vcruntime140.dll","vcruntime140_1.dll","msvcp140.dll","msvcp140_1.dll")) {
             if (Test-Path (Join-Path $internal $dll)) {
               Write-Host "$dll already in bundle"
               continue
             }
-            foreach ($src in $dllSources) {
+            foreach ($src in $sources) {
               $candidate = Join-Path $src $dll
               if (Test-Path $candidate) {
                 Copy-Item $candidate $internal -Force
@@ -113,51 +122,11 @@ jobs:
               }
             }
             if (-not (Test-Path (Join-Path $internal $dll))) {
-              Write-Warning "$dll not found in any search location"
+              Write-Warning "$dll not found — may be missing on some machines"
             }
           }
-
-          # ── 2. Tcl/Tk data directories ──────────────────────────────────────
-          # Tkinter needs _tcl_data and _tk_data in _internal\.
-          $tclDest = Join-Path $internal "_tcl_data"
-          $tkDest  = Join-Path $internal "_tk_data"
-
-          if ((Test-Path $tclDest) -and (Test-Path $tkDest)) {
-            Write-Host "Tcl/Tk data already in bundle"
-          } else {
-            # Search for tcl root in common locations
-            $tclRoot = $null
-            foreach ($candidate in @(
-              (Join-Path $pyDir "tcl"),
-              (Join-Path (Split-Path $pyDir -Parent) "tcl"),
-              "C:\hostedtoolcache\windows\Python\3.12*\x64\tcl"
-            )) {
-              $resolved = Resolve-Path $candidate -ErrorAction SilentlyContinue
-              if ($resolved) { $tclRoot = $resolved.Path; break }
-            }
-
-            if ($tclRoot) {
-              Write-Host "Tcl root: $tclRoot"
-              foreach ($dir in Get-ChildItem $tclRoot -Directory) {
-                if ($dir.Name -match "^tcl\d" -and -not (Test-Path $tclDest)) {
-                  Copy-Item $dir.FullName $tclDest -Recurse -Force
-                  Write-Host "Copied $($dir.Name) -> _tcl_data"
-                } elseif ($dir.Name -match "^tk\d" -and -not (Test-Path $tkDest)) {
-                  Copy-Item $dir.FullName $tkDest -Recurse -Force
-                  Write-Host "Copied $($dir.Name) -> _tk_data"
-                }
-              }
-            } else {
-              Write-Warning "Could not find Python tcl/ directory — Tkinter may fail at runtime"
-            }
-          }
-
-          # ── Summary ─────────────────────────────────────────────────────────
-          Write-Host "--- Bundle contents (top level) ---"
+          Write-Host "--- _internal top-level ---"
           Get-ChildItem $internal | Select-Object Name | Format-Table
-          Write-Host "vcruntime140.dll : $(Test-Path (Join-Path $internal 'vcruntime140.dll'))"
-          Write-Host "_tcl_data        : $(Test-Path $tclDest)"
-          Write-Host "_tk_data         : $(Test-Path $tkDest)"
 
       - name: Zip the dist folder
         run: |
