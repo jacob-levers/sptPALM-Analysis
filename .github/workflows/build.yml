@@ -112,30 +112,38 @@ jobs:
       - name: Bundle VC++ runtime DLLs
         shell: pwsh
         run: |
-          # python312.dll depends on vcruntime140.dll etc., which are not
-          # guaranteed to be present on end-user Windows machines.
+          # python312.dll requires vcruntime140.dll / vcruntime140_1.dll at
+          # runtime. These are NOT guaranteed on all Windows machines.
+          # Strategy: use ctypes to ask Python where it loaded each DLL from
+          # (guaranteed correct since Python itself already loaded them), then
+          # copy those exact files into _internal alongside python312.dll.
           $internal = "dist\sptPALM\_internal"
-          $pyDir    = python -c "import sys,os; print(os.path.dirname(sys.executable))"
-          $sources  = @($pyDir, "$env:SystemRoot\System32")
-          foreach ($dll in @("vcruntime140.dll","vcruntime140_1.dll","msvcp140.dll","msvcp140_1.dll")) {
+
+          foreach ($dll in @("vcruntime140.dll", "vcruntime140_1.dll")) {
             if (Test-Path (Join-Path $internal $dll)) {
-              Write-Host "$dll already in bundle"
+              Write-Host "$dll already in bundle — skipping"
               continue
             }
-            foreach ($src in $sources) {
-              $candidate = Join-Path $src $dll
-              if (Test-Path $candidate) {
-                Copy-Item $candidate $internal -Force
-                Write-Host "Copied $dll from $src"
-                break
-              }
-            }
-            if (-not (Test-Path (Join-Path $internal $dll))) {
-              Write-Warning "$dll not found — may be missing on some machines"
+            $src = python -c "
+import ctypes, ctypes.wintypes, os
+try:
+    lib = ctypes.WinDLL('$dll')
+    buf = ctypes.create_unicode_buffer(32768)
+    ctypes.windll.kernel32.GetModuleFileNameW(lib._handle, buf, 32768)
+    print(buf.value)
+except Exception as e:
+    print('')
+"
+            if ($src -and (Test-Path $src)) {
+              Copy-Item $src $internal -Force
+              Write-Host "Copied $dll from $src"
+            } else {
+              Write-Warning "$dll not found via ctypes — users may need to install VC++ Redistributable"
             }
           }
-          Write-Host "--- _internal top-level ---"
-          Get-ChildItem $internal | Select-Object Name | Format-Table
+
+          Write-Host "--- _internal DLLs ---"
+          Get-ChildItem $internal -Filter "*.dll" | Select-Object Name | Format-Table
 
       - name: Zip the dist folder
         run: |
