@@ -2922,6 +2922,21 @@ class SPTPalmApp(tk.Tk):
             except Exception:
                 pass
 
+        def _plabel(ax, text, color="#79c0ff"):
+            """Draw a label *inside* the axes near the top.
+
+            ax.set_title() is clipped when add_axes([0,0,1,1]) is used because
+            the title sits above y=1.0 (outside the figure bounds).  Using
+            ax.text() with transAxes keeps the text inside the figure at all times.
+            A semi-transparent background box makes it readable over any image.
+            """
+            ax.text(0.5, 0.97, text,
+                    transform=ax.transAxes,
+                    ha="center", va="top",
+                    color=color, fontsize=9,
+                    bbox=dict(facecolor="#09090e", alpha=0.65,
+                              edgecolor="none", pad=3))
+
         # Throttled localisation preview (per-chunk, max 3 fps)
         def _preview_cb(frame_idx, frame_img, xs, ys, total):
             now = _time.monotonic()
@@ -2948,9 +2963,8 @@ class SPTPalmApp(tk.Tk):
                     ax.scatter(xs2, ys2, s=55, facecolors="none",
                                edgecolors="#4ea8ff", linewidths=1.0, alpha=0.85)
                 ax.set_axis_off()
-                ax.set_title(f"Localising  —  frame {frame_idx:,} / {total:,}   "
-                             f"({len(xs)} particles)",
-                             color="#79c0ff", fontsize=9, pad=4)
+                _plabel(ax, f"Localising  —  frame {frame_idx:,} / {total:,}   "
+                            f"({len(xs)} particles)")
                 _send_fig(fig, f"frame {frame_idx:,} / {total:,}")
                 fig.clear()
             except Exception:
@@ -3071,8 +3085,7 @@ class SPTPalmApp(tk.Tk):
                 ax.set_facecolor("#09090e")
                 ax.imshow(raw0, cmap="inferno", origin="upper", interpolation="nearest")
                 ax.set_axis_off()
-                ax.set_title(f"Loaded  —  {n_frames:,} frames  |  {stack.shape[2]}×{stack.shape[1]} px",
-                             color="#79c0ff", fontsize=9, pad=4)
+                _plabel(ax, f"Loaded  —  {n_frames:,} frames  |  {stack.shape[2]}×{stack.shape[1]} px")
                 _send_fig(fig, "raw stack")
                 fig.clear()
             except Exception:
@@ -3111,8 +3124,7 @@ class SPTPalmApp(tk.Tk):
                     ax.imshow(roi_mask, cmap="Blues", alpha=0.35,
                               origin="upper", vmin=0, vmax=1)
                     ax.set_axis_off()
-                    ax.set_title("Drawn ROI  —  blue = included region",
-                                 color="#79c0ff", fontsize=9, pad=4)
+                    _plabel(ax, "Drawn ROI  —  blue = included region")
                     _send_fig(fig, "drawn ROI")
                     fig.clear()
                 except Exception:
@@ -3142,8 +3154,7 @@ class SPTPalmApp(tk.Tk):
                     ax.imshow(roi_mask, cmap="Blues", alpha=0.35,
                               origin="upper", vmin=0, vmax=1)
                     ax.set_axis_off()
-                    ax.set_title("ROI Mask  —  blue = included region",
-                                 color="#79c0ff", fontsize=9, pad=4)
+                    _plabel(ax, "ROI Mask  —  blue = included region")
                     _send_fig(fig, "ROI mask")
                     fig.clear()
                 except Exception:
@@ -3164,8 +3175,8 @@ class SPTPalmApp(tk.Tk):
                     _ax2.imshow(_raw0_norm, cmap="inferno", origin="upper",
                                 interpolation="nearest")
                     _ax2.set_axis_off()
-                    _ax2.set_title("Localising particles…  (using all CPU cores)",
-                                   color="#f0a020", fontsize=9, pad=4)
+                    _plabel(_ax2, "Localising particles…  (using all CPU cores)",
+                            color="#f0a020")
                     _send_fig(_fig2, "localising…")
                     _fig2.clear()
             except Exception:
@@ -3200,9 +3211,7 @@ class SPTPalmApp(tk.Tk):
                                 s=30, facecolors="none", edgecolors="#4ea8ff",
                                 linewidths=0.8, alpha=0.7)
                 _ax.set_axis_off()
-                _ax.set_title(f"Localised  —  {len(locs):,} spots  |  "
-                              f"minmass={_minmass:.3f}",
-                              color="#79c0ff", fontsize=9, pad=4)
+                _plabel(_ax, f"Localised  —  {len(locs):,} spots  |  minmass={_minmass:.3f}")
                 _send_fig(_fig, f"{len(locs):,} localisations")
                 _fig.clear()
             except Exception:
@@ -3294,9 +3303,7 @@ class SPTPalmApp(tk.Tk):
                             lw=0.7, alpha=0.6, color=col)
                 ax.set_axis_off()
                 n_total = tracks["particle"].nunique()
-                ax.set_title(
-                    f"Linked  —  {n_total:,} trajectories  (showing {n_show})",
-                    color="#79c0ff", fontsize=9, pad=4)
+                _plabel(ax, f"Linked  —  {n_total:,} trajectories  (showing {n_show})")
                 _send_fig(fig, f"{n_total:,} trajectories")
                 fig.clear()
             except Exception:
@@ -3421,7 +3428,7 @@ class SPTPalmApp(tk.Tk):
                 ax_prev  = fig_prev.add_axes([0, 0, 1, 1])
                 ax_prev.imshow(final_img, interpolation="lanczos")
                 ax_prev.set_axis_off()
-                ax_prev.set_title("Analysis complete", color="#2ea043", fontsize=9, pad=4)
+                _plabel(ax_prev, "Analysis complete", color="#2ea043")
                 _send_fig(fig_prev, "complete")
                 fig_prev.clear()
             except Exception:
