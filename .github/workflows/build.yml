@@ -54,7 +54,6 @@ jobs:
           path: dist/sptPALM-macOS.dmg
           retention-days: 30
 
-      # Optional: attach to a GitHub Release when a tag is pushed
       - name: Upload to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
@@ -86,28 +85,9 @@ jobs:
           pip install pyinstaller
 
       - name: Build exe bundle
+        # The spec file handles Tcl/Tk bundling directly via tkinter query +
+        # glob fallback, so no post-build copy step is needed.
         run: pyinstaller sptpalm.spec --noconfirm --clean
-
-      - name: Bundle Tcl/Tk data
-        shell: pwsh
-        run: |
-          $internal = "dist\sptPALM\_internal"
-          $tclDest  = Join-Path $internal "_tcl_data"
-          $tkDest   = Join-Path $internal "_tk_data"
-
-          # Filter glob results to directories only — .lib files also match tcl8* / tk8*
-          $tclSrc = python -c "import sys,os,glob; h=[d for d in glob.glob(os.path.join(sys.prefix,'tcl','tcl8*')) if os.path.isdir(d)]; print(sorted(h)[-1] if h else '')"
-          $tkSrc  = python -c "import sys,os,glob; h=[d for d in glob.glob(os.path.join(sys.prefix,'tcl','tk8*'))  if os.path.isdir(d)]; print(sorted(h)[-1] if h else '')"
-          Write-Host "TCL dir : $tclSrc"
-          Write-Host "TK  dir : $tkSrc"
-
-          if (-not $tclSrc -or -not (Test-Path $tclSrc)) { Write-Error "tcl8.x directory not found"; exit 1 }
-          if (-not $tkSrc  -or -not (Test-Path $tkSrc))  { Write-Error "tk8.x directory not found";  exit 1 }
-
-          if (-not (Test-Path $tclDest)) { Copy-Item $tclSrc $tclDest -Recurse -Force; Write-Host "Copied _tcl_data" }
-          if (-not (Test-Path $tkDest))  { Copy-Item $tkSrc  $tkDest  -Recurse -Force; Write-Host "Copied _tk_data"  }
-          Write-Host "_tcl_data exists: $(Test-Path $tclDest)"
-          Write-Host "_tk_data  exists: $(Test-Path $tkDest)"
 
       - name: Bundle VC++ runtime DLLs
         shell: pwsh
@@ -133,10 +113,43 @@ jobs:
           Write-Host "--- _internal DLLs ---"
           Get-ChildItem $internal -Filter "*.dll" | Select-Object Name | Format-Table
 
-      - name: Zip the dist folder
+      - name: Verify bundle contents
+        shell: pwsh
         run: |
-          Compress-Archive -Path dist\sptPALM -DestinationPath dist\sptPALM-Windows.zip
+          # Hard-fail the build if any critical file or directory is missing.
+          # This catches packaging regressions before users download a broken zip.
+          $internal = "dist\sptPALM\_internal"
+          $ok = $true
+
+          # Tcl/Tk data — required for the Tkinter GUI to start
+          foreach ($dir in @("_tcl_data", "_tk_data")) {
+            $path = Join-Path $internal $dir
+            if (Test-Path $path) {
+              Write-Host "OK  $dir"
+            } else {
+              Write-Error "MISSING: $path"
+              $ok = $false
+            }
+          }
+
+          # Core Python DLL
+          $pyDll = Get-ChildItem $internal -Filter "python3*.dll" | Select-Object -First 1
+          if ($pyDll) { Write-Host "OK  $($pyDll.Name)" } else { Write-Error "MISSING: python3xx.dll"; $ok = $false }
+
+          # VC++ runtime (non-fatal warning only — not all runners have it)
+          foreach ($dll in @("vcruntime140.dll", "vcruntime140_1.dll")) {
+            if (Test-Path (Join-Path $internal $dll)) { Write-Host "OK  $dll" } else { Write-Warning "ABSENT: $dll (users may need VC++ Redist)" }
+          }
+
+          # Main executable
+          if (Test-Path "dist\sptPALM\sptPALM.exe") { Write-Host "OK  sptPALM.exe" } else { Write-Error "MISSING: sptPALM.exe"; $ok = $false }
+
+          if (-not $ok) { exit 1 }
+          Write-Host "All critical bundle checks passed."
+
+      - name: Zip the dist folder
         shell: powershell
+        run: Compress-Archive -Path dist\sptPALM -DestinationPath dist\sptPALM-Windows.zip
 
       - name: Upload zip artifact
         uses: actions/upload-artifact@v4
