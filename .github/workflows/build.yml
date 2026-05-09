@@ -34,7 +34,7 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pyinstaller
+          pip install "pyinstaller==6.11.1"   # pinned for reproducible Tcl/Tk bundling behaviour
 
       - name: Build .app
         run: pyinstaller sptpalm.spec --noconfirm --clean
@@ -82,7 +82,7 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pyinstaller
+          pip install "pyinstaller==6.11.1"   # pinned for reproducible Tcl/Tk bundling behaviour
 
       - name: Build exe bundle
         run: pyinstaller sptpalm.spec --noconfirm --clean
@@ -217,6 +217,25 @@ jobs:
 
           if (-not $ok) { exit 1 }
           Write-Host "All critical bundle checks passed."
+
+      - name: Smoke test (launch the app)
+        shell: pwsh
+        run: |
+          # Actually launch the exe to verify it doesn't crash on startup.
+          # The most common startup crash is the Tcl/Tk FileNotFoundError —
+          # this step catches it BEFORE the broken zip ships to users.
+          $exe = "dist\sptPALM\sptPALM.exe"
+          Write-Host "Launching $exe ..."
+          $proc = Start-Process -FilePath $exe -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 12
+          if ($proc.HasExited) {
+            $code = $proc.ExitCode
+            Write-Error "FATAL: app exited with code $code within 12s — startup crash (likely Tcl/Tk or DLL issue)"
+            exit 1
+          }
+          Write-Host "OK: app still running after 12s — GUI initialised successfully"
+          $proc.Kill()
+          $proc.WaitForExit(5000) | Out-Null
 
       - name: Zip the dist folder
         shell: powershell

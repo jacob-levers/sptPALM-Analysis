@@ -1313,15 +1313,20 @@ def preprocess_and_localise_stream(stack, diameter=7, minmass=None, percentile=6
 
 
 def _localise_chunk(chunk, diameter, minmass, percentile, frame_offset):
-    """Localise one chunk and apply global frame offset. Always uses processes=1
-    so that parallelism is handled at the chunk level via ThreadPoolExecutor,
-    which avoids the macOS multiprocessing-fork crash and joblib frozen-app hangs."""
+    """Localise one chunk and apply global frame offset.  Uses processes=1
+    inside tp.batch — chunk-level parallelism is handled by the caller via
+    multiprocessing.Pool (true multi-core, no GIL contention)."""
     locs = tp.batch(chunk, diameter=diameter, minmass=minmass,
                     percentile=percentile, processes=1)
     if len(locs) > 0:
         locs = locs.copy()
         locs["frame"] += frame_offset
     return locs
+
+
+def _localise_chunk_args(args):
+    """Picklable wrapper for multiprocessing.Pool.imap()."""
+    return _localise_chunk(*args)
 
 
 def localise_particles(stack, diameter=7, minmass=0.1, percentile=64,
@@ -1336,19 +1341,45 @@ def localise_particles(stack, diameter=7, minmass=0.1, percentile=64,
     print(f"  Diameter  : {diameter}px  |  minmass: {minmass:.4f}")
     print(f"  Chunks    : {n_chunks} x ~{chunk_size} frames  |  Workers: {workers}")
 
-    t0      = time.perf_counter()
-    chunks  = np.array_split(stack, n_chunks)
-    offsets = [i * chunk_size for i in range(len(chunks))]
+    t0       = time.perf_counter()
+    chunks   = np.array_split(stack, n_chunks)
+    offsets  = [i * chunk_size for i in range(len(chunks))]
+    args_list = [(c, diameter, minmass, percentile, o)
+                 for c, o in zip(chunks, offsets)]
 
-    # Run localisation serially — tp.batch/tp.locate internally use numpy/scipy
-    # which can use all CPU cores per frame.  Parallelising at the chunk level
-    # causes massive thread oversubscription in frozen apps on Windows (where
-    # BLAS thread caps don't take effect before DLL load), making it ~10x slower.
-    chunk_pairs = list(zip(chunks, offsets))
-    chunk_results = [_localise_chunk(chunk, diameter, minmass, percentile, offset)
-                     for chunk, offset in _tqdm(chunk_pairs, total=n_chunks,
-                                                desc="  Localising", unit="chunk",
-                                                ncols=70)]
+    # ── Parallelism strategy ──────────────────────────────────────────────────
+    # Use multiprocessing.Pool (spawn) for chunk-level parallelism.  Each worker
+    # is a separate process with its own GIL and BLAS thread = 1 (cap set at
+    # module import), so N workers truly use N CPU cores.  Threading approaches
+    # (joblib, ThreadPoolExecutor) deadlock or oversubscribe in frozen apps.
+    #
+    # Spawn startup cost (~5s/worker on Windows) only pays off with enough work.
+    # Below the threshold, run serially (avoids paying startup for small jobs).
+    use_mp = (workers > 1 and n_chunks > 1 and n_frames >= 2000)
+
+    chunk_results = []
+    if use_mp:
+        try:
+            ctx = multiprocessing.get_context("spawn")
+            actual_workers = min(workers, n_chunks)
+            print(f"  Parallelism: multiprocessing.Pool × {actual_workers} (spawn)")
+            with ctx.Pool(processes=actual_workers) as pool:
+                for r in _tqdm(
+                        pool.imap(_localise_chunk_args, args_list, chunksize=1),
+                        total=n_chunks, desc="  Localising", unit="chunk",
+                        ncols=70):
+                    chunk_results.append(r)
+        except Exception as exc:
+            print(f"  Multiprocessing failed ({type(exc).__name__}: {exc}); "
+                  f"falling back to serial")
+            chunk_results = []
+            use_mp = False
+
+    if not use_mp:
+        chunk_results = [_localise_chunk_args(a)
+                         for a in _tqdm(args_list, total=n_chunks,
+                                        desc="  Localising", unit="chunk",
+                                        ncols=70)]
 
     valid = [df for df in chunk_results if df is not None and len(df) > 0]
     result = pd.concat(valid, ignore_index=True) if valid else pd.DataFrame()
