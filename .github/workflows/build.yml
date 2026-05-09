@@ -238,8 +238,64 @@ jobs:
           $proc.WaitForExit(5000) | Out-Null
 
       - name: Zip the dist folder
-        shell: powershell
-        run: Compress-Archive -Path dist\sptPALM -DestinationPath dist\sptPALM-Windows.zip
+        # Use Python's zipfile via shutil (reliable, deterministic, preserves
+        # all subdirectories).  PowerShell's Compress-Archive has known issues
+        # with PyInstaller bundles — it can silently drop files or corrupt
+        # archives on bundles with many small files (e.g. _tcl_data).
+        shell: pwsh
+        run: |
+          python -c "import shutil; shutil.make_archive('dist/sptPALM-Windows', 'zip', 'dist', 'sptPALM')"
+          if (-not (Test-Path "dist\sptPALM-Windows.zip")) {
+            Write-Error "Zip creation failed"
+            exit 1
+          }
+          $size = (Get-Item "dist\sptPALM-Windows.zip").Length / 1MB
+          Write-Host ("Created sptPALM-Windows.zip ({0:N1} MB)" -f $size)
+
+      - name: Verify zip integrity (extract & re-test)
+        # Defence in depth: extract the zip we're about to ship, verify
+        # _tcl_data and _tk_data survived the archiving round-trip, and
+        # smoke-test the extracted exe.  If THIS fails, users will too.
+        shell: pwsh
+        run: |
+          $verifyDir = "$env:RUNNER_TEMP\sptPALM_verify"
+          if (Test-Path $verifyDir) { Remove-Item -Recurse -Force $verifyDir }
+          New-Item -ItemType Directory -Path $verifyDir | Out-Null
+
+          # Use Python's zipfile to extract (matches the writer)
+          python -c "import zipfile; zipfile.ZipFile(r'dist\sptPALM-Windows.zip').extractall(r'$verifyDir')"
+
+          $extractedExe = Join-Path $verifyDir "sptPALM\sptPALM.exe"
+          $extractedTcl = Join-Path $verifyDir "sptPALM\_internal\_tcl_data"
+          $extractedTk  = Join-Path $verifyDir "sptPALM\_internal\_tk_data"
+
+          $ok = $true
+          if (-not (Test-Path $extractedExe))  { Write-Error "ZIP CORRUPT: sptPALM.exe missing after extract"; $ok = $false }
+          if (-not (Test-Path $extractedTcl))  { Write-Error "ZIP CORRUPT: _tcl_data missing after extract"; $ok = $false }
+          if (-not (Test-Path $extractedTk))   { Write-Error "ZIP CORRUPT: _tk_data missing after extract"; $ok = $false }
+          if (-not $ok) { exit 1 }
+
+          # Critical: verify init.tcl actually survived (the file the rthook checks for)
+          $initTcl = Join-Path $extractedTcl "init.tcl"
+          if (-not (Test-Path $initTcl)) {
+            Write-Error "ZIP CORRUPT: _tcl_data\init.tcl missing after extract — Tcl runtime will fail"
+            exit 1
+          }
+          Write-Host "ZIP OK: extracted bundle has _tcl_data\init.tcl, _tk_data, sptPALM.exe"
+
+          # Smoke test the EXTRACTED bundle (not the build dir).  This is what
+          # the user actually downloads and runs.
+          Write-Host "Smoke testing extracted exe..."
+          $proc = Start-Process -FilePath $extractedExe -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 12
+          if ($proc.HasExited) {
+            $code = $proc.ExitCode
+            Write-Error "FATAL: extracted exe crashed with exit code $code (Tcl/Tk or DLL issue)"
+            exit 1
+          }
+          Write-Host "Extracted exe still running after 12s — bundle is healthy"
+          $proc.Kill()
+          $proc.WaitForExit(5000) | Out-Null
 
       - name: Upload zip artifact
         uses: actions/upload-artifact@v4
