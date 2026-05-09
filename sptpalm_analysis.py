@@ -1238,7 +1238,7 @@ def preprocess_and_localise_stream(stack, diameter=7, minmass=None, percentile=6
 
     # Localise first chunk (already preprocessed)
     locs0 = tp.batch(first_pp, diameter=diameter, minmass=minmass,
-                     percentile=percentile, processes=1, verbose=False)
+                     percentile=percentile, processes=1)
     if len(locs0) > 0:
         all_locs.append(locs0)
 
@@ -1274,7 +1274,7 @@ def preprocess_and_localise_stream(stack, diameter=7, minmass=None, percentile=6
         frame_count += len(chunk_pp)
 
         locs_i = tp.batch(chunk_pp, diameter=diameter, minmass=minmass,
-                          percentile=percentile, processes=1, verbose=False)
+                          percentile=percentile, processes=1)
 
         if len(locs_i) > 0:
             locs_i = locs_i.copy()
@@ -1317,7 +1317,7 @@ def _localise_chunk(chunk, diameter, minmass, percentile, frame_offset):
     so that parallelism is handled at the chunk level via ThreadPoolExecutor,
     which avoids the macOS multiprocessing-fork crash and joblib frozen-app hangs."""
     locs = tp.batch(chunk, diameter=diameter, minmass=minmass,
-                    percentile=percentile, processes=1, verbose=False)
+                    percentile=percentile, processes=1)
     if len(locs) > 0:
         locs = locs.copy()
         locs["frame"] += frame_offset
@@ -1370,8 +1370,7 @@ def link_trajectories(locs, search_range=5, memory=3, min_len=5, max_len=None):
           f"(search_range={search_range}px, memory={memory}) ...")
     t0 = time.perf_counter()
     try:
-        linked = tp.link(locs, search_range=search_range, memory=memory,
-                         verbose=False)
+        linked = tp.link(locs, search_range=search_range, memory=memory)
         print(f"  tp.link done — filtering stubs (min_len={min_len}) ...")
     except Exception as exc:
         if "SubnetOversizeException" in type(exc).__name__ or "Subnetwork" in str(exc):
@@ -1381,7 +1380,7 @@ def link_trajectories(locs, search_range=5, memory=3, min_len=5, max_len=None):
             print(f"  WARNING: SubnetOversizeException — switching to "
                   f"nonrecursive linker (consider reducing Search range)")
             linked = tp.link(locs, search_range=search_range, memory=memory,
-                             link_strategy="nonrecursive", verbose=False)
+                             link_strategy="nonrecursive")
         else:
             raise
     filtered = tp.filter_stubs(linked, min_len)
