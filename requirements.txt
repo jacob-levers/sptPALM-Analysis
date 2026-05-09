@@ -17,3 +17,4 @@ imageio
 Pillow
 psutil
 scikit-learn
+threadpoolctl      # dynamically expand BLAS pool during localisation

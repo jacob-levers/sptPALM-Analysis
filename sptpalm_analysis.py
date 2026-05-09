@@ -68,14 +68,18 @@ import xml.etree.ElementTree as ET
 warnings.filterwarnings("ignore")
 
 # ── BLAS / OpenBLAS / MKL threading policy ─────────────────────────────────────
-# We deliberately do NOT cap BLAS threads here.  numpy/scipy/skimage internally
-# parallelise heavy ops (gaussian_filter, uniform_filter, FFT) across all cores
-# via OpenBLAS or MKL — that is exactly the multi-core utilisation we want.
+# Cap internal BLAS threads to 1.  We use ThreadPoolExecutor for preprocessing
+# (one Python thread per frame, all calling scipy.ndimage which uses BLAS).
+# Without this cap, we get N² threads (Python pool × BLAS pool) on N cores,
+# which deadlocks Windows frozen apps before the first preview frame is sent.
 #
-# The cap was previously needed when joblib was spawning N Python threads each
-# calling numpy (= N² threads on N cores → catastrophic oversubscription).
-# Now that localisation runs chunks serially in the main worker thread, only
-# numpy's internal pool exists, so no oversubscription is possible.
+# Per-frame numpy/scipy operations on small (256×256) images are too fast to
+# benefit from BLAS threading anyway — chunk-level Python threading wins.
+# This MUST be set before numpy is imported to take effect.
+for _blas_env in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
+                  "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+                  "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_blas_env, "1")
 
 import numpy as np
 import pandas as pd
@@ -88,6 +92,14 @@ from matplotlib.lines import Line2D
 import trackpy as tp
 from joblib import Parallel, delayed
 from concurrent.futures import ThreadPoolExecutor
+try:
+    from threadpoolctl import threadpool_limits as _threadpool_limits
+except Exception:
+    # Fallback no-op context manager if threadpoolctl unavailable
+    from contextlib import contextmanager as _cm
+    @_cm
+    def _threadpool_limits(limits=None, user_api=None):
+        yield
 from scipy.ndimage import uniform_filter, gaussian_filter, gaussian_filter1d
 from scipy.interpolate import interp1d
 from scipy.optimize import curve_fit
@@ -1234,9 +1246,10 @@ def preprocess_and_localise_stream(stack, diameter=7, minmass=None, percentile=6
     mean_acc  = first_pp.sum(axis=0).astype(np.float64)
     frame_count = len(first_pp)
 
-    # Localise first chunk (already preprocessed)
-    locs0 = tp.batch(first_pp, diameter=diameter, minmass=minmass,
-                     percentile=percentile, processes=1)
+    # Localise first chunk (already preprocessed) — expand BLAS to all cores
+    with _threadpool_limits(limits=N_CPUS):
+        locs0 = tp.batch(first_pp, diameter=diameter, minmass=minmass,
+                         percentile=percentile, processes=1)
     if len(locs0) > 0:
         all_locs.append(locs0)
 
@@ -1271,8 +1284,9 @@ def preprocess_and_localise_stream(stack, diameter=7, minmass=None, percentile=6
         mean_acc   += chunk_pp.sum(axis=0)
         frame_count += len(chunk_pp)
 
-        locs_i = tp.batch(chunk_pp, diameter=diameter, minmass=minmass,
-                          percentile=percentile, processes=1)
+        with _threadpool_limits(limits=N_CPUS):
+            locs_i = tp.batch(chunk_pp, diameter=diameter, minmass=minmass,
+                              percentile=percentile, processes=1)
 
         if len(locs_i) > 0:
             locs_i = locs_i.copy()
@@ -1339,14 +1353,18 @@ def localise_particles(stack, diameter=7, minmass=0.1, percentile=64,
     offsets  = [i * chunk_size for i in range(len(chunks))]
     chunk_pairs = list(zip(chunks, offsets))
 
-    # Run chunks serially in the calling thread.  Per-frame numpy/scipy ops
-    # (gaussian_filter, FFT, etc.) parallelise internally across all CPU cores
-    # via the BLAS pool — true multi-core utilisation without the spawn-worker
-    # startup hangs that plague PyInstaller frozen apps.
-    chunk_results = [_localise_chunk(chunk, diameter, minmass, percentile, offset)
-                     for chunk, offset in _tqdm(chunk_pairs, total=n_chunks,
-                                                desc="  Localising", unit="chunk",
-                                                ncols=70)]
+    # Run chunks serially in the calling thread, but DYNAMICALLY expand the
+    # BLAS thread pool to N_CPUS for the duration of localisation.  Per-frame
+    # numpy/scipy ops (gaussian_filter, FFT, centroid fitting) then parallelise
+    # internally across all CPU cores — full multi-core utilisation without
+    # nested-thread oversubscription (single Python thread × N BLAS threads
+    # = N total threads on N cores).  threadpoolctl restores the cap on exit.
+    print(f"  BLAS pool : expanded to {N_CPUS} threads for localisation")
+    with _threadpool_limits(limits=N_CPUS):
+        chunk_results = [_localise_chunk(chunk, diameter, minmass, percentile, offset)
+                         for chunk, offset in _tqdm(chunk_pairs, total=n_chunks,
+                                                    desc="  Localising", unit="chunk",
+                                                    ncols=70)]
 
     valid = [df for df in chunk_results if df is not None and len(df) > 0]
     result = pd.concat(valid, ignore_index=True) if valid else pd.DataFrame()

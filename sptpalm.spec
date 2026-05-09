@@ -49,6 +49,7 @@ hidden += [
     "concurrent.futures",
     "concurrent.futures.thread",
     "psutil",
+    "threadpoolctl",   # used by sptpalm_analysis to expand BLAS during localise
     # encoding tables sometimes missed in frozen builds
     "encodings.utf_8",
     "encodings.ascii",
