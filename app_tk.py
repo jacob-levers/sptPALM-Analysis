@@ -3614,6 +3614,22 @@ def _open_folder(path: str) -> None:
 
 def main():
     app = SPTPalmApp()
+
+    # CI smoke-test marker: write a file once Tk is fully initialised so the
+    # build pipeline can verify the GUI actually started (rather than
+    # erroneously passing because an error dialog kept the process alive).
+    try:
+        marker_path = os.environ.get("SPTPALM_READY_MARKER")
+        if marker_path:
+            try:
+                app.update_idletasks()  # ensure widgets exist
+            except Exception:
+                pass
+            with open(marker_path, "w") as _f:
+                _f.write("ready\n")
+    except Exception:
+        pass
+
     app.mainloop()
 
 
