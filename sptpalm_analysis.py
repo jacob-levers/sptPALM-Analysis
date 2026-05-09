@@ -1340,17 +1340,15 @@ def localise_particles(stack, diameter=7, minmass=0.1, percentile=64,
     chunks  = np.array_split(stack, n_chunks)
     offsets = [i * chunk_size for i in range(len(chunks))]
 
-    # Parallelise across chunks using ThreadPoolExecutor (more reliable than
-    # joblib in PyInstaller frozen apps on both macOS and Windows — joblib can
-    # deadlock when worker threads encounter broken sys.stderr).
+    # Run localisation serially — tp.batch/tp.locate internally use numpy/scipy
+    # which can use all CPU cores per frame.  Parallelising at the chunk level
+    # causes massive thread oversubscription in frozen apps on Windows (where
+    # BLAS thread caps don't take effect before DLL load), making it ~10x slower.
     chunk_pairs = list(zip(chunks, offsets))
-    with ThreadPoolExecutor(max_workers=workers) as _exe:
-        _futs = [_exe.submit(_localise_chunk, chunk, diameter, minmass,
-                             percentile, offset)
-                 for chunk, offset in chunk_pairs]
-        chunk_results = [_f.result() for _f in
-                         _tqdm(_futs, total=n_chunks,
-                               desc="  Localising", unit="chunk", ncols=70)]
+    chunk_results = [_localise_chunk(chunk, diameter, minmass, percentile, offset)
+                     for chunk, offset in _tqdm(chunk_pairs, total=n_chunks,
+                                                desc="  Localising", unit="chunk",
+                                                ncols=70)]
 
     valid = [df for df in chunk_results if df is not None and len(df) > 0]
     result = pd.concat(valid, ignore_index=True) if valid else pd.DataFrame()
