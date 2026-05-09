@@ -89,6 +89,7 @@ from matplotlib.lines import Line2D
 
 import trackpy as tp
 from joblib import Parallel, delayed
+from concurrent.futures import ThreadPoolExecutor
 from scipy.ndimage import uniform_filter, gaussian_filter, gaussian_filter1d
 from scipy.interpolate import interp1d
 from scipy.optimize import curve_fit
@@ -658,9 +659,10 @@ def preprocess_stack(stack, bg_radius=50, bg_method="uniform_filter",
         processed = [fn(f, bg_radius) for f in
                      _tqdm(stack, desc="  Preprocessing", unit="fr", ncols=70)]
     else:
-        processed = Parallel(n_jobs=workers, prefer="threads")(
-            delayed(fn)(f, bg_radius)
-            for f in _tqdm(stack, desc="  Preprocessing", unit="fr", ncols=70))
+        with ThreadPoolExecutor(max_workers=workers) as _exe:
+            _futs = [_exe.submit(fn, f, bg_radius) for f in stack]
+            processed = [_f.result() for _f in
+                         _tqdm(_futs, desc="  Preprocessing", unit="fr", ncols=70)]
 
     elapsed = time.perf_counter() - t0
     print(f"  Done in {elapsed:.1f}s  ({elapsed/n*1000:.1f} ms/frame)")
@@ -1219,8 +1221,9 @@ def preprocess_and_localise_stream(stack, diameter=7, minmass=None, percentile=6
 
     # ── First chunk: preprocess now so we can auto-detect minmass ─────────────
     first_end  = min(chunk_size, n_frames)
-    first_pp   = np.stack(Parallel(n_jobs=workers_, prefer="threads")(
-        delayed(fn)(f, bg_radius) for f in stack[:first_end]))
+    with ThreadPoolExecutor(max_workers=workers_) as _exe:
+        first_pp = np.stack([_f.result() for _f in
+                             [_exe.submit(fn, f, bg_radius) for f in stack[:first_end]]])
 
     if minmass is None:
         minmass = float(np.percentile(first_pp[min(5, first_end - 1)], 99) * 0.4)
@@ -1235,7 +1238,7 @@ def preprocess_and_localise_stream(stack, diameter=7, minmass=None, percentile=6
 
     # Localise first chunk (already preprocessed)
     locs0 = tp.batch(first_pp, diameter=diameter, minmass=minmass,
-                     percentile=percentile, processes=1)
+                     percentile=percentile, processes=1, verbose=False)
     if len(locs0) > 0:
         all_locs.append(locs0)
 
@@ -1263,14 +1266,15 @@ def preprocess_and_localise_stream(stack, diameter=7, minmass=None, percentile=6
 
         start     = i * chunk_size
         end       = min(start + chunk_size, n_frames)
-        chunk_pp  = np.stack(Parallel(n_jobs=workers_, prefer="threads")(
-            delayed(fn)(f, bg_radius) for f in stack[start:end]))
+        with ThreadPoolExecutor(max_workers=workers_) as _exe:
+            chunk_pp = np.stack([_f.result() for _f in
+                                 [_exe.submit(fn, f, bg_radius) for f in stack[start:end]]])
 
         mean_acc   += chunk_pp.sum(axis=0)
         frame_count += len(chunk_pp)
 
         locs_i = tp.batch(chunk_pp, diameter=diameter, minmass=minmass,
-                          percentile=percentile, processes=1)
+                          percentile=percentile, processes=1, verbose=False)
 
         if len(locs_i) > 0:
             locs_i = locs_i.copy()
@@ -1310,10 +1314,10 @@ def preprocess_and_localise_stream(stack, diameter=7, minmass=None, percentile=6
 
 def _localise_chunk(chunk, diameter, minmass, percentile, frame_offset):
     """Localise one chunk and apply global frame offset. Always uses processes=1
-    so that parallelism is handled at the chunk level via joblib threads,
-    which avoids the macOS multiprocessing-fork crash."""
+    so that parallelism is handled at the chunk level via ThreadPoolExecutor,
+    which avoids the macOS multiprocessing-fork crash and joblib frozen-app hangs."""
     locs = tp.batch(chunk, diameter=diameter, minmass=minmass,
-                    percentile=percentile, processes=1)
+                    percentile=percentile, processes=1, verbose=False)
     if len(locs) > 0:
         locs = locs.copy()
         locs["frame"] += frame_offset
@@ -1336,19 +1340,17 @@ def localise_particles(stack, diameter=7, minmass=0.1, percentile=64,
     chunks  = np.array_split(stack, n_chunks)
     offsets = [i * chunk_size for i in range(len(chunks))]
 
-    # Parallelise across chunks using threads (safe on macOS — no fork).
-    # tp.batch internally uses NumPy/SciPy which release the GIL, so
-    # thread-level parallelism gives real speedup.
+    # Parallelise across chunks using ThreadPoolExecutor (more reliable than
+    # joblib in PyInstaller frozen apps on both macOS and Windows — joblib can
+    # deadlock when worker threads encounter broken sys.stderr).
     chunk_pairs = list(zip(chunks, offsets))
-    # Always parallel — preview_cb is intentionally unused here.
-    # The GUI sends a static post-localisation preview instead of per-chunk
-    # live frames, which allows full multi-core use without deadlocking the
-    # joblib thread pool inside a frozen Windows background thread.
-    chunk_results = Parallel(n_jobs=workers, prefer="threads")(
-        delayed(_localise_chunk)(chunk, diameter, minmass, percentile, offset)
-        for chunk, offset in _tqdm(
-            chunk_pairs, total=n_chunks,
-            desc="  Localising", unit="chunk", ncols=70))
+    with ThreadPoolExecutor(max_workers=workers) as _exe:
+        _futs = [_exe.submit(_localise_chunk, chunk, diameter, minmass,
+                             percentile, offset)
+                 for chunk, offset in chunk_pairs]
+        chunk_results = [_f.result() for _f in
+                         _tqdm(_futs, total=n_chunks,
+                               desc="  Localising", unit="chunk", ncols=70)]
 
     valid = [df for df in chunk_results if df is not None and len(df) > 0]
     result = pd.concat(valid, ignore_index=True) if valid else pd.DataFrame()
@@ -1368,7 +1370,8 @@ def link_trajectories(locs, search_range=5, memory=3, min_len=5, max_len=None):
           f"(search_range={search_range}px, memory={memory}) ...")
     t0 = time.perf_counter()
     try:
-        linked = tp.link(locs, search_range=search_range, memory=memory)
+        linked = tp.link(locs, search_range=search_range, memory=memory,
+                         verbose=False)
         print(f"  tp.link done — filtering stubs (min_len={min_len}) ...")
     except Exception as exc:
         if "SubnetOversizeException" in type(exc).__name__ or "Subnetwork" in str(exc):
@@ -1378,7 +1381,7 @@ def link_trajectories(locs, search_range=5, memory=3, min_len=5, max_len=None):
             print(f"  WARNING: SubnetOversizeException — switching to "
                   f"nonrecursive linker (consider reducing Search range)")
             linked = tp.link(locs, search_range=search_range, memory=memory,
-                             link_strategy="nonrecursive")
+                             link_strategy="nonrecursive", verbose=False)
         else:
             raise
     filtered = tp.filter_stubs(linked, min_len)
@@ -1468,12 +1471,15 @@ def compute_msd_and_fit(tracks, pixel_size, frame_interval,
     print(f"  Workers           : {workers} / {N_CPUS} CPU cores")
     t0 = time.perf_counter()
 
-    results = Parallel(n_jobs=workers, prefer="threads")(
-        delayed(_msd_and_fit_one)(
-            grouped.get_group(pid)[["x", "y"]].values * pixel_size,
-            grouped.get_group(pid)["frame"].values,
-            pid, lag_times, max_lagtime, n_fit)
-        for pid in _tqdm(pid_list, desc="  MSD + fitting", unit="track", ncols=70))
+    with ThreadPoolExecutor(max_workers=workers) as _exe:
+        _futs = [_exe.submit(
+                    _msd_and_fit_one,
+                    grouped.get_group(pid)[["x", "y"]].values * pixel_size,
+                    grouped.get_group(pid)["frame"].values,
+                    pid, lag_times, max_lagtime, n_fit)
+                 for pid in pid_list]
+        results = [_f.result() for _f in
+                   _tqdm(_futs, desc="  MSD + fitting", unit="track", ncols=70)]
 
     elapsed = time.perf_counter() - t0
     rate    = n_tracks / elapsed

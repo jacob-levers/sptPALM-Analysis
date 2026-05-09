@@ -194,6 +194,16 @@ def _bootstrap():
 if not getattr(sys, "frozen", False):
     _bootstrap()
 
+# ── Frozen-app stderr guard ────────────────────────────────────────────────────
+# PyInstaller console=False builds set sys.stderr to None on Windows (and may
+# leave it broken on macOS).  Third-party libraries (tqdm, trackpy, joblib)
+# all try to write to sys.stderr, which raises AttributeError and can cause
+# background worker threads to deadlock.  Replace None with a no-op sink so
+# every write silently succeeds.
+if sys.stderr is None:
+    import io as _io
+    sys.stderr = _io.StringIO()
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  All required packages are present — continue with normal startup
 # ══════════════════════════════════════════════════════════════════════════════
