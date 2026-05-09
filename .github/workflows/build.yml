@@ -85,9 +85,80 @@ jobs:
           pip install pyinstaller
 
       - name: Build exe bundle
-        # The spec file handles Tcl/Tk bundling directly via tkinter query +
-        # glob fallback, so no post-build copy step is needed.
         run: pyinstaller sptpalm.spec --noconfirm --clean
+
+      - name: Bundle Tcl/Tk data (fallback)
+        shell: pwsh
+        run: |
+          # The spec file tries to bundle _tcl_data/_tk_data at build time.
+          # This step is a hard fallback: if they are still missing after the
+          # build (spec discovery failed), find and copy them now.
+          $internal = "dist\sptPALM\_internal"
+
+          # Use _tkinter constants for exact version — no Tk window needed
+          $tclVer = python -c "import _tkinter; print(_tkinter.TCL_VERSION)"
+          $tkVer  = python -c "import _tkinter; print(_tkinter.TK_VERSION)"
+          Write-Host "TCL version: $tclVer  |  TK version: $tkVer"
+
+          # Try multiple candidate locations for each
+          function Find-TclDir($ver, $prefix) {
+            $candidates = @(
+              (Join-Path $prefix "tcl\tcl$ver"),
+              (Join-Path $prefix "tcl$ver"),
+              (Join-Path $prefix "lib\tcl$ver")
+            )
+            foreach ($c in $candidates) {
+              if (Test-Path $c -PathType Container) { return $c }
+            }
+            # Broad glob fallback
+            $hits = Get-ChildItem (Join-Path $prefix "tcl") -Directory -Filter "tcl$($ver[0])*" -ErrorAction SilentlyContinue | Sort-Object Name
+            if ($hits) { return $hits[-1].FullName }
+            return $null
+          }
+          function Find-TkDir($ver, $prefix) {
+            $candidates = @(
+              (Join-Path $prefix "tcl\tk$ver"),
+              (Join-Path $prefix "tk$ver"),
+              (Join-Path $prefix "lib\tk$ver")
+            )
+            foreach ($c in $candidates) {
+              if (Test-Path $c -PathType Container) { return $c }
+            }
+            $hits = Get-ChildItem (Join-Path $prefix "tcl") -Directory -Filter "tk$($ver[0])*" -ErrorAction SilentlyContinue | Sort-Object Name
+            if ($hits) { return $hits[-1].FullName }
+            return $null
+          }
+
+          $prefix = python -c "import sys; print(sys.prefix)"
+          Write-Host "sys.prefix: $prefix"
+
+          $tclSrc = Find-TclDir $tclVer $prefix
+          $tkSrc  = Find-TkDir  $tkVer  $prefix
+          Write-Host "TCL src: $tclSrc"
+          Write-Host "TK  src: $tkSrc"
+
+          $tclDest = Join-Path $internal "_tcl_data"
+          $tkDest  = Join-Path $internal "_tk_data"
+
+          if (-not (Test-Path $tclDest)) {
+            if ($tclSrc -and (Test-Path $tclSrc)) {
+              Copy-Item $tclSrc $tclDest -Recurse -Force
+              Write-Host "Fallback: copied _tcl_data from $tclSrc"
+            } else {
+              Write-Error "FATAL: cannot find Tcl $tclVer data directory"
+              exit 1
+            }
+          } else { Write-Host "_tcl_data already present (from spec)" }
+
+          if (-not (Test-Path $tkDest)) {
+            if ($tkSrc -and (Test-Path $tkSrc)) {
+              Copy-Item $tkSrc $tkDest -Recurse -Force
+              Write-Host "Fallback: copied _tk_data from $tkSrc"
+            } else {
+              Write-Error "FATAL: cannot find Tk $tkVer data directory"
+              exit 1
+            }
+          } else { Write-Host "_tk_data already present (from spec)" }
 
       - name: Bundle VC++ runtime DLLs
         shell: pwsh
