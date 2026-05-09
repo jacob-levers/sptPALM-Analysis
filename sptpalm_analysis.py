@@ -67,17 +67,15 @@ import warnings
 import xml.etree.ElementTree as ET
 warnings.filterwarnings("ignore")
 
-# ── Prevent BLAS/OpenBLAS/MKL thread oversubscription ─────────────────────────
-# Scientific libraries (numpy, scipy, skimage) each spin up their own internal
-# threads (via OpenBLAS or MKL).  When joblib ALSO spawns N_CPUS Python threads
-# each calling numpy, you end up with N_CPUS² threads fighting for N_CPUS cores
-# — performance collapses, especially on Windows.  Setting these to "1" caps
-# internal BLAS parallelism so joblib's threads are the ones that scale linearly.
-# This must be done *before* numpy is imported to take full effect.
-for _blas_env in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
-                  "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS",
-                  "VECLIB_MAXIMUM_THREADS"):
-    os.environ.setdefault(_blas_env, "1")
+# ── BLAS / OpenBLAS / MKL threading policy ─────────────────────────────────────
+# We deliberately do NOT cap BLAS threads here.  numpy/scipy/skimage internally
+# parallelise heavy ops (gaussian_filter, uniform_filter, FFT) across all cores
+# via OpenBLAS or MKL — that is exactly the multi-core utilisation we want.
+#
+# The cap was previously needed when joblib was spawning N Python threads each
+# calling numpy (= N² threads on N cores → catastrophic oversubscription).
+# Now that localisation runs chunks serially in the main worker thread, only
+# numpy's internal pool exists, so no oversubscription is possible.
 
 import numpy as np
 import pandas as pd
@@ -1313,20 +1311,15 @@ def preprocess_and_localise_stream(stack, diameter=7, minmass=None, percentile=6
 
 
 def _localise_chunk(chunk, diameter, minmass, percentile, frame_offset):
-    """Localise one chunk and apply global frame offset.  Uses processes=1
-    inside tp.batch — chunk-level parallelism is handled by the caller via
-    multiprocessing.Pool (true multi-core, no GIL contention)."""
+    """Localise one chunk and apply global frame offset.  tp.batch's internal
+    numpy/scipy operations use ALL CPU cores per frame via OpenBLAS/MKL — no
+    explicit pool needed."""
     locs = tp.batch(chunk, diameter=diameter, minmass=minmass,
                     percentile=percentile, processes=1)
     if len(locs) > 0:
         locs = locs.copy()
         locs["frame"] += frame_offset
     return locs
-
-
-def _localise_chunk_args(args):
-    """Picklable wrapper for multiprocessing.Pool.imap()."""
-    return _localise_chunk(*args)
 
 
 def localise_particles(stack, diameter=7, minmass=0.1, percentile=64,
@@ -1339,47 +1332,21 @@ def localise_particles(stack, diameter=7, minmass=0.1, percentile=64,
     workers  = max(1, min(workers, N_CPUS))
 
     print(f"  Diameter  : {diameter}px  |  minmass: {minmass:.4f}")
-    print(f"  Chunks    : {n_chunks} x ~{chunk_size} frames  |  Workers: {workers}")
+    print(f"  Chunks    : {n_chunks} x ~{chunk_size} frames")
 
     t0       = time.perf_counter()
     chunks   = np.array_split(stack, n_chunks)
     offsets  = [i * chunk_size for i in range(len(chunks))]
-    args_list = [(c, diameter, minmass, percentile, o)
-                 for c, o in zip(chunks, offsets)]
+    chunk_pairs = list(zip(chunks, offsets))
 
-    # ── Parallelism strategy ──────────────────────────────────────────────────
-    # Use multiprocessing.Pool (spawn) for chunk-level parallelism.  Each worker
-    # is a separate process with its own GIL and BLAS thread = 1 (cap set at
-    # module import), so N workers truly use N CPU cores.  Threading approaches
-    # (joblib, ThreadPoolExecutor) deadlock or oversubscribe in frozen apps.
-    #
-    # Spawn startup cost (~5s/worker on Windows) only pays off with enough work.
-    # Below the threshold, run serially (avoids paying startup for small jobs).
-    use_mp = (workers > 1 and n_chunks > 1 and n_frames >= 2000)
-
-    chunk_results = []
-    if use_mp:
-        try:
-            ctx = multiprocessing.get_context("spawn")
-            actual_workers = min(workers, n_chunks)
-            print(f"  Parallelism: multiprocessing.Pool × {actual_workers} (spawn)")
-            with ctx.Pool(processes=actual_workers) as pool:
-                for r in _tqdm(
-                        pool.imap(_localise_chunk_args, args_list, chunksize=1),
-                        total=n_chunks, desc="  Localising", unit="chunk",
-                        ncols=70):
-                    chunk_results.append(r)
-        except Exception as exc:
-            print(f"  Multiprocessing failed ({type(exc).__name__}: {exc}); "
-                  f"falling back to serial")
-            chunk_results = []
-            use_mp = False
-
-    if not use_mp:
-        chunk_results = [_localise_chunk_args(a)
-                         for a in _tqdm(args_list, total=n_chunks,
-                                        desc="  Localising", unit="chunk",
-                                        ncols=70)]
+    # Run chunks serially in the calling thread.  Per-frame numpy/scipy ops
+    # (gaussian_filter, FFT, etc.) parallelise internally across all CPU cores
+    # via the BLAS pool — true multi-core utilisation without the spawn-worker
+    # startup hangs that plague PyInstaller frozen apps.
+    chunk_results = [_localise_chunk(chunk, diameter, minmass, percentile, offset)
+                     for chunk, offset in _tqdm(chunk_pairs, total=n_chunks,
+                                                desc="  Localising", unit="chunk",
+                                                ncols=70)]
 
     valid = [df for df in chunk_results if df is not None and len(df) > 0]
     result = pd.concat(valid, ignore_index=True) if valid else pd.DataFrame()
