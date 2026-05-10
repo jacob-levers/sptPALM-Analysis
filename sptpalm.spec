@@ -18,6 +18,11 @@ import sys
 
 # ── Hidden imports ─────────────────────────────────────────────────────────────
 hidden = []
+# numpy 2.x renamed numpy.core → numpy._core; some submodules (e.g.
+# numpy._core._exceptions) are loaded lazily and missed by static analysis.
+# collect_submodules ensures every numpy submodule is included.
+hidden += collect_submodules("numpy")
+hidden += collect_submodules("pandas")
 hidden += collect_submodules("trackpy")
 hidden += collect_submodules("scipy")
 hidden += collect_submodules("skimage")
