@@ -1049,23 +1049,46 @@ def correct_drift(locs, n_seg_frames=200, upsampling=4, smooth_sigma=1.5):
     print(f"  Localisations/segment: min {min(seg_counts):,}, "
           f"max {max(seg_counts):,}")
 
-    # ── Cross-correlate consecutive density maps ───────────────────────────────
-    dx_steps = [0.0]
-    dy_steps = [0.0]
-    for i in range(1, n_segments):
-        if seg_counts[i - 1] < 5 or seg_counts[i] < 5:
-            dx_steps.append(0.0); dy_steps.append(0.0)
-            continue
-        corr = _correlate2d(density_maps[i - 1], density_maps[i],
-                            mode="full", method="fft")
-        peak = np.unravel_index(np.argmax(corr), corr.shape)
-        # peak position relative to centre gives the shift of segment i vs i-1
-        dy_steps.append(float(peak[0] - (H - 1)))
-        dx_steps.append(float(peak[1] - (W - 1)))
+    # ── Cross-correlate ALL pairs (i, j) → solve cumulative drift ─────────────
+    # This is the redundant cross-correlation (RCC) algorithm of Wang et al.
+    # 2014 (Nat. Methods).  Instead of relying only on consecutive pairs, we
+    # measure the inter-segment shift Δ_{ij} for every pair (i, j) with i<j
+    # and then solve the over-determined linear system
+    #
+    #     drift[j] − drift[i] = Δ_{ij}      for all valid pairs
+    #
+    # by least-squares.  Drift[0] is fixed at zero (gauge fixing).  The
+    # redundancy averages out cross-correlation noise far better than the
+    # consecutive-only chain, and is robust to any single bad pair (e.g. a
+    # segment with too few localisations).
+    A_rows_x, A_rows_y = [], []
+    b_x, b_y = [], []
+    for i in range(n_segments):
+        for j in range(i + 1, n_segments):
+            if seg_counts[i] < 5 or seg_counts[j] < 5:
+                continue
+            corr = _correlate2d(density_maps[i], density_maps[j],
+                                mode="full", method="fft")
+            peak = np.unravel_index(np.argmax(corr), corr.shape)
+            dy_pair = float(peak[0] - (H - 1))
+            dx_pair = float(peak[1] - (W - 1))
+            row = np.zeros(n_segments)
+            row[i], row[j] = -1.0, 1.0    # drift[j] - drift[i] = Δ_{ij}
+            A_rows_x.append(row); b_x.append(dx_pair)
+            A_rows_y.append(row); b_y.append(dy_pair)
 
-    # ── Integrate → cumulative drift in density-map pixels ────────────────────
-    dx_cum = np.cumsum(dx_steps)
-    dy_cum = np.cumsum(dy_steps)
+    if not A_rows_x:
+        # Fallback: zero drift
+        dx_cum = np.zeros(n_segments)
+        dy_cum = np.zeros(n_segments)
+    else:
+        # Add gauge-fixing row: drift[0] = 0 (heavy weight)
+        gauge = np.zeros(n_segments); gauge[0] = 1.0
+        A = np.vstack(A_rows_x + [gauge * 1e3])
+        bx = np.append(np.array(b_x), 0.0)
+        by = np.append(np.array(b_y), 0.0)
+        dx_cum, *_ = np.linalg.lstsq(A, bx, rcond=None)
+        dy_cum, *_ = np.linalg.lstsq(A, by, rcond=None)
 
     # Smooth then convert to localization pixels
     dx_sm = gaussian_filter1d(dx_cum, sigma=smooth_sigma) / upsampling
@@ -1444,14 +1467,31 @@ def msd_linear(t, D, offset):
     return 4 * D * t + offset
 
 
-def classify_motion(alpha):
-    if   alpha < 0.5: return "Immobile"
-    elif alpha < 0.9: return "Confined"
-    elif alpha < 1.1: return "Brownian"
-    else:             return "Directed"
+# Default alpha-exponent thresholds for the four-class motion classifier.
+# Conventional sptPALM values: 0.5 / 0.9 / 1.1.  These are now the *defaults*
+# but every public function that classifies motion accepts a thresholds=
+# triple so users can tune the boundaries to their lab's convention.
+ALPHA_THRESHOLDS_DEFAULT = (0.5, 0.9, 1.1)
 
 
-def _msd_and_fit_one(xy_um, frames, pid, lag_times, max_lagtime, n_fit):
+def classify_motion(alpha, thresholds=ALPHA_THRESHOLDS_DEFAULT):
+    """Classify a track by its anomalous exponent α.
+
+    thresholds = (t_immobile, t_confined, t_directed):
+        α  <  t_immobile   → "Immobile"
+        t_immobile  ≤ α  <  t_confined → "Confined"
+        t_confined  ≤ α  <  t_directed → "Brownian"
+        α  ≥  t_directed   → "Directed"
+    """
+    t_imm, t_conf, t_dir = thresholds
+    if   alpha < t_imm:  return "Immobile"
+    elif alpha < t_conf: return "Confined"
+    elif alpha < t_dir:  return "Brownian"
+    else:                return "Directed"
+
+
+def _msd_and_fit_one(xy_um, frames, pid, lag_times, max_lagtime, n_fit,
+                     alpha_thresholds=ALPHA_THRESHOLDS_DEFAULT):
     """
     Compute per-track MSD array AND fit D + alpha in a single pass.
 
@@ -1485,18 +1525,27 @@ def _msd_and_fit_one(xy_um, frames, pid, lag_times, max_lagtime, n_fit):
             D = popt[0]
         except: pass
 
-    motion = classify_motion(alpha) if np.isfinite(alpha) else "Unknown"
+    motion = classify_motion(alpha, alpha_thresholds) if np.isfinite(alpha) else "Unknown"
 
-    # Confinement radius: mean distance of all positions from the track centroid
-    centroid       = xy_um.mean(axis=0)
-    conf_radius_um = float(np.mean(np.sqrt(np.sum((xy_um - centroid) ** 2, axis=1))))
+    # Two distinct radial-spread metrics, both useful and named explicitly:
+    #   mean_radial_displacement_um  = ⟨|r − r̄|⟩       (1st moment)
+    #   radius_of_gyration_um        = √⟨|r − r̄|²⟩    (RMS, the standard Rg)
+    # `confinement_radius_um` is kept as an alias for the first quantity so
+    # legacy CSVs and downstream code keep working.
+    centroid    = xy_um.mean(axis=0)
+    sq_dists    = np.sum((xy_um - centroid) ** 2, axis=1)
+    mean_radial = float(np.mean(np.sqrt(sq_dists)))
+    rg          = float(np.sqrt(np.mean(sq_dists)))
 
     return pid, msd_vals, dict(particle=pid, D=D, alpha=alpha, motion=motion,
-                               confinement_radius_um=conf_radius_um)
+                               confinement_radius_um=mean_radial,
+                               mean_radial_displacement_um=mean_radial,
+                               radius_of_gyration_um=rg)
 
 
 def compute_msd_and_fit(tracks, pixel_size, frame_interval,
-                        max_lagtime=20, n_fit=5, workers=N_CPUS):
+                        max_lagtime=20, n_fit=5, workers=N_CPUS,
+                        alpha_thresholds=ALPHA_THRESHOLDS_DEFAULT):
     """
     Single parallel pass that computes both MSD and diffusion fits.
     Replaces tp.imsd + tp.emsd + separate fit loop — all in one go.
@@ -1515,7 +1564,7 @@ def compute_msd_and_fit(tracks, pixel_size, frame_interval,
                     _msd_and_fit_one,
                     grouped.get_group(pid)[["x", "y"]].values * pixel_size,
                     grouped.get_group(pid)["frame"].values,
-                    pid, lag_times, max_lagtime, n_fit)
+                    pid, lag_times, max_lagtime, n_fit, alpha_thresholds)
                  for pid in pid_list]
         results = [_f.result() for _f in
                    _tqdm(_futs, desc="  MSD + fitting", unit="track", ncols=70)]
@@ -1697,19 +1746,25 @@ def compute_turning_angles(tracks):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compute_mobile_fraction_over_time(tracks, diff_df, frame_interval,
-                                       window_frames=100):
-    """
-    Compute mobile fraction in sliding windows of `window_frames` frames.
+                                       window_frames=100,
+                                       d_threshold=MOBILE_D_THRESHOLD_DEFAULT):
+    """Compute mobile fraction in sliding windows of `window_frames` frames.
+
+    Mobile = tracks with D ≥ d_threshold (consistent with _mob_immob_ratio
+    and the LogD-distribution panel's threshold line).  Tracks with
+    non-finite D are excluded from the window denominator.
 
     Returns DataFrame with columns: time_s, mobile_fraction, n_tracks.
-    Only windows with ≥5 tracks are included.
+    Only windows with ≥5 valid tracks are included.
     """
     if len(tracks) == 0 or len(diff_df) == 0:
         return pd.DataFrame(columns=["time_s", "mobile_fraction", "n_tracks"])
 
     track_times = tracks.groupby("particle")["frame"].mean().reset_index()
     track_times.columns = ["particle", "mean_frame"]
-    merged = track_times.merge(diff_df[["particle", "motion"]], on="particle", how="inner")
+    merged = track_times.merge(diff_df[["particle", "D"]], on="particle", how="inner")
+    # Drop tracks where D could not be fit
+    merged = merged[np.isfinite(merged["D"]) & (merged["D"] > 0)]
 
     max_frame = int(tracks["frame"].max())
     windows   = range(0, max_frame, window_frames)
@@ -1720,7 +1775,7 @@ def compute_mobile_fraction_over_time(tracks, diff_df, frame_interval,
         total = len(sel)
         if total < 5:
             continue
-        mobile = sel["motion"].isin(["Free diffusion", "Directed", "Brownian"]).sum()
+        mobile = int((sel["D"] >= d_threshold).sum())
         rows.append({
             "time_s":          (w + window_frames / 2) * frame_interval,
             "mobile_fraction": mobile / total,
@@ -1772,18 +1827,44 @@ def compute_clusters(locs, pixel_size_um, eps_um=0.05, min_samples=5,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compute_dwell_times(tracks, diff_df, frame_interval):
+    """Per-track dwell times for confined / immobile tracks.
+
+    Returns a DataFrame with three durations per track:
+
+      dwell_time_total_s     (last_frame − first_frame + 1) × Δt   ← canonical
+      dwell_time_observed_s  n_observations × Δt                   ← fewer if gaps
+      dwell_time_s           alias for dwell_time_total_s          ← back-compat
+
+    The exponential τ is fit to dwell_time_total_s (residence-time semantics).
+    """
     confined_pids = diff_df[diff_df["motion"].isin(["Confined", "Immobile"])]["particle"]
     print(f"  Dwell times       : {len(confined_pids):,} confined/immobile tracks")
     rows = []
+    # Group once by particle for speed
+    grouped = tracks.groupby("particle")["frame"]
     for pid in confined_pids:
-        n = len(tracks[tracks["particle"] == pid])
-        if n > 0:
-            rows.append({"particle": int(pid), "dwell_time_s": n * frame_interval})
+        if pid not in grouped.groups:
+            continue
+        frames = grouped.get_group(pid).values
+        n_obs = len(frames)
+        if n_obs == 0:
+            continue
+        f_min = int(frames.min())
+        f_max = int(frames.max())
+        dur_total = (f_max - f_min + 1) * frame_interval
+        dur_obs   = n_obs * frame_interval
+        rows.append({
+            "particle":              int(pid),
+            "dwell_time_s":          dur_total,   # back-compat alias
+            "dwell_time_total_s":    dur_total,   # full duration including gaps
+            "dwell_time_observed_s": dur_obs,     # observed frames × Δt
+            "n_observations":        int(n_obs),
+        })
     dwell_df = pd.DataFrame(rows)
     tau = np.nan
     if len(dwell_df) >= 10:
         try:
-            dt = np.sort(dwell_df["dwell_time_s"].values)
+            dt = np.sort(dwell_df["dwell_time_total_s"].values)
             cdf = np.arange(1, len(dt) + 1) / len(dt)
             popt, _ = curve_fit(lambda t, tau: 1 - np.exp(-t / tau),
                                 dt, cdf, p0=[dt.mean()], bounds=(1e-6, np.inf),
@@ -2605,12 +2686,29 @@ def _msd_auc(emsd_df, frame_interval):
     return float(_trap(y[order], t[order]))
 
 
-def _mob_immob_ratio(diff_df):
-    """Mobile / Immobile ratio from motion_class column."""
-    if diff_df is None or "motion" not in diff_df.columns:
+# Default D cutoff for splitting Mobile / Immobile populations (µm²/s).
+# 0.05 is the conventional membrane-protein threshold used throughout the
+# sptPALM literature; tracks with D ≥ this value are considered Mobile.
+MOBILE_D_THRESHOLD_DEFAULT = 0.05
+
+
+def _mob_immob_ratio(diff_df, d_threshold=MOBILE_D_THRESHOLD_DEFAULT):
+    """Mobile / Immobile ratio defined by a diffusion-coefficient threshold.
+
+    Tracks with D ≥ d_threshold count as Mobile; D < d_threshold count as
+    Immobile.  Tracks with non-finite D (alpha fit failed) are excluded
+    from BOTH numerator and denominator — they contribute neither mobility
+    state, which avoids inflating either count.
+    """
+    if diff_df is None or "D" not in diff_df.columns:
         return np.nan
-    n_imm = (diff_df["motion"] == "Immobile").sum()
-    n_mob = (diff_df["motion"] != "Immobile").sum()
+    d = diff_df["D"].values
+    valid = np.isfinite(d) & (d > 0)
+    if valid.sum() == 0:
+        return np.nan
+    d = d[valid]
+    n_mob = int((d >= d_threshold).sum())
+    n_imm = int((d <  d_threshold).sum())
     return float(n_mob / n_imm) if n_imm > 0 else np.nan
 
 
@@ -2875,6 +2973,7 @@ def compare_groups(groups=None,
                    output_dir=None, output_stem="comparison",
                    panels=None, theme="Dark",
                    pdf_report=True,
+                   mobile_d_threshold=MOBILE_D_THRESHOLD_DEFAULT,
                    progress_cb=None,
                    # ─ Legacy 2-group signature (backward compat) ─
                    folders_a=None, folders_b=None,
@@ -2971,7 +3070,7 @@ def compare_groups(groups=None,
             "stem":             summary["stem"],
             "n_tracks":         len(d) if d is not None else 0,
             "auc_msd":          _msd_auc(summary["ensemble_msd"], fi),
-            "mob_immob_ratio":  _mob_immob_ratio(d),
+            "mob_immob_ratio":  _mob_immob_ratio(d, mobile_d_threshold),
             "median_D":         float(d["D"].median()) if d is not None and "D" in d.columns else np.nan,
             "median_alpha":     float(d["alpha"].median()) if d is not None and "alpha" in d.columns else np.nan,
             "mean_track_length_s": float(_track_lengths(summary["tracks"], fi).mean())
@@ -3086,7 +3185,8 @@ def compare_groups(groups=None,
             centers = 0.5 * (edges[:-1] + edges[1:])
             frac = counts / counts.sum() if counts.sum() else counts
             ax.plot(centers, frac, "-o", color=color, label=grp_label, ms=4, lw=1.2)
-        ax.axvline(np.log10(0.05), color=pal["GRD"], ls="--", lw=0.8)
+        ax.axvline(np.log10(mobile_d_threshold), color=pal["GRD"], ls="--", lw=0.8,
+                   label=f"D = {mobile_d_threshold} µm²/s")
         ax.set_xlabel("log₁₀ D  (µm²/s)")
         ax.set_ylabel("Relative frequency")
         ax.set_title("LogD Frequency Distribution")
@@ -3302,20 +3402,41 @@ def compare_groups(groups=None,
     fig.tight_layout(rect=[0, 0, 1, 0.96])
 
     # ── Build statistics dataframe (per metric × pairwise) ────────────────────
+    # Bonferroni correction across pairwise comparisons WITHIN each metric:
+    # multiplies the raw p-value by the number of pairs (capped at 1.0).
+    # The omnibus row gets the raw p-value only — it's a single test.
     stats_rows = []
     for metric, rec in stats_records.items():
         omn = rec.get("omnibus")
         if omn:
+            stars = omn["stars"]
+            stars_bonf = stars  # omnibus needs no correction
             stats_rows.append({
                 "metric": metric, "comparison": "omnibus",
-                "test": omn["test"], "p_value": omn["p"], "stars": omn["stars"],
+                "test": omn["test"],
+                "p_value": omn["p"], "stars": stars,
+                "p_value_bonferroni": omn["p"], "stars_bonferroni": stars_bonf,
                 "n_a": "", "n_b": "", "mean_a": "", "mean_b": "",
                 "sem_a": "", "sem_b": "", "label_a": "all groups", "label_b": "",
             })
-        for pw in rec.get("pairwise", []):
+        pairs = rec.get("pairwise", [])
+        n_pairs = max(1, len(pairs))
+        for pw in pairs:
+            p = pw["p"]
+            if np.isfinite(p):
+                p_bonf = min(1.0, p * n_pairs)
+                if   p_bonf < 0.001: stars_bonf = "***"
+                elif p_bonf < 0.01:  stars_bonf = "**"
+                elif p_bonf < 0.05:  stars_bonf = "*"
+                else:                stars_bonf = "ns"
+            else:
+                p_bonf = np.nan
+                stars_bonf = ""
             stats_rows.append({
                 "metric": metric, "comparison": f"{pw['label_i']} vs {pw['label_j']}",
-                "test": pw["test"], "p_value": pw["p"], "stars": pw["stars"],
+                "test": pw["test"],
+                "p_value": pw["p"], "stars": pw["stars"],
+                "p_value_bonferroni": p_bonf, "stars_bonferroni": stars_bonf,
                 "n_a": pw["n_i"], "n_b": pw["n_j"],
                 "mean_a": pw["mean_i"], "mean_b": pw["mean_j"],
                 "sem_a": pw["sem_i"], "sem_b": pw["sem_j"],

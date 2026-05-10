@@ -1136,6 +1136,19 @@ class SPTPalmApp(_APP_BASE):
         self.v_max_lagtime = tk.IntVar(value=20)
         self.v_n_fit       = tk.IntVar(value=5)
 
+        # Motion-class α boundaries (configurable by the user; defaults match
+        # conventional sptPALM cut-offs).  α < α_imm → Immobile;
+        # α_imm ≤ α < α_conf → Confined;  α_conf ≤ α < α_dir → Brownian;
+        # α ≥ α_dir → Directed.
+        self.v_alpha_immobile = tk.DoubleVar(value=0.5)
+        self.v_alpha_confined = tk.DoubleVar(value=0.9)
+        self.v_alpha_directed = tk.DoubleVar(value=1.1)
+
+        # Mobile / Immobile threshold on D (µm²/s) — used by the mob/immob
+        # ratio bar and the LogD-distribution threshold line.  Default 0.05
+        # is the conventional membrane-protein cutoff.
+        self.v_mobile_d_threshold = tk.DoubleVar(value=0.05)
+
         # ROI — auto-threshold with Li algorithm by default (best for neurites)
         self.v_roi_mode        = tk.StringVar(value="Auto threshold")
         self.v_roi_auto_method = tk.StringVar(value="Li")
@@ -1744,6 +1757,37 @@ class SPTPalmApp(_APP_BASE):
                       "optimal."
                   ))
 
+        self._row(f, "α immobile cut-off",
+                  lambda P: self._spin_flt(P, self.v_alpha_immobile, 0.0, 1.0, 0.05),
+                  info=(
+                      "Anomalous exponent α below this value classifies a track as "
+                      "Immobile.\n\n"
+                      "Convention: 0.5 (sptPALM default).  Some labs use 0.4–0.6.\n\n"
+                      "Tracks with α between this value and the next threshold are "
+                      "classified as Confined."
+                  ))
+        self._row(f, "α confined cut-off",
+                  lambda P: self._spin_flt(P, self.v_alpha_confined, 0.5, 1.5, 0.05),
+                  info=(
+                      "α below this value (and above the immobile cut-off) is "
+                      "Confined; α between this and the directed cut-off is "
+                      "Brownian.\n\nConvention: 0.9."
+                  ))
+        self._row(f, "α directed cut-off",
+                  lambda P: self._spin_flt(P, self.v_alpha_directed, 0.9, 2.0, 0.05),
+                  info=(
+                      "α at or above this value classifies a track as Directed "
+                      "(superdiffusive / motor-driven).\n\nConvention: 1.1."
+                  ))
+        self._row(f, "Mobile D threshold (µm²/s)",
+                  lambda P: self._spin_flt(P, self.v_mobile_d_threshold, 1e-4, 5.0, 0.01),
+                  info=(
+                      "Diffusion coefficient cut-off used by the Mobile/Immobile "
+                      "ratio panel and the LogD-distribution threshold line.\n\n"
+                      "Tracks with D ≥ this value are Mobile; D < this value are "
+                      "Immobile.  Convention for membrane proteins: 0.05 µm²/s."
+                  ))
+
         self._row(f, "JDD populations",
                   lambda P: self._combo(P, self.v_jdd_components,
                                         [1, 2, 3]),
@@ -2020,6 +2064,10 @@ class SPTPalmApp(_APP_BASE):
             "max_track_len":   self.v_max_track_len.get(),
             "max_lagtime":     self.v_max_lagtime.get(),
             "n_fit":           self.v_n_fit.get(),
+            "alpha_immobile":  self.v_alpha_immobile.get(),
+            "alpha_confined":  self.v_alpha_confined.get(),
+            "alpha_directed":  self.v_alpha_directed.get(),
+            "mobile_d_threshold": self.v_mobile_d_threshold.get(),
             "jdd_components":  self.v_jdd_components.get(),
             "filter_d_enabled": self.v_filter_d_enabled.get(),
             "filter_d_min":    self.v_filter_d_min.get(),
@@ -2063,6 +2111,10 @@ class SPTPalmApp(_APP_BASE):
         _s(self.v_max_track_len,  "max_track_len")
         _s(self.v_max_lagtime,    "max_lagtime")
         _s(self.v_n_fit,          "n_fit")
+        _s(self.v_alpha_immobile, "alpha_immobile")
+        _s(self.v_alpha_confined, "alpha_confined")
+        _s(self.v_alpha_directed, "alpha_directed")
+        _s(self.v_mobile_d_threshold, "mobile_d_threshold")
         _s(self.v_jdd_components,   "jdd_components")
         _s(self.v_filter_d_enabled, "filter_d_enabled")
         _s(self.v_filter_d_min,     "filter_d_min")
@@ -3023,6 +3075,9 @@ class SPTPalmApp(_APP_BASE):
                         output_dir=outdir, output_stem=stem,
                         panels=panels_chosen, theme=st_theme.get(),
                         pdf_report=st_pdf.get(),
+                        mobile_d_threshold=(
+                            self.v_mobile_d_threshold.get()
+                            if hasattr(self, "v_mobile_d_threshold") else 0.05),
                         progress_cb=_progress)
 
                     self.after(0, lambda: _log(
@@ -3233,7 +3288,10 @@ class SPTPalmApp(_APP_BASE):
                         tracks, px, fi,
                         max_lagtime=self.v_max_lagtime.get(),
                         n_fit=self.v_n_fit.get(),
-                        workers=workers)
+                        workers=workers,
+                        alpha_thresholds=(self.v_alpha_immobile.get(),
+                                          self.v_alpha_confined.get(),
+                                          self.v_alpha_directed.get()))
 
                     if self.v_filter_d_enabled.get():
                         d_min, d_max = self.v_filter_d_min.get(), self.v_filter_d_max.get()
@@ -3249,7 +3307,8 @@ class SPTPalmApp(_APP_BASE):
                     b_mf = compute_mobile_fraction_over_time(
                         tracks, diff_df, fi,
                         window_frames=max(50, int(0.1 * tracks["frame"].max()))
-                        if len(tracks) else 100)
+                        if len(tracks) else 100,
+                        d_threshold=self.v_mobile_d_threshold.get())
 
                     b_cluster_labels, b_cluster_stats_df, b_n_clusters, b_cluster_xy = compute_clusters(
                         locs, px,
@@ -3950,7 +4009,10 @@ class SPTPalmApp(_APP_BASE):
                 tracks, px, fi,
                 max_lagtime=self.v_max_lagtime.get(),
                 n_fit=self.v_n_fit.get(),
-                workers=workers)
+                workers=workers,
+                alpha_thresholds=(self.v_alpha_immobile.get(),
+                                  self.v_alpha_confined.get(),
+                                  self.v_alpha_directed.get()))
 
             # Preview: ensemble MSD curve
             try:
@@ -4015,7 +4077,8 @@ class SPTPalmApp(_APP_BASE):
             turning_angles = compute_turning_angles(tracks)
             mobile_frac_df = compute_mobile_fraction_over_time(
                 tracks, diff_df, fi,
-                window_frames=max(50, int(0.1 * tracks["frame"].max())) if len(tracks) else 100)
+                window_frames=max(50, int(0.1 * tracks["frame"].max())) if len(tracks) else 100,
+                d_threshold=self.v_mobile_d_threshold.get())
 
             _emit_progress("Cluster analysis…", 88)
             cluster_labels, cluster_stats_df, n_clusters, cluster_xy = compute_clusters(
