@@ -1165,8 +1165,7 @@ class SPTPalmApp(tk.Tk):
     # ── Top-level layout ──────────────────────────────────────────────────────
 
     def _build_ui(self):
-        # Header
-        # Header — taller, two-tone strip
+        # ── Header ─────────────────────────────────────────────────────────────
         hdr = tk.Frame(self, bg=SIDEBAR, pady=0)
         hdr.pack(fill="x")
         inner_hdr = tk.Frame(hdr, bg=SIDEBAR)
@@ -1179,14 +1178,95 @@ class SPTPalmApp(tk.Tk):
                  bg=SIDEBAR, fg=MUTED, font=F(11)).pack(side="right")
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x")  # separator
 
+        # ── Mode tab strip ─────────────────────────────────────────────────────
+        # Two top-level views: Analyse Data and Compare Data.  Welcome screen
+        # is shown until the user picks one.  After that, they can flick
+        # between modes via the tabs.
+        self._mode_var = tk.StringVar(value="welcome")
+        mode_strip = tk.Frame(self, bg=SIDEBAR, height=42)
+        mode_strip.pack(fill="x")
+        mode_strip.pack_propagate(False)
+        self._mode_btns = {}
+        for key, text in [("analyse", "Analyse Data"), ("compare", "Compare Data")]:
+            b = tk.Label(mode_strip, text=text, bg=SIDEBAR, fg=MUTED,
+                         font=F(11, "bold"), padx=22, pady=10, cursor="hand2")
+            b.pack(side="left")
+            b.bind("<Button-1>", lambda e, k=key: self._set_mode(k))
+            self._mode_btns[key] = b
+        tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
+
+        # ── Body container (holds the three mode frames) ──────────────────────
+        self._body = tk.Frame(self, bg=BG)
+        self._body.pack(fill="both", expand=True)
+
+        self._welcome_frame = tk.Frame(self._body, bg=BG)
+        self._analyse_frame = tk.Frame(self._body, bg=BG)
+        self._compare_frame = tk.Frame(self._body, bg=BG)
+        for fr in (self._welcome_frame, self._analyse_frame, self._compare_frame):
+            fr.place(relx=0, rely=0, relwidth=1, relheight=1)
+
+        self._build_welcome(self._welcome_frame)
+        self._build_analyse_layout(self._analyse_frame)
+        self._build_compare_layout(self._compare_frame)
+
+        self._set_mode("welcome")
+
+    # ─── Welcome screen ─────────────────────────────────────────────────────
+    def _build_welcome(self, parent):
+        """Initial landing screen — two big buttons to pick a mode."""
+        # Center a card
+        card = tk.Frame(parent, bg=CARD, bd=0,
+                        highlightthickness=1, highlightbackground=BORDER)
+        card.place(relx=0.5, rely=0.5, anchor="center", width=580, height=320)
+
+        tk.Label(card, text="Welcome", bg=CARD, fg=TXT,
+                 font=F(20, "bold")).pack(pady=(28, 4))
+        tk.Label(card, text="What would you like to do?",
+                 bg=CARD, fg=MUTED, font=F(12)).pack(pady=(0, 22))
+
+        btn_row = tk.Frame(card, bg=CARD)
+        btn_row.pack(pady=4)
+
+        def _big_btn(text, sub, command, color=ACC):
+            holder = tk.Frame(btn_row, bg=CARD)
+            holder.pack(side="left", padx=14)
+            b = tk.Label(holder, text=text, bg=color, fg="white",
+                         font=F(13, "bold"), padx=24, pady=14, cursor="hand2",
+                         relief="flat", bd=0, width=18)
+            b.pack()
+            b.bind("<Button-1>", lambda e: command())
+            tk.Label(holder, text=sub, bg=CARD, fg=MUTED,
+                     font=F(9)).pack(pady=(8, 0))
+
+        _big_btn("▶ Analyse Data",
+                 "Single file or batch run from\na .czi / .tif image",
+                 lambda: self._set_mode("analyse"))
+        _big_btn("⇆ Compare Data",
+                 "Overlay results from N folders\nvs M folders",
+                 lambda: self._set_mode("compare"),
+                 color="#3b6ed8")
+
+        tk.Label(card, text="(You can switch any time using the tabs above.)",
+                 bg=CARD, fg=MUTED, font=F(9, "italic")).pack(pady=(20, 0))
+
+    # ─── Analyse mode layout (file bar + params/results + bottom bar) ───────
+    def _build_analyse_layout(self, parent):
+        """Wrap the original analyse UI (file bar, params/results, bottom bar)
+        inside `parent` so it can be shown/hidden as a single mode frame."""
+        # Bottom bar first — packed to bottom so it stays pinned
+        tk.Frame(parent, bg=BORDER, height=1).pack(fill="x", side="bottom")
+        btm = tk.Frame(parent, bg=SIDEBAR)
+        btm.pack(fill="x", side="bottom")
+        self._build_bottom_bar(btm)
+
         # File bar
-        fb = tk.Frame(self, bg=SIDEBAR)
+        fb = tk.Frame(parent, bg=SIDEBAR)
         fb.pack(fill="x")
         self._build_file_bar(fb)
-        tk.Frame(self, bg=BORDER, height=1).pack(fill="x")  # separator
+        tk.Frame(parent, bg=BORDER, height=1).pack(fill="x")  # separator
 
         # Main content area — left panel + right panel side by side
-        content = tk.Frame(self, bg=BG)
+        content = tk.Frame(parent, bg=BG)
         content.pack(fill="both", expand=True)
 
         # Left: fixed-width scrollable parameters
@@ -1217,11 +1297,26 @@ class SPTPalmApp(tk.Tk):
         self._right.pack(side="left", fill="both", expand=True)
         self._show_placeholder()
 
-        # Bottom bar
-        tk.Frame(self, bg=BORDER, height=1).pack(fill="x", side="bottom")
-        btm = tk.Frame(self, bg=SIDEBAR)
-        btm.pack(fill="x", side="bottom")
-        self._build_bottom_bar(btm)
+    def _set_mode(self, mode):
+        """Switch top-level view: 'welcome' | 'analyse' | 'compare'."""
+        if mode not in ("welcome", "analyse", "compare"):
+            return
+        self._mode_var.set(mode)
+
+        # Raise the chosen frame
+        target = {
+            "welcome": self._welcome_frame,
+            "analyse": self._analyse_frame,
+            "compare": self._compare_frame,
+        }[mode]
+        target.tkraise()
+
+        # Update tab styling — Welcome has neither tab "active"
+        for key, btn in self._mode_btns.items():
+            if mode != "welcome" and key == mode:
+                btn.configure(fg=ACC, bg=BG)
+            else:
+                btn.configure(fg=MUTED, bg=SIDEBAR)
 
     def _build_file_bar(self, parent):
         pad = dict(padx=6, pady=11)
@@ -1246,10 +1341,7 @@ class SPTPalmApp(tk.Tk):
                    command=self._browse_outdir).pack(side="left", padx=(0, 14))
         self._batch_btn = ttk.Button(parent, text="Batch",
                                      command=self._on_batch, width=7)
-        self._batch_btn.pack(side="left", padx=(0, 6))
-        self._compare_btn = ttk.Button(parent, text="Compare",
-                                       command=self._open_compare_window, width=8)
-        self._compare_btn.pack(side="left", padx=(0, 14))
+        self._batch_btn.pack(side="left", padx=(0, 14))
 
     def _build_bottom_bar(self, parent):
         # Grid layout so the button is always in column 0 and cannot be pushed off
@@ -2524,25 +2616,12 @@ class SPTPalmApp(tk.Tk):
 
     # ── Batch processing ──────────────────────────────────────────────────────
 
-    def _open_compare_window(self):
-        """Open the Compare-analyses dialog: two groups of analysis output
-        folders → multi-panel comparative figure."""
-        # If already open, just bring it to the front
-        if getattr(self, "_compare_win", None) is not None:
-            try:
-                if self._compare_win.winfo_exists():
-                    self._compare_win.lift()
-                    self._compare_win.focus_force()
-                    return
-            except Exception:
-                pass
-
-        win = tk.Toplevel(self)
-        self._compare_win = win
-        win.title("Compare Analyses")
-        win.configure(bg=BG)
-        win.geometry("980x780")
-        win.transient(self)
+    def _build_compare_layout(self, parent):
+        """Inline Compare UI inside the given parent frame.  Selected via the
+        Compare Data tab in the top mode strip."""
+        win = parent           # alias so existing code referring to `win` still works
+        # Root for askdirectory, etc. — use the main app window
+        # Toplevel-only attributes (.lift, .geometry, .protocol) are no-ops here.
 
         # State
         st_label_a = tk.StringVar(value="Pre")
@@ -2566,14 +2645,11 @@ class SPTPalmApp(tk.Tk):
         }
         panel_vars = {k: tk.BooleanVar(value=True) for k in panel_keys}
 
-        # Header
-        hdr = tk.Frame(win, bg=SIDEBAR)
-        hdr.pack(fill="x")
-        tk.Label(hdr, text="Compare Analyses", bg=SIDEBAR, fg=ACC,
-                 font=F(16, "bold")).pack(side="left", padx=18, pady=10)
-        tk.Label(hdr, text="Pick two groups of analysis output folders and overlay them",
-                 bg=SIDEBAR, fg=MUTED, font=F(10)).pack(side="left", padx=(6, 0), pady=10)
-        tk.Frame(win, bg=BORDER, height=1).pack(fill="x")
+        # Subheader (mode strip already gives the page title; this just adds context)
+        sub = tk.Frame(win, bg=BG)
+        sub.pack(fill="x", padx=14, pady=(10, 0))
+        tk.Label(sub, text="Pick two groups of analysis output folders and overlay them",
+                 bg=BG, fg=MUTED, font=F(10)).pack(side="left")
 
         body = tk.Frame(win, bg=BG)
         body.pack(fill="both", expand=True, padx=14, pady=10)
@@ -2805,11 +2881,6 @@ class SPTPalmApp(tk.Tk):
                 lbl.pack(padx=8, pady=8)
             except Exception as e:
                 _log(f"  (could not preview image: {e})")
-
-        def _on_close():
-            self._compare_win = None
-            win.destroy()
-        win.protocol("WM_DELETE_WINDOW", _on_close)
 
     def _on_batch(self):
         if self._running:
