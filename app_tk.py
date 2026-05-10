@@ -230,6 +230,23 @@ if getattr(sys, "frozen", False):
     if _meipass and _meipass not in sys.path:
         sys.path.insert(0, _meipass)
 
+# ── Pre-load numpy + matplotlib at app startup ────────────────────────────────
+# These were previously imported lazily inside the worker thread, where any
+# import failure (numpy DLL, matplotlib backend) silently killed the thread
+# with no visible error — the symptom is "stuck on Worker thread started, no
+# further logs."  Loading them at module level surfaces any error as a visible
+# startup crash with full traceback in the PyInstaller bootloader dialog.
+try:
+    import numpy as _np_preload  # noqa: F401
+    import matplotlib as _mpl_preload
+    _mpl_preload.use("Agg")
+    from matplotlib.figure import Figure as _Figure_preload  # noqa: F401
+    from matplotlib.backends.backend_agg import FigureCanvasAgg as _FCA_preload  # noqa: F401
+except Exception:
+    import traceback as _tb
+    _tb.print_exc()
+    raise
+
 # Must be set before any other imports on macOS
 if sys.platform == "darwin":
     try:
@@ -2907,10 +2924,21 @@ class SPTPalmApp(tk.Tk):
         self._q.put(("log", "── Worker thread started ──"))
         self._q.put(("progress", ("Initialising…", 1)))
 
-        import numpy as np
-        import time as _time
-        from matplotlib.figure import Figure
-        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        # These modules are pre-loaded at app startup (see top of this file),
+        # so the imports here are O(1) cache lookups.  Wrap in try/except so
+        # any unexpected failure shows in the GUI log instead of silently
+        # killing the worker thread.
+        try:
+            import numpy as np
+            import time as _time
+            from matplotlib.figure import Figure
+            from matplotlib.backends.backend_agg import FigureCanvasAgg
+        except Exception as _exc:
+            import traceback as _tb
+            self._q.put(("log", f"FATAL import error in worker: {type(_exc).__name__}: {_exc}"))
+            self._q.put(("log", _tb.format_exc()))
+            self._q.put(("error", f"Import error: {_exc}"))
+            return
 
         self._q.put(("log", "  matplotlib + numpy ready"))
 
