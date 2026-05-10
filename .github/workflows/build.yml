@@ -84,262 +84,72 @@ jobs:
           pip install -r requirements.txt
           pip install "pyinstaller==6.11.1"   # pinned for reproducible Tcl/Tk bundling behaviour
 
-      - name: Build exe bundle
+      - name: Build exe (onefile)
+        # Spec produces a single self-contained sptPALM.exe.  Tcl/Tk and all
+        # binaries are bundled INSIDE the exe and extracted to %TEMP% at
+        # runtime — no chance of user extraction dropping files.
         run: pyinstaller sptpalm.spec --noconfirm --clean
 
-      - name: Bundle Tcl/Tk data (fallback)
+      - name: Verify exe exists and is reasonable size
         shell: pwsh
         run: |
-          # The spec file tries to bundle _tcl_data/_tk_data at build time.
-          # This step is a hard fallback: if they are still missing after the
-          # build (spec discovery failed), find and copy them now.
-          $internal = "dist\sptPALM\_internal"
-
-          # Use _tkinter constants for exact version — no Tk window needed
-          $tclVer = python -c "import _tkinter; print(_tkinter.TCL_VERSION)"
-          $tkVer  = python -c "import _tkinter; print(_tkinter.TK_VERSION)"
-          Write-Host "TCL version: $tclVer  |  TK version: $tkVer"
-
-          # Try multiple candidate locations for each
-          function Find-TclDir($ver, $prefix) {
-            $candidates = @(
-              (Join-Path $prefix "tcl\tcl$ver"),
-              (Join-Path $prefix "tcl$ver"),
-              (Join-Path $prefix "lib\tcl$ver")
-            )
-            foreach ($c in $candidates) {
-              if (Test-Path $c -PathType Container) { return $c }
-            }
-            # Broad glob fallback
-            $hits = Get-ChildItem (Join-Path $prefix "tcl") -Directory -Filter "tcl$($ver[0])*" -ErrorAction SilentlyContinue | Sort-Object Name
-            if ($hits) { return $hits[-1].FullName }
-            return $null
+          $exe = "dist\sptPALM.exe"
+          if (-not (Test-Path $exe)) {
+            Write-Error "FATAL: $exe not produced by build"
+            exit 1
           }
-          function Find-TkDir($ver, $prefix) {
-            $candidates = @(
-              (Join-Path $prefix "tcl\tk$ver"),
-              (Join-Path $prefix "tk$ver"),
-              (Join-Path $prefix "lib\tk$ver")
-            )
-            foreach ($c in $candidates) {
-              if (Test-Path $c -PathType Container) { return $c }
-            }
-            $hits = Get-ChildItem (Join-Path $prefix "tcl") -Directory -Filter "tk$($ver[0])*" -ErrorAction SilentlyContinue | Sort-Object Name
-            if ($hits) { return $hits[-1].FullName }
-            return $null
+          $sizeMB = (Get-Item $exe).Length / 1MB
+          Write-Host ("sptPALM.exe size: {0:N1} MB" -f $sizeMB)
+          if ($sizeMB -lt 50) {
+            Write-Error "FATAL: $exe is suspiciously small ($sizeMB MB) — bundle is incomplete"
+            exit 1
           }
 
-          $prefix = python -c "import sys; print(sys.prefix)"
-          Write-Host "sys.prefix: $prefix"
-
-          $tclSrc = Find-TclDir $tclVer $prefix
-          $tkSrc  = Find-TkDir  $tkVer  $prefix
-          Write-Host "TCL src: $tclSrc"
-          Write-Host "TK  src: $tkSrc"
-
-          $tclDest = Join-Path $internal "_tcl_data"
-          $tkDest  = Join-Path $internal "_tk_data"
-
-          if (-not (Test-Path $tclDest)) {
-            if ($tclSrc -and (Test-Path $tclSrc)) {
-              Copy-Item $tclSrc $tclDest -Recurse -Force
-              Write-Host "Fallback: copied _tcl_data from $tclSrc"
-            } else {
-              Write-Error "FATAL: cannot find Tcl $tclVer data directory"
-              exit 1
-            }
-          } else { Write-Host "_tcl_data already present (from spec)" }
-
-          if (-not (Test-Path $tkDest)) {
-            if ($tkSrc -and (Test-Path $tkSrc)) {
-              Copy-Item $tkSrc $tkDest -Recurse -Force
-              Write-Host "Fallback: copied _tk_data from $tkSrc"
-            } else {
-              Write-Error "FATAL: cannot find Tk $tkVer data directory"
-              exit 1
-            }
-          } else { Write-Host "_tk_data already present (from spec)" }
-
-      - name: Bundle VC++ runtime DLLs
+      - name: Smoke test (launch the onefile exe)
         shell: pwsh
         run: |
-          # python312.dll requires vcruntime140.dll / vcruntime140_1.dll at
-          # runtime. These are NOT guaranteed on all Windows machines.
-          # Strategy: use ctypes to ask Python where it loaded each DLL from
-          # (guaranteed correct since Python itself already loaded them), then
-          # copy those exact files into _internal alongside python312.dll.
-          $internal = "dist\sptPALM\_internal"
-
-          foreach ($dll in @("vcruntime140.dll", "vcruntime140_1.dll")) {
-            if (Test-Path (Join-Path $internal $dll)) { Write-Host "$dll already in bundle"; continue }
-            $src = python -c "import ctypes,ctypes.wintypes; lib=ctypes.WinDLL('$dll'); buf=ctypes.create_unicode_buffer(32768); ctypes.windll.kernel32.GetModuleFileNameW(lib._handle,buf,32768); print(buf.value)"
-            if ($src -and (Test-Path $src)) {
-              Copy-Item $src $internal -Force
-              Write-Host "Copied $dll from $src"
-            } else {
-              Write-Warning "$dll not found — users may need VC++ Redistributable"
-            }
-          }
-
-          Write-Host "--- _internal DLLs ---"
-          Get-ChildItem $internal -Filter "*.dll" | Select-Object Name | Format-Table
-
-      - name: Verify bundle contents
-        shell: pwsh
-        run: |
-          # Hard-fail the build if any critical file or directory is missing.
-          # This catches packaging regressions before users download a broken zip.
-          $internal = "dist\sptPALM\_internal"
-          $ok = $true
-
-          # Tcl/Tk data — required for the Tkinter GUI to start
-          foreach ($dir in @("_tcl_data", "_tk_data")) {
-            $path = Join-Path $internal $dir
-            if (Test-Path $path) {
-              Write-Host "OK  $dir"
-            } else {
-              Write-Error "MISSING: $path"
-              $ok = $false
-            }
-          }
-
-          # Core Python DLL
-          $pyDll = Get-ChildItem $internal -Filter "python3*.dll" | Select-Object -First 1
-          if ($pyDll) { Write-Host "OK  $($pyDll.Name)" } else { Write-Error "MISSING: python3xx.dll"; $ok = $false }
-
-          # VC++ runtime (non-fatal warning only — not all runners have it)
-          foreach ($dll in @("vcruntime140.dll", "vcruntime140_1.dll")) {
-            if (Test-Path (Join-Path $internal $dll)) { Write-Host "OK  $dll" } else { Write-Warning "ABSENT: $dll (users may need VC++ Redist)" }
-          }
-
-          # Main executable
-          if (Test-Path "dist\sptPALM\sptPALM.exe") { Write-Host "OK  sptPALM.exe" } else { Write-Error "MISSING: sptPALM.exe"; $ok = $false }
-
-          if (-not $ok) { exit 1 }
-          Write-Host "All critical bundle checks passed."
-
-      - name: Smoke test (launch the app)
-        shell: pwsh
-        run: |
-          # Use a marker-file handshake instead of HasExited.  PyInstaller
-          # console=False apps show a Windows error dialog on startup crash
-          # which KEEPS THE PROCESS ALIVE — HasExited returns false and the
-          # smoke test would falsely pass.  The app writes the marker file
-          # only after Tk is fully initialised, so its presence proves the
-          # GUI actually started.
-          $exe    = "dist\sptPALM\sptPALM.exe"
+          # Marker-file handshake: app writes a file only AFTER Tk fully
+          # initialises.  Catches startup crashes that PyInstaller hides
+          # behind an error dialog (which would otherwise keep HasExited false).
+          $exe    = "dist\sptPALM.exe"
           $marker = Join-Path $env:RUNNER_TEMP "sptpalm_ready.marker"
           Remove-Item -Path $marker -ErrorAction SilentlyContinue
           $env:SPTPALM_READY_MARKER = $marker
 
-          Write-Host "Launching $exe (waiting for ready marker $marker)..."
+          Write-Host "Launching $exe (onefile bootloader will extract to TEMP — first launch is slower)..."
           $proc = Start-Process -FilePath $exe -PassThru -WindowStyle Hidden
 
-          $deadline = (Get-Date).AddSeconds(30)
+          # Onefile takes longer to start (extracts to %TEMP%): give 60s
+          $deadline = (Get-Date).AddSeconds(60)
           $ready = $false
           while ((Get-Date) -lt $deadline) {
             if (Test-Path $marker) { $ready = $true; break }
-            if ($proc.HasExited)  {
+            if ($proc.HasExited) {
               Write-Error "FATAL: process exited with code $($proc.ExitCode) before writing ready marker"
               exit 1
             }
             Start-Sleep -Milliseconds 500
           }
-
           if (-not $ready) {
-            Write-Error "FATAL: app did not write ready marker within 30s — startup crash (likely Tcl/Tk or DLL issue, hidden by error dialog)"
+            Write-Error "FATAL: app did not signal ready within 60s — startup crash hidden by error dialog"
             try { $proc.Kill() } catch {}
             exit 1
           }
-          Write-Host "OK: ready marker written — GUI initialised successfully"
+          Write-Host "OK: ready marker written — onefile bundle is healthy"
           $proc.Kill()
           $proc.WaitForExit(5000) | Out-Null
 
-      - name: Zip the dist folder
-        # Use Python's zipfile via shutil (reliable, deterministic, preserves
-        # all subdirectories).  PowerShell's Compress-Archive has known issues
-        # with PyInstaller bundles — it can silently drop files or corrupt
-        # archives on bundles with many small files (e.g. _tcl_data).
-        shell: pwsh
-        run: |
-          python -c "import shutil; shutil.make_archive('dist/sptPALM-Windows', 'zip', 'dist', 'sptPALM')"
-          if (-not (Test-Path "dist\sptPALM-Windows.zip")) {
-            Write-Error "Zip creation failed"
-            exit 1
-          }
-          $size = (Get-Item "dist\sptPALM-Windows.zip").Length / 1MB
-          Write-Host ("Created sptPALM-Windows.zip ({0:N1} MB)" -f $size)
-
-      - name: Verify zip integrity (extract & re-test)
-        # Defence in depth: extract the zip we're about to ship, verify
-        # _tcl_data and _tk_data survived the archiving round-trip, and
-        # smoke-test the extracted exe.  If THIS fails, users will too.
-        shell: pwsh
-        run: |
-          $verifyDir = "$env:RUNNER_TEMP\sptPALM_verify"
-          if (Test-Path $verifyDir) { Remove-Item -Recurse -Force $verifyDir }
-          New-Item -ItemType Directory -Path $verifyDir | Out-Null
-
-          # Use Python's zipfile to extract (matches the writer)
-          python -c "import zipfile; zipfile.ZipFile(r'dist\sptPALM-Windows.zip').extractall(r'$verifyDir')"
-
-          $extractedExe = Join-Path $verifyDir "sptPALM\sptPALM.exe"
-          $extractedTcl = Join-Path $verifyDir "sptPALM\_internal\_tcl_data"
-          $extractedTk  = Join-Path $verifyDir "sptPALM\_internal\_tk_data"
-
-          $ok = $true
-          if (-not (Test-Path $extractedExe))  { Write-Error "ZIP CORRUPT: sptPALM.exe missing after extract"; $ok = $false }
-          if (-not (Test-Path $extractedTcl))  { Write-Error "ZIP CORRUPT: _tcl_data missing after extract"; $ok = $false }
-          if (-not (Test-Path $extractedTk))   { Write-Error "ZIP CORRUPT: _tk_data missing after extract"; $ok = $false }
-          if (-not $ok) { exit 1 }
-
-          # Critical: verify init.tcl actually survived (the file the rthook checks for)
-          $initTcl = Join-Path $extractedTcl "init.tcl"
-          if (-not (Test-Path $initTcl)) {
-            Write-Error "ZIP CORRUPT: _tcl_data\init.tcl missing after extract — Tcl runtime will fail"
-            exit 1
-          }
-          Write-Host "ZIP OK: extracted bundle has _tcl_data\init.tcl, _tk_data, sptPALM.exe"
-
-          # Smoke test the EXTRACTED bundle (not the build dir).  Uses the
-          # same marker-file handshake to detect crashes that hide behind
-          # the Windows error dialog.
-          Write-Host "Smoke testing extracted exe..."
-          $marker = Join-Path $env:RUNNER_TEMP "sptpalm_ready_extracted.marker"
-          Remove-Item -Path $marker -ErrorAction SilentlyContinue
-          $env:SPTPALM_READY_MARKER = $marker
-
-          $proc = Start-Process -FilePath $extractedExe -PassThru -WindowStyle Hidden
-          $deadline = (Get-Date).AddSeconds(30)
-          $ready = $false
-          while ((Get-Date) -lt $deadline) {
-            if (Test-Path $marker) { $ready = $true; break }
-            if ($proc.HasExited) {
-              Write-Error "FATAL: extracted exe exited with code $($proc.ExitCode) before writing ready marker"
-              exit 1
-            }
-            Start-Sleep -Milliseconds 500
-          }
-          if (-not $ready) {
-            Write-Error "FATAL: extracted exe did not signal ready within 30s — startup crash hidden by error dialog"
-            try { $proc.Kill() } catch {}
-            exit 1
-          }
-          Write-Host "Extracted exe signalled ready — bundle is healthy"
-          $proc.Kill()
-          $proc.WaitForExit(5000) | Out-Null
-
-      - name: Upload zip artifact
+      - name: Upload exe artifact
         uses: actions/upload-artifact@v4
         with:
           name: sptPALM-Windows
-          path: dist\sptPALM-Windows.zip
+          path: dist\sptPALM.exe
           retention-days: 30
 
       - name: Upload to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist\sptPALM-Windows.zip
+          files: dist\sptPALM.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

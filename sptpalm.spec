@@ -168,47 +168,75 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data)
 
-exe = EXE(
-    pyz,
-    a.scripts,
-    [],
-    exclude_binaries=True,
-    name="sptPALM",
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=False,
-    upx=False,
-    console=False,
-    argv_emulation=False,
-    codesign_identity=None,
-    entitlements_file=None,
-)
-
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    strip=False,
-    upx=False,
-    upx_exclude=[],
-    name="sptPALM",
-)
-
-# macOS .app bundle (ignored on Windows)
-if sys.platform == "darwin":
-    app = BUNDLE(
-        coll,
-        name="sptPALM.app",
-        icon=None,
-        bundle_identifier="com.jacoblevers.sptpalm",
-        info_plist={
-            "CFBundleName": "sptPALM",
-            "CFBundleDisplayName": "sptPALM Analysis Pipeline",
-            "CFBundleVersion": "1.0.0",
-            "CFBundleShortVersionString": "1.0.0",
-            "NSHighResolutionCapable": True,
-            "LSMinimumSystemVersion": "11.0",
-            "NSAppleEventsUsageDescription": "Required for analysis.",
-        },
+# ── Windows: ONEFILE mode (single self-contained .exe) ────────────────────────
+# Extracting a zip on the user's Windows machine is fundamentally unreliable —
+# Windows Explorer's built-in extractor silently drops files (long paths,
+# special chars), and Defender quarantines .tcl scripts.  Onefile sidesteps
+# this entirely: the bundle is a single .exe that extracts itself to %TEMP%
+# at runtime where no user/AV can accidentally damage it.
+if sys.platform == "win32":
+    exe = EXE(
+        pyz,
+        a.scripts,
+        a.binaries,
+        a.zipfiles,
+        a.datas,
+        [],
+        name="sptPALM",
+        debug=False,
+        bootloader_ignore_signals=False,
+        strip=False,
+        upx=False,
+        runtime_tmpdir=None,           # default %TEMP%\_MEIxxxxx
+        console=False,
+        disable_windowed_traceback=False,
+        argv_emulation=False,
+        target_arch=None,
+        codesign_identity=None,
+        entitlements_file=None,
     )
+else:
+    # macOS/Linux: ONEDIR mode (then wrap in .app/.dmg on macOS)
+    exe = EXE(
+        pyz,
+        a.scripts,
+        [],
+        exclude_binaries=True,
+        name="sptPALM",
+        debug=False,
+        bootloader_ignore_signals=False,
+        strip=False,
+        upx=False,
+        console=False,
+        argv_emulation=False,
+        codesign_identity=None,
+        entitlements_file=None,
+    )
+
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.zipfiles,
+        a.datas,
+        strip=False,
+        upx=False,
+        upx_exclude=[],
+        name="sptPALM",
+    )
+
+    if sys.platform == "darwin":
+        app = BUNDLE(
+            coll,
+            name="sptPALM.app",
+            icon=None,
+            bundle_identifier="com.jacoblevers.sptpalm",
+            info_plist={
+                "CFBundleName": "sptPALM",
+                "CFBundleDisplayName": "sptPALM Analysis Pipeline",
+                "CFBundleVersion": "1.0.0",
+                "CFBundleShortVersionString": "1.0.0",
+                "NSHighResolutionCapable": True,
+                "LSMinimumSystemVersion": "11.0",
+                "NSAppleEventsUsageDescription": "Required for analysis.",
+            },
+        )
