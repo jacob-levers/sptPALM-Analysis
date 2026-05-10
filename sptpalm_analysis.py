@@ -1353,22 +1353,22 @@ def localise_particles(stack, diameter=7, minmass=0.1, percentile=64,
     offsets  = [i * chunk_size for i in range(len(chunks))]
     chunk_pairs = list(zip(chunks, offsets))
 
-    # Chunk-level parallelism via ThreadPoolExecutor.  tp.batch's per-frame
-    # work (scipy.ndimage convolution, centroid fitting) is mostly C code that
-    # releases the GIL — so N Python threads each running tp.batch on their
-    # own chunk run nearly in parallel on N cores.  BLAS stays capped at 1
-    # per call (no nested-thread oversubscription), and chunk-level threading
-    # gives the multi-core speedup that BLAS-level threading cannot deliver
-    # for small (256×256) per-frame ops where BLAS overhead exceeds the work.
-    n_workers = min(workers, n_chunks, N_CPUS)
-    print(f"  Parallelism : {n_workers} chunk-level threads (BLAS per call = 1)")
-    chunk_results = [None] * n_chunks
-    with ThreadPoolExecutor(max_workers=n_workers) as _exe:
-        _futs = {_exe.submit(_localise_chunk, c, diameter, minmass, percentile, o): i
-                 for i, (c, o) in enumerate(chunk_pairs)}
-        for _f in _tqdm(as_completed(_futs), total=n_chunks,
-                        desc="  Localising", unit="chunk", ncols=70):
-            chunk_results[_futs[_f]] = _f.result()
+    # Run chunks serially with BLAS pool dynamically expanded to N_CPUS.
+    # Per-frame numpy/scipy ops parallelise internally across all CPU cores.
+    # NOTE: chunk-level threading (ThreadPoolExecutor) consistently deadlocks
+    # tp.batch in PyInstaller frozen apps on Windows for reasons that resist
+    # diagnosis (some interaction with trackpy's internal state).  This
+    # BLAS-only approach is reliable but limited — small per-frame ops on
+    # 256×256 images don't benefit much from BLAS threading, so total CPU
+    # use is modest (~10-20% on a 12-core machine).  Acceptable trade-off
+    # for reliability.  True multi-core requires multiprocessing.Pool which
+    # has its own onefile-mode issues.
+    print(f"  BLAS pool : expanded to {N_CPUS} threads for localisation")
+    with _threadpool_limits(limits=N_CPUS):
+        chunk_results = [_localise_chunk(chunk, diameter, minmass, percentile, offset)
+                         for chunk, offset in _tqdm(chunk_pairs, total=n_chunks,
+                                                    desc="  Localising", unit="chunk",
+                                                    ncols=70)]
 
     valid = [df for df in chunk_results if df is not None and len(df) > 0]
     result = pd.concat(valid, ignore_index=True) if valid else pd.DataFrame()
