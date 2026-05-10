@@ -2991,29 +2991,49 @@ def compare_groups(folders_a, folders_b, label_a="Group A", label_b="Group B",
         ax.set_title("Track Length Distribution")
         ax.legend(frameon=False, loc="best")
 
-    # ── 7. Jump Distance Distribution ─────────────────────────────────────────
+    # ── 7. Jump Distance Distribution: per-population D + fraction ────────────
+    # Each replicate fits 1, 2 or 3 diffusing populations (Immobile / Mobile /
+    # Fast).  We show the fitted D for each as a dot; the marker size encodes
+    # the population fraction (bigger dot = larger fraction of particles).
+    # x positions are integer population indices, with a small horizontal
+    # offset between Group A and Group B for visual separation.
     if "jdd" in panels:
         ax = _next_ax()
         any_data = False
-        for grp, summaries, color in ((label_a, summaries_a, color_a),
-                                      (label_b, summaries_b, color_b)):
-            # Aggregate fitted D values across replicates
-            ds = [s["jdd"]["D_values"] for s in summaries
-                  if s.get("jdd") and "D_values" in s["jdd"]]
-            if not ds: continue
-            any_data = True
-            # Bar chart: x = population index (1..3), y = mean D across replicates
-            max_pop = max(len(x) for x in ds)
-            xs = np.arange(max_pop)
-            for i, d_arr in enumerate(ds):
-                ax.scatter(xs[:len(d_arr)] + (0 if grp == label_a else 0.3),
-                           d_arr, color=color, alpha=0.5, s=18,
-                           label=grp if i == 0 else None)
+        max_pop_overall = 0
+        # Build (x, y, size, color) for each replicate's D fits
+        for grp, summaries, color, x_offset in (
+                (label_a, summaries_a, color_a, -0.12),
+                (label_b, summaries_b, color_b, +0.12)):
+            label_done = False
+            for s in summaries:
+                jd = s.get("jdd")
+                if not jd or "D_values" not in jd:
+                    continue
+                D = np.asarray(jd["D_values"], dtype=float)
+                f = np.asarray(jd.get("fractions", np.ones_like(D)), dtype=float)
+                if D.size == 0:
+                    continue
+                any_data = True
+                max_pop_overall = max(max_pop_overall, len(D))
+                # Marker area scales with fraction: 25 px² for f=0, 200 for f=1
+                sizes = 25 + 175 * np.clip(f, 0, 1)
+                xs = np.arange(len(D)) + x_offset
+                ax.scatter(xs, D,
+                           s=sizes, color=color,
+                           alpha=0.55, edgecolor=color,
+                           label=(grp if not label_done else None))
+                label_done = True
         if any_data:
-            ax.set_xlabel("Diffusion population")
-            ax.set_ylabel("D (µm²/s)")
+            tick_labels = ["Immobile", "Mobile", "Fast"][:max_pop_overall]
+            if max_pop_overall == 1:
+                tick_labels = ["All"]
+            ax.set_xticks(np.arange(max_pop_overall))
+            ax.set_xticklabels(tick_labels)
+            ax.set_xlim(-0.5, max_pop_overall - 0.5)
+            ax.set_ylabel("D (µm²/s, log)")
             ax.set_yscale("log")
-            ax.set_title("JDD: per-population D")
+            ax.set_title("JDD: per-population D  (marker size ∝ population fraction)")
             ax.legend(frameon=False, loc="best")
         else:
             ax.text(0.5, 0.5, "No JDD data\n(re-run analysis to generate)",
@@ -3032,12 +3052,12 @@ def compare_groups(folders_a, folders_b, label_a="Group A", label_b="Group B",
             for s in summaries:
                 d = s.get("dwell_times")
                 if d is None or len(d) == 0: continue
-                # try common column names
-                col = next((c for c in ("dwell_s", "dwell_time", "dwell", "tau_s")
+                # try common column names — dwell_time_s is the canonical
+                # one written by compute_dwell_times.
+                col = next((c for c in ("dwell_time_s", "dwell_s",
+                                        "dwell_time", "dwell", "tau_s")
                             if c in d.columns), None)
-                if col is None and len(d.columns):
-                    col = d.columns[0]
-                if col is None: continue
+                if col is None: continue   # silently skip — never fall back to e.g. "particle"
                 pooled.extend(d[col].values)
             if not pooled: continue
             any_data = True
@@ -3060,10 +3080,12 @@ def compare_groups(folders_a, folders_b, label_a="Group A", label_b="Group B",
             ax.set_title("Dwell Time Survival")
 
     # ── 9. Turning angle distribution ─────────────────────────────────────────
+    # compute_turning_angles() returns UNSIGNED angles in DEGREES (0-180)
+    # via arccos.  0° = no turn (continued straight), 180° = full reversal.
     if "turning_angles" in panels:
         ax = _next_ax()
         any_data = False
-        bins = np.linspace(-np.pi, np.pi, 37)
+        bins = np.linspace(0, 180, 37)   # 5° bins
         centers = 0.5 * (bins[:-1] + bins[1:])
         for grp, summaries, color in ((label_a, summaries_a, color_a),
                                       (label_b, summaries_b, color_b)):
@@ -3078,8 +3100,10 @@ def compare_groups(folders_a, folders_b, label_a="Group A", label_b="Group B",
             frac = counts / counts.sum() if counts.sum() else counts
             ax.plot(centers, frac, color=color, lw=1.5, label=grp)
         if any_data:
-            ax.set_xlabel("Turning angle (rad)")
-            ax.set_ylabel("Frequency")
+            ax.set_xlabel("Turning angle (deg)")
+            ax.set_ylabel("Relative frequency")
+            ax.set_xlim(0, 180)
+            ax.set_xticks([0, 45, 90, 135, 180])
             ax.set_title("Turning Angle Distribution")
             ax.legend(frameon=False, loc="best")
         else:
