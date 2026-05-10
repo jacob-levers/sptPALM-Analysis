@@ -242,6 +242,19 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext
 
 N_CPUS = multiprocessing.cpu_count()
 
+
+def _to_jsonable(obj):
+    """Recursively convert numpy arrays / scalars to plain Python types so
+    json.dump can serialise them."""
+    # numpy types
+    if hasattr(obj, "tolist"):       # ndarray, np.generic
+        return obj.tolist()
+    if isinstance(obj, dict):
+        return {k: _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_jsonable(v) for v in obj]
+    return obj
+
 # ── Palette ────────────────────────────────────────────────────────────────────
 BG      = "#09090e"      # near-black canvas
 SIDEBAR = "#111318"      # left panel — visibly distinct from BG
@@ -3119,8 +3132,7 @@ class SPTPalmApp(tk.Tk):
                         }, _bpf, indent=2)
                     if jdd:
                         with open(os.path.join(data_dir, f"{stem}_jdd.json"), "w") as _bjf:
-                            _b_json.dump({k: (list(v) if hasattr(v, "__iter__") and not isinstance(v, str) else v)
-                                          for k, v in jdd.items()}, _bjf, indent=2)
+                            _b_json.dump(_to_jsonable(jdd), _bjf, indent=2)
                     if b_dwell_df is not None and len(b_dwell_df):
                         b_dwell_df.to_csv(
                             os.path.join(data_dir, f"{stem}_dwell_times.csv"), index=False)
@@ -3949,8 +3961,7 @@ class SPTPalmApp(tk.Tk):
             if jdd:
                 jdd_path = os.path.join(data_dir, f"{stem}_jdd.json")
                 with open(jdd_path, "w") as _jf:
-                    _json.dump({k: (list(v) if hasattr(v, "__iter__") and not isinstance(v, str) else v)
-                                for k, v in jdd.items()}, _jf, indent=2)
+                    _json.dump(_to_jsonable(jdd), _jf, indent=2)
             if dwell_df is not None and len(dwell_df):
                 dwell_df.to_csv(
                     os.path.join(data_dir, f"{stem}_dwell_times.csv"), index=False)
