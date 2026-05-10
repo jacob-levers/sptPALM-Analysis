@@ -55,6 +55,8 @@ hidden += [
     "concurrent.futures.thread",
     "psutil",
     "threadpoolctl",   # used by sptpalm_analysis to expand BLAS during localise
+    "tkinterdnd2",     # drag-and-drop folders into the Compare tab
+    "tkinterdnd2.TkinterDnD",
     # encoding tables sometimes missed in frozen builds
     "encodings.utf_8",
     "encodings.ascii",
@@ -67,6 +69,10 @@ datas += collect_data_files("skimage")
 datas += collect_data_files("matplotlib")
 datas += collect_data_files("aicspylibczi")
 datas += collect_data_files("PIL")           # Pillow data (ICC profiles etc.)
+try:
+    datas += collect_data_files("tkinterdnd2")  # platform DnD libraries
+except Exception:
+    pass
 datas += [("sptpalm_analysis.py", ".")]
 
 # ── Tcl/Tk data (Windows only) ─────────────────────────────────────────────────

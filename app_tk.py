@@ -240,6 +240,18 @@ if sys.platform == "darwin":
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
+# Optional: drag-and-drop folders into the Compare tab via tkinterdnd2.
+# If the package is missing or fails to load (e.g. its bundled DLLs aren't
+# present), the app still works — drag-and-drop is just disabled.
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    _APP_BASE = TkinterDnD.Tk
+    _HAS_DND = True
+except Exception:
+    _APP_BASE = tk.Tk
+    _HAS_DND = False
+    DND_FILES = None  # placeholder so references don't fail at import time
+
 N_CPUS = multiprocessing.cpu_count()
 
 
@@ -1006,7 +1018,7 @@ class _ROIEditorDialog(tk.Toplevel):
 #  MAIN APPLICATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-class SPTPalmApp(tk.Tk):
+class SPTPalmApp(_APP_BASE):
     def __init__(self):
         super().__init__()
         self.title("sptPALM Analysis Pipeline — Zeiss Elyra — By Jacob Levers")
@@ -2629,19 +2641,28 @@ class SPTPalmApp(tk.Tk):
 
     # ── Batch processing ──────────────────────────────────────────────────────
 
+    # ─── Theme presets for group colours (used by Compare) ─────────────────
+    # Cycled through when adding new groups.  Per-group pickers still override.
+    _COMPARE_THEME_COLORS = {
+        "Dark": ["#e6edf3", "#79c0ff", "#7ed321", "#f78166",
+                 "#a371f7", "#e85a4f"],
+        "Light": ["#000000", "#3b6ed8", "#2ea043", "#cb2431",
+                  "#7c3aed", "#d97706"],
+        "Publication": ["#000000", "#666666", "#222222", "#888888",
+                        "#444444", "#aaaaaa"],
+    }
+    _COMPARE_DEFAULT_LABELS = ["Pre", "Post", "Group C", "Group D",
+                               "Group E", "Group F"]
+    _COMPARE_MAX_GROUPS = 6
+
     def _build_compare_layout(self, parent):
         """Inline Compare UI inside the given parent frame.  Selected via the
-        Compare Data tab in the top mode strip."""
-        win = parent           # alias so existing code referring to `win` still works
-        # Root for askdirectory, etc. — use the main app window
-        # Toplevel-only attributes (.lift, .geometry, .protocol) are no-ops here.
+        Compare Data tab in the top mode strip.  Supports an arbitrary
+        number of groups (2–6) with dynamic Add/Remove."""
+        win = parent
 
-        # State
-        st_label_a = tk.StringVar(value="Pre")
-        st_label_b = tk.StringVar(value="Post")
-        st_outdir  = tk.StringVar(value="")
-        st_color_a = tk.StringVar(value="#000000")
-        st_color_b = tk.StringVar(value="#3b6ed8")
+        # ── State ─────────────────────────────────────────────────────────────
+        st_outdir = tk.StringVar(value="")
         panel_keys = ["msd", "auc", "logd_dist", "mob_immob",
                       "motion_classes", "track_length",
                       "jdd", "dwell_cdf", "turning_angles"]
@@ -2657,47 +2678,88 @@ class SPTPalmApp(tk.Tk):
             "turning_angles":  "Turning angle distribution",
         }
         panel_vars = {k: tk.BooleanVar(value=True) for k in panel_keys}
+        st_pdf = tk.BooleanVar(value=True)
+        st_theme = tk.StringVar(
+            value=self.v_fig_theme.get() if hasattr(self, "v_fig_theme") else "Dark")
 
-        # Subheader (mode strip already gives the page title; this just adds context)
+        # Per-group state lives in this list; mutated by add/remove.
+        self._compare_groups = []        # list of dicts (see _add_group)
+
+        # ── Subheader ─────────────────────────────────────────────────────────
         sub = tk.Frame(win, bg=BG)
         sub.pack(fill="x", padx=14, pady=(10, 0))
-        tk.Label(sub, text="Pick two groups of analysis output folders and overlay them",
+        sub_text = ("Pick 2–6 groups of analysis output folders, then overlay them."
+                    + ("  ·  Tip: drag folders directly onto a group's list."
+                       if _HAS_DND else ""))
+        tk.Label(sub, text=sub_text,
                  bg=BG, fg=MUTED, font=F(10)).pack(side="left")
 
         body = tk.Frame(win, bg=BG)
         body.pack(fill="both", expand=True, padx=14, pady=10)
 
-        # ── Two-group selector row ────────────────────────────────────────────
-        groups_row = tk.Frame(body, bg=BG)
-        groups_row.pack(fill="x")
-        groups_row.columnconfigure(0, weight=1)
-        groups_row.columnconfigure(1, weight=1)
+        # ── Groups grid (2 columns, wraps as more groups are added) ────────────
+        groups_container = tk.Frame(body, bg=BG)
+        groups_container.pack(fill="x")
+        groups_container.columnconfigure(0, weight=1)
+        groups_container.columnconfigure(1, weight=1)
 
-        list_a = list_b = None
-        def _make_group_card(parent, title, lbl_var, color_var, side):
-            card = tk.Frame(parent, bg=CARD, bd=0, highlightthickness=1,
-                            highlightbackground=BORDER)
-            tk.Label(card, text=title, bg=CARD, fg=ACC,
-                     font=F(11, "bold")).pack(anchor="w", padx=10, pady=(8, 2))
+        # ── Helpers (defined before _make_group_card so we can refer forward) ─
+        def _regrid_groups():
+            for i, g in enumerate(self._compare_groups):
+                row, col = divmod(i, 2)
+                g["card"].grid(row=row, column=col, sticky="nsew",
+                               padx=(0, 6) if col == 0 else (6, 0),
+                               pady=(0 if row == 0 else 8, 0))
+                # Disable Remove on the only-2-groups case
+                state = "normal" if len(self._compare_groups) > 2 else "disabled"
+                g["remove_btn"].configure(state=state)
+            # Update the +Add Group button state
+            add_state = "normal" if len(self._compare_groups) < self._COMPARE_MAX_GROUPS else "disabled"
+            add_group_btn.configure(state=add_state)
+
+        def _make_group_card(initial_label, initial_color):
+            label_var = tk.StringVar(value=initial_label)
+            color_var = tk.StringVar(value=initial_color)
+
+            card = tk.Frame(groups_container, bg=CARD, bd=0,
+                            highlightthickness=1, highlightbackground=BORDER)
+
+            # Header: title + Remove button
+            head = tk.Frame(card, bg=CARD)
+            head.pack(fill="x", padx=10, pady=(8, 2))
+            title_lbl = tk.Label(head, text=initial_label, bg=CARD, fg=ACC,
+                                 font=F(11, "bold"))
+            title_lbl.pack(side="left")
+            label_var.trace_add(
+                "write",
+                lambda *_: title_lbl.configure(text=label_var.get() or "(unnamed)"))
+            remove_btn = ttk.Button(head, text="× Remove", width=11)
+            remove_btn.pack(side="right")
+
+            # Label + colour row
             row = tk.Frame(card, bg=CARD)
             row.pack(fill="x", padx=10, pady=(0, 4))
             tk.Label(row, text="Label:", bg=CARD, fg=MUTED, font=F(10)).pack(side="left")
-            tk.Entry(row, textvariable=lbl_var, width=14, bg=BG, fg=TXT,
+            tk.Entry(row, textvariable=label_var, width=14, bg=BG, fg=TXT,
                      relief="flat", bd=0, font=F(10),
                      highlightthickness=1, highlightbackground=BORDER,
-                     highlightcolor=ACC, insertbackground=ACC).pack(side="left", padx=(4, 12))
-            tk.Label(row, text="Color:", bg=CARD, fg=MUTED, font=F(10)).pack(side="left")
-            color_swatch = tk.Label(row, bg=color_var.get(), width=3, relief="solid", bd=1)
+                     highlightcolor=ACC, insertbackground=ACC
+                     ).pack(side="left", padx=(4, 12))
+            tk.Label(row, text="Colour:", bg=CARD, fg=MUTED, font=F(10)).pack(side="left")
+            color_swatch = tk.Label(row, bg=color_var.get(), width=3,
+                                    relief="solid", bd=1)
             color_swatch.pack(side="left", padx=(4, 6))
             def _pick_color():
                 from tkinter import colorchooser
                 c = colorchooser.askcolor(parent=win, color=color_var.get(),
-                                          title="Pick group color")
+                                          title="Pick group colour")
                 if c and c[1]:
                     color_var.set(c[1])
                     color_swatch.configure(bg=c[1])
-            ttk.Button(row, text="Pick", command=_pick_color, width=5).pack(side="left")
+            ttk.Button(row, text="Pick", command=_pick_color,
+                       width=5).pack(side="left")
 
+            # Folder list
             list_frame = tk.Frame(card, bg=CARD)
             list_frame.pack(fill="both", expand=True, padx=10, pady=(0, 6))
             sb = tk.Scrollbar(list_frame, orient="vertical")
@@ -2710,47 +2772,110 @@ class SPTPalmApp(tk.Tk):
             lb.pack(side="left", fill="both", expand=True)
             sb.configure(command=lb.yview)
 
+            # Drag-and-drop: accept folders dropped from the OS file manager.
+            # Parses the platform-specific drop string into a list of paths
+            # and only accepts directories.
+            if _HAS_DND:
+                def _on_drop(event, listbox=lb, label_var=label_var):
+                    import re
+                    # tk drop data format: paths separated by spaces, with
+                    # paths that contain spaces wrapped in {…}.
+                    raw = event.data or ""
+                    paths = [a or b for a, b in
+                             re.findall(r'\{([^}]+)\}|(\S+)', raw)]
+                    accepted = 0
+                    for p in paths:
+                        if not p: continue
+                        if os.path.isdir(p):
+                            if p not in listbox.get(0, "end"):
+                                listbox.insert("end", p); accepted += 1
+                    if accepted == 0 and paths:
+                        messagebox.showinfo(
+                            "Drag-and-drop",
+                            "Compare expects folders containing analysis "
+                            "outputs.  None of the dropped items are "
+                            "directories.", parent=win)
+                try:
+                    lb.drop_target_register(DND_FILES)
+                    lb.dnd_bind("<<Drop>>", _on_drop)
+                except Exception:
+                    pass
+
+            # Action buttons
             btns = tk.Frame(card, bg=CARD)
             btns.pack(fill="x", padx=10, pady=(0, 10))
             def _add():
                 f = filedialog.askdirectory(
-                    parent=win, title=f"Add folder to {lbl_var.get()}")
+                    parent=win, title=f"Add folder to {label_var.get()}")
                 if f and f not in lb.get(0, "end"):
                     lb.insert("end", f)
             def _add_many():
-                # Pick a parent and add every immediate subfolder that has a data/ dir
-                parent = filedialog.askdirectory(
-                    parent=win, title="Select parent folder (will add all valid subfolders)")
-                if not parent: return
+                par = filedialog.askdirectory(
+                    parent=win,
+                    title="Select parent folder (will add all valid subfolders)")
+                if not par: return
                 added = 0
-                for name in sorted(os.listdir(parent)):
-                    sub = os.path.join(parent, name)
+                for name in sorted(os.listdir(par)):
+                    sub = os.path.join(par, name)
                     if not os.path.isdir(sub): continue
-                    if os.path.isdir(os.path.join(sub, "data")) or any(
+                    if (os.path.isdir(os.path.join(sub, "data")) or any(
                             f.endswith("_diffusion_summary.csv")
-                            for f in os.listdir(sub) if os.path.isfile(os.path.join(sub, f))):
+                            for f in os.listdir(sub)
+                            if os.path.isfile(os.path.join(sub, f)))):
                         if sub not in lb.get(0, "end"):
-                            lb.insert("end", sub)
-                            added += 1
+                            lb.insert("end", sub); added += 1
                 if added == 0:
-                    messagebox.showinfo("Add subfolders",
-                        "No analysis folders detected as direct children of that path.",
-                        parent=win)
-            def _remove():
+                    messagebox.showinfo(
+                        "Add subfolders",
+                        "No analysis folders detected as direct children "
+                        "of that path.", parent=win)
+            def _remove_items():
                 for i in reversed(lb.curselection()):
                     lb.delete(i)
             def _clear():
                 lb.delete(0, "end")
-            ttk.Button(btns, text="+ Add",       command=_add,      width=8).pack(side="left", padx=(0, 4))
-            ttk.Button(btns, text="+ Add many",  command=_add_many, width=10).pack(side="left", padx=(0, 4))
-            ttk.Button(btns, text="− Remove",    command=_remove,   width=9).pack(side="left", padx=(0, 4))
-            ttk.Button(btns, text="Clear",       command=_clear,    width=7).pack(side="left")
-            return card, lb
+            ttk.Button(btns, text="+ Add",       command=_add,        width=8 ).pack(side="left", padx=(0, 4))
+            ttk.Button(btns, text="+ Add many",  command=_add_many,   width=10).pack(side="left", padx=(0, 4))
+            ttk.Button(btns, text="− Remove",    command=_remove_items, width=9 ).pack(side="left", padx=(0, 4))
+            ttk.Button(btns, text="Clear",       command=_clear,      width=7 ).pack(side="left")
 
-        card_a, list_a = _make_group_card(groups_row, "Group A", st_label_a, st_color_a, "left")
-        card_b, list_b = _make_group_card(groups_row, "Group B", st_label_b, st_color_b, "right")
-        card_a.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        card_b.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+            return {
+                "card": card, "label_var": label_var, "color_var": color_var,
+                "swatch": color_swatch, "listbox": lb, "remove_btn": remove_btn,
+            }
+
+        def _add_group():
+            if len(self._compare_groups) >= self._COMPARE_MAX_GROUPS:
+                return
+            idx = len(self._compare_groups)
+            label = (self._COMPARE_DEFAULT_LABELS[idx]
+                     if idx < len(self._COMPARE_DEFAULT_LABELS)
+                     else f"Group {idx + 1}")
+            colors = self._COMPARE_THEME_COLORS.get(
+                st_theme.get(), self._COMPARE_THEME_COLORS["Dark"])
+            color = colors[idx % len(colors)]
+            g = _make_group_card(label, color)
+            g["remove_btn"].configure(command=lambda gg=g: _remove_group(gg))
+            self._compare_groups.append(g)
+            _regrid_groups()
+
+        def _remove_group(g):
+            if len(self._compare_groups) <= 2:
+                return
+            try: g["card"].destroy()
+            except Exception: pass
+            try: self._compare_groups.remove(g)
+            except ValueError: pass
+            _regrid_groups()
+
+        def _on_theme_changed(*_):
+            colors = self._COMPARE_THEME_COLORS.get(
+                st_theme.get(), self._COMPARE_THEME_COLORS["Dark"])
+            for i, g in enumerate(self._compare_groups):
+                c = colors[i % len(colors)]
+                g["color_var"].set(c)
+                try: g["swatch"].configure(bg=c)
+                except Exception: pass
 
         # ── Output folder ─────────────────────────────────────────────────────
         out_row = tk.Frame(body, bg=BG)
@@ -2760,39 +2885,15 @@ class SPTPalmApp(tk.Tk):
         tk.Entry(out_row, textvariable=st_outdir, bg=CARD, fg=TXT,
                  insertbackground=ACC, relief="flat", bd=0, font=F(10),
                  highlightthickness=1, highlightbackground=BORDER,
-                 highlightcolor=ACC).pack(side="left", fill="x", expand=True, padx=(6, 6))
+                 highlightcolor=ACC).pack(side="left", fill="x", expand=True,
+                                           padx=(6, 6))
         def _pick_out():
-            f = filedialog.askdirectory(parent=win, title="Where to save the comparison figure")
+            f = filedialog.askdirectory(
+                parent=win, title="Where to save the comparison figure")
             if f: st_outdir.set(f)
         ttk.Button(out_row, text="Browse", command=_pick_out, width=8).pack(side="left")
 
-        # ── Theme + colour row ────────────────────────────────────────────────
-        # Default the Compare theme to whatever the Analyse tab is using, so
-        # the two pipelines stay visually consistent unless the user changes it.
-        st_theme = tk.StringVar(
-            value=self.v_fig_theme.get() if hasattr(self, "v_fig_theme") else "Dark")
-
-        # Theme presets pick sensible default group colours; user can still
-        # override with the per-group pickers above.
-        _theme_default_colors = {
-            "Dark":        ("#e6edf3", "#79c0ff"),    # bright on dark bg
-            "Light":       ("#000000", "#3b6ed8"),    # dark on white bg (your lab style)
-            "Publication": ("#000000", "#666666"),    # black + grey, journal-friendly
-        }
-        def _on_theme_changed(*_):
-            t = st_theme.get()
-            ca, cb = _theme_default_colors.get(t, ("#000000", "#3b6ed8"))
-            st_color_a.set(ca); st_color_b.set(cb)
-            # update swatch labels (we only stored the swatches inside the
-            # closure, so re-walk the row to re-colour them)
-            for grp_card in (card_a, card_b):
-                for r in grp_card.winfo_children():
-                    for sub in r.winfo_children() if hasattr(r, "winfo_children") else []:
-                        if isinstance(sub, tk.Label) and sub.cget("relief") == "solid":
-                            tgt = ca if grp_card is card_a else cb
-                            try: sub.configure(bg=tgt)
-                            except Exception: pass
-
+        # ── Theme + group-management row ──────────────────────────────────────
         theme_row = tk.Frame(body, bg=BG)
         theme_row.pack(fill="x", pady=(8, 4))
         tk.Label(theme_row, text="Figure theme:", bg=BG, fg=MUTED,
@@ -2802,8 +2903,15 @@ class SPTPalmApp(tk.Tk):
                                    state="readonly", width=14)
         theme_combo.pack(side="left", padx=(6, 18))
         theme_combo.bind("<<ComboboxSelected>>", _on_theme_changed)
+        add_group_btn = ttk.Button(theme_row, text="+ Add group",
+                                   command=_add_group, width=14)
+        add_group_btn.pack(side="left", padx=(0, 12))
+        tk.Checkbutton(theme_row, text="PDF report", variable=st_pdf,
+                       bg=BG, fg=TXT, activebackground=BG, activeforeground=TXT,
+                       selectcolor=BG, font=F(10), bd=0,
+                       highlightthickness=0).pack(side="left", padx=(0, 12))
         tk.Label(theme_row,
-                 text="(per-group colours can still be customised above)",
+                 text="(per-group colours can still be overridden)",
                  bg=BG, fg=MUTED, font=F(9, "italic")).pack(side="left")
 
         # ── Panel toggles ─────────────────────────────────────────────────────
@@ -2815,8 +2923,10 @@ class SPTPalmApp(tk.Tk):
             r, c = divmod(i, 3)
             tk.Checkbutton(toggles, text=panel_labels[k], variable=panel_vars[k],
                            bg=BG, fg=TXT, activebackground=BG, activeforeground=TXT,
-                           selectcolor=BG, font=F(10), bd=0, highlightthickness=0
-                           ).grid(row=r, column=c + 1, sticky="w", padx=(8, 14), pady=2)
+                           selectcolor=BG, font=F(10), bd=0,
+                           highlightthickness=0
+                           ).grid(row=r, column=c + 1, sticky="w",
+                                  padx=(8, 14), pady=2)
 
         # ── Generate button ───────────────────────────────────────────────────
         gen_row = tk.Frame(body, bg=BG)
@@ -2834,7 +2944,7 @@ class SPTPalmApp(tk.Tk):
                  font=F(10, "bold")).pack(anchor="w", pady=(12, 2))
         log_box = scrolledtext.ScrolledText(
             body, bg=CARD, fg=MUTED, insertbackground=TXT, wrap="word",
-            font=FM(9), height=12, bd=0, relief="flat", highlightthickness=0)
+            font=FM(9), height=10, bd=0, relief="flat", highlightthickness=0)
         log_box.pack(fill="both", expand=True)
         log_box.configure(state="disabled")
 
@@ -2849,36 +2959,46 @@ class SPTPalmApp(tk.Tk):
             log_box.configure(state="disabled")
             log_box.see("end")
 
-        # Worker
+        # ── Worker ────────────────────────────────────────────────────────────
         def _on_generate():
-            folders_a = list(list_a.get(0, "end"))
-            folders_b = list(list_b.get(0, "end"))
-            if not folders_a or not folders_b:
-                messagebox.showerror("Compare", "Add at least one folder to each group.",
-                                     parent=win)
+            # Snapshot all groups
+            groups_snapshot = []
+            for i, g in enumerate(self._compare_groups):
+                folders = list(g["listbox"].get(0, "end"))
+                if not folders:
+                    messagebox.showerror(
+                        "Compare",
+                        f"Group '{g['label_var'].get() or i+1}' has no folders.",
+                        parent=win)
+                    return
+                groups_snapshot.append({
+                    "folders": folders,
+                    "label":   g["label_var"].get().strip() or f"Group {i+1}",
+                    "color":   g["color_var"].get(),
+                })
+            if len(groups_snapshot) < 2:
+                messagebox.showerror("Compare", "Need at least 2 groups.", parent=win)
                 return
+
             outdir = st_outdir.get().strip()
             if not outdir:
-                # Default: parent of first folder in group A
-                outdir = os.path.dirname(folders_a[0])
+                outdir = os.path.dirname(groups_snapshot[0]["folders"][0])
                 st_outdir.set(outdir)
 
-            panels = {k for k, v in panel_vars.items() if v.get()}
-            if not panels:
-                messagebox.showerror("Compare", "Enable at least one panel.", parent=win)
+            panels_chosen = {k for k, v in panel_vars.items() if v.get()}
+            if not panels_chosen:
+                messagebox.showerror("Compare", "Enable at least one panel.",
+                                     parent=win)
                 return
 
-            label_a = st_label_a.get().strip() or "Group A"
-            label_b = st_label_b.get().strip() or "Group B"
-            color_a = st_color_a.get()
-            color_b = st_color_b.get()
-            stem = f"compare_{label_a}_vs_{label_b}".replace(" ", "_")
+            stem_parts = [g["label"] for g in groups_snapshot]
+            stem = "compare_" + "_vs_".join(stem_parts).replace(" ", "_")
 
             gen_btn.configure(state="disabled")
             status_var.set("Running…")
-            _log(f"── Comparison started ──")
-            _log(f"  {label_a}: {len(folders_a)} folder(s)")
-            _log(f"  {label_b}: {len(folders_b)} folder(s)")
+            _log("── Comparison started ──")
+            for g in groups_snapshot:
+                _log(f"  {g['label']}: {len(g['folders'])} folder(s)")
 
             def _worker():
                 try:
@@ -2892,18 +3012,18 @@ class SPTPalmApp(tk.Tk):
                         self.after(0, lambda: status_var.set(f"{done}/{total}  {msg}"))
                         self.after(0, lambda: _log(f"  [{done}/{total}] {msg}"))
 
-                    fig, summary_df = compare_groups(
-                        folders_a, folders_b, label_a, label_b,
+                    fig, summary_df, stats = compare_groups(
+                        groups=groups_snapshot,
                         output_dir=outdir, output_stem=stem,
-                        panels=panels, theme=st_theme.get(),
-                        color_a=color_a, color_b=color_b,
+                        panels=panels_chosen, theme=st_theme.get(),
+                        pdf_report=st_pdf.get(),
                         progress_cb=_progress)
 
                     self.after(0, lambda: _log(
-                        f"  Done.  {summary_df.shape[0]} replicates analysed."))
-                    self.after(0, lambda: _log(f"  Output folder: {outdir}", color="#2ea043"))
+                        f"  Done. {summary_df.shape[0]} replicate(s) analysed."))
+                    self.after(0, lambda: _log(
+                        f"  Output folder: {outdir}", color="#2ea043"))
                     self.after(0, lambda: status_var.set("Complete"))
-                    # Try to show the result
                     png_path = os.path.join(outdir, f"{stem}.png")
                     if os.path.exists(png_path):
                         self.after(0, lambda: _show_result_image(png_path))
@@ -2925,15 +3045,18 @@ class SPTPalmApp(tk.Tk):
                 viewer.title(os.path.basename(png_path))
                 viewer.configure(bg=BG)
                 img = Image.open(png_path)
-                # Fit within 1400x900
                 max_w, max_h = 1400, 900
                 img.thumbnail((max_w, max_h), Image.LANCZOS)
                 photo = ImageTk.PhotoImage(img)
                 lbl = tk.Label(viewer, image=photo, bg=BG)
-                lbl.image = photo  # keep ref
+                lbl.image = photo
                 lbl.pack(padx=8, pady=8)
             except Exception as e:
                 _log(f"  (could not preview image: {e})")
+
+        # ── Initialise with two default groups ────────────────────────────────
+        _add_group()
+        _add_group()
 
     def _on_batch(self):
         if self._running:

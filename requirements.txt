@@ -18,3 +18,4 @@ Pillow
 psutil
 scikit-learn
 threadpoolctl      # dynamically expand BLAS pool during localisation
+tkinterdnd2        # drag-and-drop folders into the Compare tab
