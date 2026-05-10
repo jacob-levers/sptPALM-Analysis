@@ -1325,15 +1325,21 @@ def preprocess_and_localise_stream(stack, diameter=7, minmass=None, percentile=6
 
 
 def _localise_chunk(chunk, diameter, minmass, percentile, frame_offset):
-    """Localise one chunk and apply global frame offset.  tp.batch's internal
-    numpy/scipy operations use ALL CPU cores per frame via OpenBLAS/MKL — no
-    explicit pool needed."""
+    """Localise one chunk and apply global frame offset."""
     locs = tp.batch(chunk, diameter=diameter, minmass=minmass,
                     percentile=percentile, processes=1)
     if len(locs) > 0:
         locs = locs.copy()
         locs["frame"] += frame_offset
     return locs
+
+
+def _localise_chunk_mp(args):
+    """Picklable wrapper for multiprocessing.Pool.imap_unordered.
+    Returns (index, dataframe) so we can preserve order despite unordered iteration."""
+    idx, chunk, diameter, minmass, percentile, frame_offset = args
+    result = _localise_chunk(chunk, diameter, minmass, percentile, frame_offset)
+    return idx, result
 
 
 def localise_particles(stack, diameter=7, minmass=0.1, percentile=64,
@@ -1353,22 +1359,38 @@ def localise_particles(stack, diameter=7, minmass=0.1, percentile=64,
     offsets  = [i * chunk_size for i in range(len(chunks))]
     chunk_pairs = list(zip(chunks, offsets))
 
-    # Run chunks serially with BLAS pool dynamically expanded to N_CPUS.
-    # Per-frame numpy/scipy ops parallelise internally across all CPU cores.
-    # NOTE: chunk-level threading (ThreadPoolExecutor) consistently deadlocks
-    # tp.batch in PyInstaller frozen apps on Windows for reasons that resist
-    # diagnosis (some interaction with trackpy's internal state).  This
-    # BLAS-only approach is reliable but limited — small per-frame ops on
-    # 256×256 images don't benefit much from BLAS threading, so total CPU
-    # use is modest (~10-20% on a 12-core machine).  Acceptable trade-off
-    # for reliability.  True multi-core requires multiprocessing.Pool which
-    # has its own onefile-mode issues.
-    print(f"  BLAS pool : expanded to {N_CPUS} threads for localisation")
-    with _threadpool_limits(limits=N_CPUS):
-        chunk_results = [_localise_chunk(chunk, diameter, minmass, percentile, offset)
-                         for chunk, offset in _tqdm(chunk_pairs, total=n_chunks,
-                                                    desc="  Localising", unit="chunk",
-                                                    ncols=70)]
+    # ── True multi-core via multiprocessing.Pool ──────────────────────────────
+    # Each worker is a separate Python process with its own GIL — N workers
+    # genuinely use N CPU cores.  Spawn context is required for Windows + macOS
+    # frozen apps; PyInstaller's freeze_support (called in app_tk.py main)
+    # makes spawn workers reuse the parent's _MEIPASS extraction, so workers
+    # start in seconds rather than minutes.  Falls back to BLAS-pool serial
+    # if Pool creation fails for any reason.
+    n_workers = min(workers, n_chunks, N_CPUS)
+    chunk_results = [None] * n_chunks
+    use_mp_ok = False
+    try:
+        print(f"  Parallelism : multiprocessing.Pool × {n_workers} (spawn — true multi-core)")
+        print(f"  Spawning workers (one-time ~10-30s; chunks then process truly in parallel)...")
+        ctx = multiprocessing.get_context("spawn")
+        mp_args = [(i, c, diameter, minmass, percentile, o)
+                   for i, (c, o) in enumerate(chunk_pairs)]
+        with ctx.Pool(processes=n_workers) as pool:
+            for idx, result in _tqdm(
+                    pool.imap_unordered(_localise_chunk_mp, mp_args),
+                    total=n_chunks, desc="  Localising", unit="chunk", ncols=70):
+                chunk_results[idx] = result
+        use_mp_ok = True
+    except Exception as exc:
+        print(f"  multiprocessing failed ({type(exc).__name__}: {exc})")
+        print(f"  Falling back to BLAS-pool parallelism (slower, single-process)")
+
+    if not use_mp_ok:
+        with _threadpool_limits(limits=N_CPUS):
+            chunk_results = [_localise_chunk(chunk, diameter, minmass, percentile, offset)
+                             for chunk, offset in _tqdm(chunk_pairs, total=n_chunks,
+                                                        desc="  Localising", unit="chunk",
+                                                        ncols=70)]
 
     valid = [df for df in chunk_results if df is not None and len(df) > 0]
     result = pd.concat(valid, ignore_index=True) if valid else pd.DataFrame()
