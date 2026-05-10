@@ -224,29 +224,11 @@ for _blas_env in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
                   "VECLIB_MAXIMUM_THREADS"):
     os.environ.setdefault(_blas_env, "1")
 
-# ── Eager-load sptpalm_analysis at app startup ────────────────────────────────
-# Lazy `from sptpalm_analysis import ...` inside the worker thread can hang
-# silently in PyInstaller onefile mode (the heavy chain of imports — numpy,
-# scipy, trackpy, threadpoolctl, etc. — happens inside a thread with redirected
-# stdout, making any failure invisible).  Doing the import at module level
-# means any startup error appears immediately and the worker just uses already-
-# imported names.
+# Make sure sptpalm_analysis is on sys.path (PyInstaller datas put it at MEIPASS)
 if getattr(sys, "frozen", False):
-    # Make sure sptpalm_analysis is on sys.path (PyInstaller datas put it at MEIPASS)
     _meipass = getattr(sys, "_MEIPASS", None)
     if _meipass and _meipass not in sys.path:
         sys.path.insert(0, _meipass)
-    # Pre-import so the heavy module graph (numpy, scipy, trackpy, threadpoolctl,
-    # imagecodecs, aicspylibczi) loads at process startup — not lazily inside a
-    # GUI thread with captured stdout where errors are invisible.
-    try:
-        import sptpalm_analysis as _sptpalm_preload  # noqa: F401
-    except Exception as _e:
-        # Don't crash startup; surface the error in a message box if Tk is up.
-        # The bootloader's error dialog will catch this if it happens before Tk.
-        import traceback as _tb
-        _tb.print_exc()
-        raise
 
 # Must be set before any other imports on macOS
 if sys.platform == "darwin":

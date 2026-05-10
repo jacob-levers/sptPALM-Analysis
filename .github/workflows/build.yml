@@ -119,8 +119,10 @@ jobs:
           Write-Host "Launching $exe (onefile bootloader will extract to TEMP — first launch is slower)..."
           $proc = Start-Process -FilePath $exe -PassThru -WindowStyle Hidden
 
-          # Onefile takes longer to start (extracts to %TEMP%): give 60s
-          $deadline = (Get-Date).AddSeconds(60)
+          # Onefile cold-start: bootloader extracts ~200 MB of files to %TEMP%
+          # then Python loads numpy + scipy + matplotlib + trackpy from a
+          # cold disk cache.  120s is generous but not flaky.
+          $deadline = (Get-Date).AddSeconds(120)
           $ready = $false
           while ((Get-Date) -lt $deadline) {
             if (Test-Path $marker) { $ready = $true; break }
