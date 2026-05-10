@@ -2766,6 +2766,46 @@ class SPTPalmApp(tk.Tk):
             if f: st_outdir.set(f)
         ttk.Button(out_row, text="Browse", command=_pick_out, width=8).pack(side="left")
 
+        # ── Theme + colour row ────────────────────────────────────────────────
+        # Default the Compare theme to whatever the Analyse tab is using, so
+        # the two pipelines stay visually consistent unless the user changes it.
+        st_theme = tk.StringVar(
+            value=self.v_fig_theme.get() if hasattr(self, "v_fig_theme") else "Dark")
+
+        # Theme presets pick sensible default group colours; user can still
+        # override with the per-group pickers above.
+        _theme_default_colors = {
+            "Dark":        ("#e6edf3", "#79c0ff"),    # bright on dark bg
+            "Light":       ("#000000", "#3b6ed8"),    # dark on white bg (your lab style)
+            "Publication": ("#000000", "#666666"),    # black + grey, journal-friendly
+        }
+        def _on_theme_changed(*_):
+            t = st_theme.get()
+            ca, cb = _theme_default_colors.get(t, ("#000000", "#3b6ed8"))
+            st_color_a.set(ca); st_color_b.set(cb)
+            # update swatch labels (we only stored the swatches inside the
+            # closure, so re-walk the row to re-colour them)
+            for grp_card in (card_a, card_b):
+                for r in grp_card.winfo_children():
+                    for sub in r.winfo_children() if hasattr(r, "winfo_children") else []:
+                        if isinstance(sub, tk.Label) and sub.cget("relief") == "solid":
+                            tgt = ca if grp_card is card_a else cb
+                            try: sub.configure(bg=tgt)
+                            except Exception: pass
+
+        theme_row = tk.Frame(body, bg=BG)
+        theme_row.pack(fill="x", pady=(8, 4))
+        tk.Label(theme_row, text="Figure theme:", bg=BG, fg=MUTED,
+                 font=F(10)).pack(side="left")
+        theme_combo = ttk.Combobox(theme_row, textvariable=st_theme,
+                                   values=["Dark", "Light", "Publication"],
+                                   state="readonly", width=14)
+        theme_combo.pack(side="left", padx=(6, 18))
+        theme_combo.bind("<<ComboboxSelected>>", _on_theme_changed)
+        tk.Label(theme_row,
+                 text="(per-group colours can still be customised above)",
+                 bg=BG, fg=MUTED, font=F(9, "italic")).pack(side="left")
+
         # ── Panel toggles ─────────────────────────────────────────────────────
         toggles = tk.Frame(body, bg=BG)
         toggles.pack(fill="x", pady=(8, 4))
@@ -2855,7 +2895,7 @@ class SPTPalmApp(tk.Tk):
                     fig, summary_df = compare_groups(
                         folders_a, folders_b, label_a, label_b,
                         output_dir=outdir, output_stem=stem,
-                        panels=panels,
+                        panels=panels, theme=st_theme.get(),
                         color_a=color_a, color_b=color_b,
                         progress_cb=_progress)
 

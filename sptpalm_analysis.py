@@ -2668,19 +2668,52 @@ def _stat_test(a, b):
         return (np.nan, "")
 
 
+def _theme_palette(theme):
+    """Return a dict with figure colours matching the Analyse-mode themes
+    ('Dark', 'Light', 'Publication')."""
+    t = (theme or "Dark")
+    # Accept various spellings
+    t = {"dark": "Dark", "light": "Light", "publication": "Publication"}.get(t.lower(), t)
+    if t == "Light":
+        return dict(theme="Light",
+                    BG="#ffffff", PNL="#f6f8fa",
+                    TXT="#24292f", GRD="#d0d7de",
+                    BAR_FILL="#ffffff", SIG="#000000",
+                    FONT="sans-serif")
+    if t == "Publication":
+        return dict(theme="Publication",
+                    BG="#ffffff", PNL="#ffffff",
+                    TXT="#000000", GRD="#cccccc",
+                    BAR_FILL="#ffffff", SIG="#000000",
+                    FONT="serif")
+    # Default: Dark
+    return dict(theme="Dark",
+                BG="#0d1117", PNL="#161b22",
+                TXT="#e6edf3", GRD="#30363d",
+                BAR_FILL="#161b22", SIG="#e6edf3",
+                FONT="monospace")
+
+
 def _bar_with_dots(ax, data_a, data_b, label_a, label_b,
-                   color_a="#000000", color_b="#3b6ed8", ylabel=""):
+                   color_a="#000000", color_b="#3b6ed8", ylabel="",
+                   palette=None):
     """Bar chart with mean ± SEM and individual replicate dots.  Adds t-test
-    significance stars when n≥2 per group."""
+    significance stars when n≥2 per group.  Bar fill matches the active
+    theme so charts stay readable on dark backgrounds."""
+    pal = palette or _theme_palette("Dark")
+    fill = pal["BAR_FILL"]
+    sig_col = pal["SIG"]
+
     a = np.asarray(data_a, dtype=float); a = a[np.isfinite(a)]
     b = np.asarray(data_b, dtype=float); b = b[np.isfinite(b)]
     means = [a.mean() if len(a) else 0, b.mean() if len(b) else 0]
     sems  = [a.std(ddof=1)/np.sqrt(len(a)) if len(a) > 1 else 0,
              b.std(ddof=1)/np.sqrt(len(b)) if len(b) > 1 else 0]
     x = [0, 1]
-    bars = ax.bar(x, means, yerr=sems, capsize=4,
-                  color=["white", "white"],
-                  edgecolor=[color_a, color_b], linewidth=1.5)
+    ax.bar(x, means, yerr=sems, capsize=4,
+           color=[fill, fill],
+           edgecolor=[color_a, color_b], linewidth=1.5,
+           ecolor=sig_col)
     # Scatter dots, jittered
     rng = np.random.default_rng(0)
     if len(a):
@@ -2698,14 +2731,16 @@ def _bar_with_dots(ax, data_a, data_b, label_a, label_b,
         top = max([a.max() if len(a) else 0, b.max() if len(b) else 0]) * 1.05
         if top <= 0:
             top = max(means) * 1.5 if max(means) > 0 else 1
-        ax.plot([0, 0, 1, 1], [top, top * 1.03, top * 1.03, top], color="black", lw=0.8)
-        ax.text(0.5, top * 1.05, stars, ha="center", va="bottom", fontsize=11)
+        ax.plot([0, 0, 1, 1], [top, top * 1.03, top * 1.03, top],
+                color=sig_col, lw=0.8)
+        ax.text(0.5, top * 1.05, stars, ha="center", va="bottom",
+                fontsize=11, color=sig_col)
         ax.set_ylim(0, top * 1.18)
 
 
 def compare_groups(folders_a, folders_b, label_a="Group A", label_b="Group B",
                    output_dir=None, output_stem="comparison",
-                   panels=None, theme="light",
+                   panels=None, theme="Dark",
                    color_a="#000000", color_b="#3b6ed8",
                    progress_cb=None):
     """Compare two groups of analysis output folders and render a multi-panel
@@ -2795,12 +2830,21 @@ def compare_groups(folders_a, folders_b, label_a="Group A", label_b="Group B",
     ncols = 3 if n_plots > 4 else 2
     nrows = (n_plots + ncols - 1) // ncols
 
-    if theme == "dark":
-        plt.style.use("dark_background")
-    else:
-        plt.style.use("default")
+    pal = _theme_palette(theme)
+    plt.rcParams.update({
+        "text.color":      pal["TXT"], "axes.labelcolor": pal["TXT"],
+        "xtick.color":     pal["TXT"], "ytick.color":     pal["TXT"],
+        "axes.titlecolor": pal["TXT"],
+        "axes.edgecolor":  pal["GRD"], "axes.facecolor":  pal["PNL"],
+        "figure.facecolor": pal["BG"], "figure.edgecolor": pal["BG"],
+        "savefig.facecolor": pal["BG"], "savefig.edgecolor": pal["BG"],
+        "grid.color":      pal["GRD"], "grid.alpha": 0.4,
+        "font.family":     pal["FONT"],
+        "legend.facecolor": pal["PNL"], "legend.edgecolor": pal["GRD"],
+    })
 
-    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 4.2, nrows * 3.6))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 4.2, nrows * 3.6),
+                             facecolor=pal["BG"])
     axes = np.array(axes).reshape(-1)
     for ax in axes[n_plots:]:
         ax.axis("off")
@@ -2851,7 +2895,7 @@ def compare_groups(folders_a, folders_b, label_a="Group A", label_b="Group B",
         a = summary_df.loc[summary_df["group"] == label_a, "auc_msd"].values
         b = summary_df.loc[summary_df["group"] == label_b, "auc_msd"].values
         _bar_with_dots(ax, a, b, label_a, label_b, color_a, color_b,
-                       ylabel="AUC (µm²·s)")
+                       ylabel="AUC (µm²·s)", palette=pal)
         ax.set_title("Area Under the Curve")
 
     # ── 3. LogD frequency distribution ────────────────────────────────────────
@@ -2873,7 +2917,7 @@ def compare_groups(folders_a, folders_b, label_a="Group A", label_b="Group B",
             centers = 0.5 * (edges[:-1] + edges[1:])
             frac = counts / counts.sum() if counts.sum() else counts
             ax.plot(centers, frac, "-o", color=color, label=grp, ms=4, lw=1.2)
-        ax.axvline(np.log10(0.05), color="gray", ls="--", lw=0.8)  # mobile/immobile threshold
+        ax.axvline(np.log10(0.05), color=pal["GRD"], ls="--", lw=0.8)  # mobile/immobile threshold
         ax.set_xlabel("log₁₀ D  (µm²/s)")
         ax.set_ylabel("Relative frequency")
         ax.set_title("LogD Frequency Distribution")
@@ -2885,7 +2929,7 @@ def compare_groups(folders_a, folders_b, label_a="Group A", label_b="Group B",
         a = summary_df.loc[summary_df["group"] == label_a, "mob_immob_ratio"].values
         b = summary_df.loc[summary_df["group"] == label_b, "mob_immob_ratio"].values
         _bar_with_dots(ax, a, b, label_a, label_b, color_a, color_b,
-                       ylabel="Mobile/Immobile ratio")
+                       ylabel="Mobile/Immobile ratio", palette=pal)
         ax.set_title("Mobile/Immobile Ratio")
 
     # ── 5. Motion class fractions (grouped bars) ──────────────────────────────
@@ -2906,13 +2950,13 @@ def compare_groups(folders_a, folders_b, label_a="Group A", label_b="Group B",
         if len(fa):
             ax.bar(x - w/2, fa.mean(axis=0), w,
                    yerr=fa.std(axis=0, ddof=1)/np.sqrt(len(fa)) if len(fa) > 1 else None,
-                   color="white", edgecolor=color_a, linewidth=1.5,
-                   capsize=3, label=label_a)
+                   color=pal["BAR_FILL"], edgecolor=color_a, linewidth=1.5,
+                   ecolor=pal["SIG"], capsize=3, label=label_a)
         if len(fb):
             ax.bar(x + w/2, fb.mean(axis=0), w,
                    yerr=fb.std(axis=0, ddof=1)/np.sqrt(len(fb)) if len(fb) > 1 else None,
-                   color="white", edgecolor=color_b, linewidth=1.5,
-                   capsize=3, label=label_b)
+                   color=pal["BAR_FILL"], edgecolor=color_b, linewidth=1.5,
+                   ecolor=pal["SIG"], capsize=3, label=label_b)
         # Scatter dots
         rng = np.random.default_rng(1)
         for i in range(len(classes)):
@@ -2974,7 +3018,7 @@ def compare_groups(folders_a, folders_b, label_a="Group A", label_b="Group B",
         else:
             ax.text(0.5, 0.5, "No JDD data\n(re-run analysis to generate)",
                     ha="center", va="center", transform=ax.transAxes,
-                    color="gray", fontsize=9)
+                    color=pal["GRD"], fontsize=9)
             ax.set_xticks([]); ax.set_yticks([])
             ax.set_title("Jump Distance Distribution")
 
@@ -3011,7 +3055,7 @@ def compare_groups(folders_a, folders_b, label_a="Group A", label_b="Group B",
         else:
             ax.text(0.5, 0.5, "No dwell-time data\n(re-run analysis to generate)",
                     ha="center", va="center", transform=ax.transAxes,
-                    color="gray", fontsize=9)
+                    color=pal["GRD"], fontsize=9)
             ax.set_xticks([]); ax.set_yticks([])
             ax.set_title("Dwell Time Survival")
 
@@ -3041,12 +3085,17 @@ def compare_groups(folders_a, folders_b, label_a="Group A", label_b="Group B",
         else:
             ax.text(0.5, 0.5, "No turning-angle data\n(re-run analysis to generate)",
                     ha="center", va="center", transform=ax.transAxes,
-                    color="gray", fontsize=9)
+                    color=pal["GRD"], fontsize=9)
             ax.set_xticks([]); ax.set_yticks([])
             ax.set_title("Turning Angle Distribution")
 
     fig.suptitle(f"{label_a}  (n={len(summaries_a)})   vs   {label_b}  (n={len(summaries_b)})",
-                 fontsize=12, fontweight="bold")
+                 fontsize=12, fontweight="bold", color=pal["TXT"])
+    # Make every subplot's background match the theme panel colour
+    for ax in axes[:n_plots]:
+        ax.set_facecolor(pal["PNL"])
+        for spine in ax.spines.values():
+            spine.set_edgecolor(pal["GRD"])
     fig.tight_layout(rect=[0, 0, 1, 0.96])
 
     # ── Save outputs ──────────────────────────────────────────────────────────
