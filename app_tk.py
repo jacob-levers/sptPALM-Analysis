@@ -2746,18 +2746,24 @@ class SPTPalmApp(_APP_BASE):
                      highlightcolor=ACC, insertbackground=ACC
                      ).pack(side="left", padx=(4, 12))
             tk.Label(row, text="Colour:", bg=CARD, fg=MUTED, font=F(10)).pack(side="left")
-            color_swatch = tk.Label(row, bg=color_var.get(), width=3,
-                                    relief="solid", bd=1)
+            # Click the swatch itself to open the colour picker — no separate
+            # button.  Slightly larger size + hand cursor + tooltip make it
+            # discoverable as a clickable target.
+            color_swatch = tk.Label(row, bg=color_var.get(), width=4, height=1,
+                                    relief="solid", bd=1, cursor="hand2")
             color_swatch.pack(side="left", padx=(4, 6))
-            def _pick_color():
+            def _pick_color(_event=None):
                 from tkinter import colorchooser
                 c = colorchooser.askcolor(parent=win, color=color_var.get(),
                                           title="Pick group colour")
                 if c and c[1]:
                     color_var.set(c[1])
                     color_swatch.configure(bg=c[1])
-            ttk.Button(row, text="Pick", command=_pick_color,
-                       width=5).pack(side="left")
+            color_swatch.bind("<Button-1>", _pick_color)
+            try:
+                _Tooltip(color_swatch, "Click to change colour")
+            except Exception:
+                pass
 
             # Folder list
             list_frame = tk.Frame(card, bg=CARD)
