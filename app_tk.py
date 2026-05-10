@@ -1246,7 +1246,10 @@ class SPTPalmApp(tk.Tk):
                    command=self._browse_outdir).pack(side="left", padx=(0, 14))
         self._batch_btn = ttk.Button(parent, text="Batch",
                                      command=self._on_batch, width=7)
-        self._batch_btn.pack(side="left", padx=(0, 14))
+        self._batch_btn.pack(side="left", padx=(0, 6))
+        self._compare_btn = ttk.Button(parent, text="Compare",
+                                       command=self._open_compare_window, width=8)
+        self._compare_btn.pack(side="left", padx=(0, 14))
 
     def _build_bottom_bar(self, parent):
         # Grid layout so the button is always in column 0 and cannot be pushed off
@@ -2521,6 +2524,293 @@ class SPTPalmApp(tk.Tk):
 
     # ── Batch processing ──────────────────────────────────────────────────────
 
+    def _open_compare_window(self):
+        """Open the Compare-analyses dialog: two groups of analysis output
+        folders → multi-panel comparative figure."""
+        # If already open, just bring it to the front
+        if getattr(self, "_compare_win", None) is not None:
+            try:
+                if self._compare_win.winfo_exists():
+                    self._compare_win.lift()
+                    self._compare_win.focus_force()
+                    return
+            except Exception:
+                pass
+
+        win = tk.Toplevel(self)
+        self._compare_win = win
+        win.title("Compare Analyses")
+        win.configure(bg=BG)
+        win.geometry("980x780")
+        win.transient(self)
+
+        # State
+        st_label_a = tk.StringVar(value="Pre")
+        st_label_b = tk.StringVar(value="Post")
+        st_outdir  = tk.StringVar(value="")
+        st_color_a = tk.StringVar(value="#000000")
+        st_color_b = tk.StringVar(value="#3b6ed8")
+        panel_keys = ["msd", "auc", "logd_dist", "mob_immob",
+                      "motion_classes", "track_length",
+                      "jdd", "dwell_cdf", "turning_angles"]
+        panel_labels = {
+            "msd":             "MSD curve overlay",
+            "auc":             "AUC bar chart",
+            "logd_dist":       "LogD distribution",
+            "mob_immob":       "Mobile/Immobile ratio",
+            "motion_classes":  "Motion class fractions",
+            "track_length":    "Track length CDF",
+            "jdd":             "Jump distance distribution",
+            "dwell_cdf":       "Dwell time survival",
+            "turning_angles":  "Turning angle distribution",
+        }
+        panel_vars = {k: tk.BooleanVar(value=True) for k in panel_keys}
+
+        # Header
+        hdr = tk.Frame(win, bg=SIDEBAR)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="Compare Analyses", bg=SIDEBAR, fg=ACC,
+                 font=F(16, "bold")).pack(side="left", padx=18, pady=10)
+        tk.Label(hdr, text="Pick two groups of analysis output folders and overlay them",
+                 bg=SIDEBAR, fg=MUTED, font=F(10)).pack(side="left", padx=(6, 0), pady=10)
+        tk.Frame(win, bg=BORDER, height=1).pack(fill="x")
+
+        body = tk.Frame(win, bg=BG)
+        body.pack(fill="both", expand=True, padx=14, pady=10)
+
+        # ── Two-group selector row ────────────────────────────────────────────
+        groups_row = tk.Frame(body, bg=BG)
+        groups_row.pack(fill="x")
+        groups_row.columnconfigure(0, weight=1)
+        groups_row.columnconfigure(1, weight=1)
+
+        list_a = list_b = None
+        def _make_group_card(parent, title, lbl_var, color_var, side):
+            card = tk.Frame(parent, bg=CARD, bd=0, highlightthickness=1,
+                            highlightbackground=BORDER)
+            tk.Label(card, text=title, bg=CARD, fg=ACC,
+                     font=F(11, "bold")).pack(anchor="w", padx=10, pady=(8, 2))
+            row = tk.Frame(card, bg=CARD)
+            row.pack(fill="x", padx=10, pady=(0, 4))
+            tk.Label(row, text="Label:", bg=CARD, fg=MUTED, font=F(10)).pack(side="left")
+            tk.Entry(row, textvariable=lbl_var, width=14, bg=BG, fg=TXT,
+                     relief="flat", bd=0, font=F(10),
+                     highlightthickness=1, highlightbackground=BORDER,
+                     highlightcolor=ACC, insertbackground=ACC).pack(side="left", padx=(4, 12))
+            tk.Label(row, text="Color:", bg=CARD, fg=MUTED, font=F(10)).pack(side="left")
+            color_swatch = tk.Label(row, bg=color_var.get(), width=3, relief="solid", bd=1)
+            color_swatch.pack(side="left", padx=(4, 6))
+            def _pick_color():
+                from tkinter import colorchooser
+                c = colorchooser.askcolor(parent=win, color=color_var.get(),
+                                          title="Pick group color")
+                if c and c[1]:
+                    color_var.set(c[1])
+                    color_swatch.configure(bg=c[1])
+            ttk.Button(row, text="Pick", command=_pick_color, width=5).pack(side="left")
+
+            list_frame = tk.Frame(card, bg=CARD)
+            list_frame.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+            sb = tk.Scrollbar(list_frame, orient="vertical")
+            sb.pack(side="right", fill="y")
+            lb = tk.Listbox(list_frame, bg=BG, fg=TXT, selectbackground=ACC,
+                            selectforeground="white", relief="flat", bd=0,
+                            font=F(9), height=8, yscrollcommand=sb.set,
+                            selectmode="extended", activestyle="none",
+                            highlightthickness=1, highlightbackground=BORDER)
+            lb.pack(side="left", fill="both", expand=True)
+            sb.configure(command=lb.yview)
+
+            btns = tk.Frame(card, bg=CARD)
+            btns.pack(fill="x", padx=10, pady=(0, 10))
+            def _add():
+                f = filedialog.askdirectory(
+                    parent=win, title=f"Add folder to {lbl_var.get()}")
+                if f and f not in lb.get(0, "end"):
+                    lb.insert("end", f)
+            def _add_many():
+                # Pick a parent and add every immediate subfolder that has a data/ dir
+                parent = filedialog.askdirectory(
+                    parent=win, title="Select parent folder (will add all valid subfolders)")
+                if not parent: return
+                added = 0
+                for name in sorted(os.listdir(parent)):
+                    sub = os.path.join(parent, name)
+                    if not os.path.isdir(sub): continue
+                    if os.path.isdir(os.path.join(sub, "data")) or any(
+                            f.endswith("_diffusion_summary.csv")
+                            for f in os.listdir(sub) if os.path.isfile(os.path.join(sub, f))):
+                        if sub not in lb.get(0, "end"):
+                            lb.insert("end", sub)
+                            added += 1
+                if added == 0:
+                    messagebox.showinfo("Add subfolders",
+                        "No analysis folders detected as direct children of that path.",
+                        parent=win)
+            def _remove():
+                for i in reversed(lb.curselection()):
+                    lb.delete(i)
+            def _clear():
+                lb.delete(0, "end")
+            ttk.Button(btns, text="+ Add",       command=_add,      width=8).pack(side="left", padx=(0, 4))
+            ttk.Button(btns, text="+ Add many",  command=_add_many, width=10).pack(side="left", padx=(0, 4))
+            ttk.Button(btns, text="− Remove",    command=_remove,   width=9).pack(side="left", padx=(0, 4))
+            ttk.Button(btns, text="Clear",       command=_clear,    width=7).pack(side="left")
+            return card, lb
+
+        card_a, list_a = _make_group_card(groups_row, "Group A", st_label_a, st_color_a, "left")
+        card_b, list_b = _make_group_card(groups_row, "Group B", st_label_b, st_color_b, "right")
+        card_a.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        card_b.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+
+        # ── Output folder ─────────────────────────────────────────────────────
+        out_row = tk.Frame(body, bg=BG)
+        out_row.pack(fill="x", pady=(10, 4))
+        tk.Label(out_row, text="Output folder:", bg=BG, fg=MUTED,
+                 font=F(10)).pack(side="left")
+        tk.Entry(out_row, textvariable=st_outdir, bg=CARD, fg=TXT,
+                 insertbackground=ACC, relief="flat", bd=0, font=F(10),
+                 highlightthickness=1, highlightbackground=BORDER,
+                 highlightcolor=ACC).pack(side="left", fill="x", expand=True, padx=(6, 6))
+        def _pick_out():
+            f = filedialog.askdirectory(parent=win, title="Where to save the comparison figure")
+            if f: st_outdir.set(f)
+        ttk.Button(out_row, text="Browse", command=_pick_out, width=8).pack(side="left")
+
+        # ── Panel toggles ─────────────────────────────────────────────────────
+        toggles = tk.Frame(body, bg=BG)
+        toggles.pack(fill="x", pady=(8, 4))
+        tk.Label(toggles, text="Panels:", bg=BG, fg=MUTED,
+                 font=F(10, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 8))
+        for i, k in enumerate(panel_keys):
+            r, c = divmod(i, 3)
+            tk.Checkbutton(toggles, text=panel_labels[k], variable=panel_vars[k],
+                           bg=BG, fg=TXT, activebackground=BG, activeforeground=TXT,
+                           selectcolor=BG, font=F(10), bd=0, highlightthickness=0
+                           ).grid(row=r, column=c + 1, sticky="w", padx=(8, 14), pady=2)
+
+        # ── Generate button ───────────────────────────────────────────────────
+        gen_row = tk.Frame(body, bg=BG)
+        gen_row.pack(fill="x", pady=(10, 6))
+        gen_btn = ttk.Button(gen_row, text="▶  Generate Comparison",
+                             style="Run.TButton",
+                             command=lambda: _on_generate())
+        gen_btn.pack(side="left")
+        status_var = tk.StringVar(value="")
+        tk.Label(gen_row, textvariable=status_var, bg=BG, fg=MUTED,
+                 font=F(10)).pack(side="left", padx=(12, 0))
+
+        # ── Log ───────────────────────────────────────────────────────────────
+        tk.Label(body, text="Log", bg=BG, fg=MUTED,
+                 font=F(10, "bold")).pack(anchor="w", pady=(12, 2))
+        log_box = scrolledtext.ScrolledText(
+            body, bg=CARD, fg=MUTED, insertbackground=TXT, wrap="word",
+            font=FM(9), height=12, bd=0, relief="flat", highlightthickness=0)
+        log_box.pack(fill="both", expand=True)
+        log_box.configure(state="disabled")
+
+        def _log(text, color=None):
+            log_box.configure(state="normal")
+            if color:
+                tag = f"c_{color.lstrip('#')}"
+                log_box.tag_configure(tag, foreground=color)
+                log_box.insert("end", text + "\n", tag)
+            else:
+                log_box.insert("end", text + "\n")
+            log_box.configure(state="disabled")
+            log_box.see("end")
+
+        # Worker
+        def _on_generate():
+            folders_a = list(list_a.get(0, "end"))
+            folders_b = list(list_b.get(0, "end"))
+            if not folders_a or not folders_b:
+                messagebox.showerror("Compare", "Add at least one folder to each group.",
+                                     parent=win)
+                return
+            outdir = st_outdir.get().strip()
+            if not outdir:
+                # Default: parent of first folder in group A
+                outdir = os.path.dirname(folders_a[0])
+                st_outdir.set(outdir)
+
+            panels = {k for k, v in panel_vars.items() if v.get()}
+            if not panels:
+                messagebox.showerror("Compare", "Enable at least one panel.", parent=win)
+                return
+
+            label_a = st_label_a.get().strip() or "Group A"
+            label_b = st_label_b.get().strip() or "Group B"
+            color_a = st_color_a.get()
+            color_b = st_color_b.get()
+            stem = f"compare_{label_a}_vs_{label_b}".replace(" ", "_")
+
+            gen_btn.configure(state="disabled")
+            status_var.set("Running…")
+            _log(f"── Comparison started ──")
+            _log(f"  {label_a}: {len(folders_a)} folder(s)")
+            _log(f"  {label_b}: {len(folders_b)} folder(s)")
+
+            def _worker():
+                try:
+                    base = (sys._MEIPASS if getattr(sys, "frozen", False)
+                            else os.path.dirname(os.path.abspath(__file__)))
+                    if base not in sys.path:
+                        sys.path.insert(0, base)
+                    from sptpalm_analysis import compare_groups
+
+                    def _progress(done, total, msg):
+                        self.after(0, lambda: status_var.set(f"{done}/{total}  {msg}"))
+                        self.after(0, lambda: _log(f"  [{done}/{total}] {msg}"))
+
+                    fig, summary_df = compare_groups(
+                        folders_a, folders_b, label_a, label_b,
+                        output_dir=outdir, output_stem=stem,
+                        panels=panels,
+                        color_a=color_a, color_b=color_b,
+                        progress_cb=_progress)
+
+                    self.after(0, lambda: _log(
+                        f"  Done.  {summary_df.shape[0]} replicates analysed."))
+                    self.after(0, lambda: _log(f"  Output folder: {outdir}", color="#2ea043"))
+                    self.after(0, lambda: status_var.set("Complete"))
+                    # Try to show the result
+                    png_path = os.path.join(outdir, f"{stem}.png")
+                    if os.path.exists(png_path):
+                        self.after(0, lambda: _show_result_image(png_path))
+                except Exception as exc:
+                    import traceback as _tb
+                    err = _tb.format_exc()
+                    self.after(0, lambda: _log(f"FAILED: {exc}", color="#f85149"))
+                    self.after(0, lambda: _log(err))
+                    self.after(0, lambda: status_var.set("Failed"))
+                finally:
+                    self.after(0, lambda: gen_btn.configure(state="normal"))
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        def _show_result_image(png_path):
+            try:
+                from PIL import Image, ImageTk
+                viewer = tk.Toplevel(win)
+                viewer.title(os.path.basename(png_path))
+                viewer.configure(bg=BG)
+                img = Image.open(png_path)
+                # Fit within 1400x900
+                max_w, max_h = 1400, 900
+                img.thumbnail((max_w, max_h), Image.LANCZOS)
+                photo = ImageTk.PhotoImage(img)
+                lbl = tk.Label(viewer, image=photo, bg=BG)
+                lbl.image = photo  # keep ref
+                lbl.pack(padx=8, pady=8)
+            except Exception as e:
+                _log(f"  (could not preview image: {e})")
+
+        def _on_close():
+            self._compare_win = None
+            win.destroy()
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+
     def _on_batch(self):
         if self._running:
             return
@@ -2731,6 +3021,44 @@ class SPTPalmApp(tk.Tk):
                     if len(b_cluster_stats_df):
                         b_cluster_stats_df.to_csv(
                             os.path.join(data_dir, f"{stem}_cluster_stats.csv"), index=False)
+
+                    # Ensemble MSD CSV (needed by the Compare feature)
+                    (emsd_df.to_frame("msd_um2")
+                            .reset_index(names="lag_frame")
+                            .to_csv(os.path.join(data_dir, f"{stem}_ensemble_msd.csv"),
+                                    index=False))
+
+                    # Extra outputs for the Compare tab (params, JDD, dwell, turning)
+                    import json as _b_json
+                    import pandas as _pd
+                    with open(os.path.join(data_dir, f"{stem}_params.json"), "w") as _bpf:
+                        _b_json.dump({
+                            "stem": stem,
+                            "pixel_size_um":     float(px),
+                            "frame_interval_s":  float(fi),
+                            "diameter":          int(diameter),
+                            "minmass":           float(self.v_minmass.get()),
+                            "search_range":      int(self.v_search_range.get()),
+                            "memory":            int(self.v_memory.get()),
+                            "min_track_length":  int(self.v_min_track.get()),
+                            "max_lagtime":       int(self.v_max_lagtime.get()),
+                            "n_localisations":   int(len(locs)),
+                            "n_tracks":          int(diff_df.shape[0]),
+                            "n_frames":          int(n_frames) if "n_frames" in dir() else int(len(tracks)),
+                        }, _bpf, indent=2)
+                    if jdd:
+                        with open(os.path.join(data_dir, f"{stem}_jdd.json"), "w") as _bjf:
+                            _b_json.dump({k: (list(v) if hasattr(v, "__iter__") and not isinstance(v, str) else v)
+                                          for k, v in jdd.items()}, _bjf, indent=2)
+                    if b_dwell_df is not None and len(b_dwell_df):
+                        b_dwell_df.to_csv(
+                            os.path.join(data_dir, f"{stem}_dwell_times.csv"), index=False)
+                    if b_ta is not None and len(b_ta):
+                        _pd.DataFrame({"turning_angle_rad": b_ta}).to_csv(
+                            os.path.join(data_dir, f"{stem}_turning_angles.csv"), index=False)
+                    if b_mf is not None and len(b_mf):
+                        b_mf.to_csv(
+                            os.path.join(data_dir, f"{stem}_mobile_fraction.csv"), index=False)
 
                     fig_data = make_figure(proj_sample, tracks, imsd_df, emsd_df, diff_df,
                                           px, fi, roi_mask=roi_mask,
@@ -3525,6 +3853,42 @@ class SPTPalmApp(tk.Tk):
             if len(cluster_stats_df):
                 cluster_stats_df.to_csv(
                     os.path.join(data_dir, f"{stem}_cluster_stats.csv"), index=False)
+
+            # ── Extra outputs for the Compare tab ─────────────────────────────
+            # These let the Compare feature reload everything from disk without
+            # re-running the analysis pipeline.
+            import json as _json
+            import pandas as _pd
+            params_path = os.path.join(data_dir, f"{stem}_params.json")
+            with open(params_path, "w") as _pf:
+                _json.dump({
+                    "stem": stem,
+                    "pixel_size_um":     float(px),
+                    "frame_interval_s":  float(fi),
+                    "diameter":          int(diameter),
+                    "minmass":           float(self.v_minmass.get()),
+                    "search_range":      int(self.v_search_range.get()),
+                    "memory":            int(self.v_memory.get()),
+                    "min_track_length":  int(self.v_min_track.get()),
+                    "max_lagtime":       int(self.v_max_lagtime.get()),
+                    "n_localisations":   int(len(locs)),
+                    "n_tracks":          int(diff_df.shape[0]),
+                    "n_frames":          int(n_frames),
+                }, _pf, indent=2)
+            if jdd:
+                jdd_path = os.path.join(data_dir, f"{stem}_jdd.json")
+                with open(jdd_path, "w") as _jf:
+                    _json.dump({k: (list(v) if hasattr(v, "__iter__") and not isinstance(v, str) else v)
+                                for k, v in jdd.items()}, _jf, indent=2)
+            if dwell_df is not None and len(dwell_df):
+                dwell_df.to_csv(
+                    os.path.join(data_dir, f"{stem}_dwell_times.csv"), index=False)
+            if turning_angles is not None and len(turning_angles):
+                _pd.DataFrame({"turning_angle_rad": turning_angles}).to_csv(
+                    os.path.join(data_dir, f"{stem}_turning_angles.csv"), index=False)
+            if mobile_frac_df is not None and len(mobile_frac_df):
+                mobile_frac_df.to_csv(
+                    os.path.join(data_dir, f"{stem}_mobile_fraction.csv"), index=False)
 
             _emit_log(f"  Output folder: {out_dir}")
             _emit_progress("Complete!", 100)

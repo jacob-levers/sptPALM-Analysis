@@ -2500,5 +2500,571 @@ def main():
     print(f"\n  Done! Results in: {out_dir}\n")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  COMPARISON  —  group A vs group B over multiple analysis output folders
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# A "group" is a list of analysis output folders.  For each folder we re-load
+# the per-experiment summary (MSD curve, D values, motion classes, etc.) and
+# compute scalar metrics (AUC, mob/immob ratio, mean track length).  We then
+# render a multi-panel figure overlaying the two groups, with scatter dots
+# per replicate and t-test significance stars on bar charts when n≥2 each.
+# Layout matches the lab's Pre/Post style: MSD curve overlay, AUC bar chart,
+# LogD frequency distribution, mobile/immobile ratio bar chart, motion class
+# fractions, track length distribution, JDD, dwell time CDF, turning angles.
+
+def _find_stem(data_dir):
+    """Find the experiment stem from filenames like {stem}_params.json or
+    {stem}_diffusion_summary.csv inside an analysis output folder's data/ dir."""
+    for f in sorted(os.listdir(data_dir)):
+        if f.endswith("_params.json"):
+            return f[:-len("_params.json")]
+    for f in sorted(os.listdir(data_dir)):
+        if f.endswith("_diffusion_summary.csv"):
+            return f[:-len("_diffusion_summary.csv")]
+    raise FileNotFoundError(f"No analysis CSVs found in {data_dir}")
+
+
+def load_summary_from_folder(folder):
+    """Load all per-experiment summary data from one analysis output folder.
+    `folder` may be the run output dir or its `data/` subdirectory."""
+    import json
+    data_dir = folder
+    if not os.path.isdir(os.path.join(data_dir, "data")):
+        # `folder` is already the data dir
+        pass
+    elif os.path.isdir(os.path.join(folder, "data")):
+        data_dir = os.path.join(folder, "data")
+
+    stem = _find_stem(data_dir)
+    s = {"folder": folder, "stem": stem, "data_dir": data_dir}
+
+    # Params (frame interval, pixel size, ...)
+    params_path = os.path.join(data_dir, f"{stem}_params.json")
+    if os.path.isfile(params_path):
+        with open(params_path) as f:
+            s["params"] = json.load(f)
+    else:
+        s["params"] = {"pixel_size_um": 0.104, "frame_interval_s": 0.05}
+
+    # Ensemble MSD
+    msd_path = os.path.join(data_dir, f"{stem}_ensemble_msd.csv")
+    if os.path.isfile(msd_path):
+        s["ensemble_msd"] = pd.read_csv(msd_path)
+    else:
+        s["ensemble_msd"] = None
+
+    # Diffusion summary (per-track D, alpha, motion_class)
+    diff_path = os.path.join(data_dir, f"{stem}_diffusion_summary.csv")
+    if os.path.isfile(diff_path):
+        s["diffusion"] = pd.read_csv(diff_path)
+    else:
+        s["diffusion"] = None
+
+    # Trajectories (for track length distribution)
+    tr_path = os.path.join(data_dir, f"{stem}_trajectories.csv")
+    if os.path.isfile(tr_path):
+        s["tracks"] = pd.read_csv(tr_path)
+    else:
+        s["tracks"] = None
+
+    # JDD
+    jdd_path = os.path.join(data_dir, f"{stem}_jdd.json")
+    if os.path.isfile(jdd_path):
+        with open(jdd_path) as f:
+            s["jdd"] = json.load(f)
+    else:
+        s["jdd"] = None
+
+    # Dwell times
+    dwell_path = os.path.join(data_dir, f"{stem}_dwell_times.csv")
+    if os.path.isfile(dwell_path):
+        s["dwell_times"] = pd.read_csv(dwell_path)
+    else:
+        s["dwell_times"] = None
+
+    # Turning angles
+    ta_path = os.path.join(data_dir, f"{stem}_turning_angles.csv")
+    if os.path.isfile(ta_path):
+        s["turning_angles"] = pd.read_csv(ta_path)["turning_angle_rad"].values
+    else:
+        s["turning_angles"] = None
+
+    return s
+
+
+def _msd_auc(emsd_df, frame_interval):
+    """Trapezoidal AUC of the MSD curve in µm²·s units."""
+    if emsd_df is None or len(emsd_df) == 0:
+        return np.nan
+    t = emsd_df["lag_frame"].values * frame_interval
+    y = emsd_df["msd_um2"].values
+    order = np.argsort(t)
+    # NumPy 2.x renamed trapz → trapezoid
+    _trap = getattr(np, "trapezoid", None) or np.trapz
+    return float(_trap(y[order], t[order]))
+
+
+def _mob_immob_ratio(diff_df):
+    """Mobile / Immobile ratio from motion_class column."""
+    if diff_df is None or "motion" not in diff_df.columns:
+        return np.nan
+    n_imm = (diff_df["motion"] == "Immobile").sum()
+    n_mob = (diff_df["motion"] != "Immobile").sum()
+    return float(n_mob / n_imm) if n_imm > 0 else np.nan
+
+
+def _motion_fractions(diff_df):
+    """Return dict of fractions per motion class."""
+    if diff_df is None or "motion" not in diff_df.columns:
+        return {}
+    counts = diff_df["motion"].value_counts()
+    total = counts.sum()
+    if total == 0:
+        return {}
+    return {k: float(v / total) for k, v in counts.items()}
+
+
+def _track_lengths(tracks_df, frame_interval):
+    """Return per-track lengths in seconds."""
+    if tracks_df is None or "particle" not in tracks_df.columns:
+        return np.array([])
+    counts = tracks_df.groupby("particle").size().values
+    return counts * frame_interval
+
+
+def _stat_test(a, b):
+    """Two-sample test on per-experiment scalars.  Welch's t by default,
+    Mann-Whitney as fallback for non-normal data.  Returns (p, label)."""
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    a = a[np.isfinite(a)]
+    b = b[np.isfinite(b)]
+    if len(a) < 2 or len(b) < 2:
+        return (np.nan, "")
+    try:
+        from scipy.stats import ttest_ind, mannwhitneyu, shapiro
+        normal = True
+        for arr in (a, b):
+            if 3 <= len(arr) <= 5000:
+                try:
+                    if shapiro(arr).pvalue < 0.05:
+                        normal = False
+                        break
+                except Exception:
+                    pass
+        if normal:
+            p = ttest_ind(a, b, equal_var=False).pvalue
+        else:
+            p = mannwhitneyu(a, b, alternative="two-sided").pvalue
+        if not np.isfinite(p):
+            return (np.nan, "")
+        if p < 0.001: stars = "***"
+        elif p < 0.01: stars = "**"
+        elif p < 0.05: stars = "*"
+        else: stars = "ns"
+        return (float(p), stars)
+    except Exception:
+        return (np.nan, "")
+
+
+def _bar_with_dots(ax, data_a, data_b, label_a, label_b,
+                   color_a="#000000", color_b="#3b6ed8", ylabel=""):
+    """Bar chart with mean ± SEM and individual replicate dots.  Adds t-test
+    significance stars when n≥2 per group."""
+    a = np.asarray(data_a, dtype=float); a = a[np.isfinite(a)]
+    b = np.asarray(data_b, dtype=float); b = b[np.isfinite(b)]
+    means = [a.mean() if len(a) else 0, b.mean() if len(b) else 0]
+    sems  = [a.std(ddof=1)/np.sqrt(len(a)) if len(a) > 1 else 0,
+             b.std(ddof=1)/np.sqrt(len(b)) if len(b) > 1 else 0]
+    x = [0, 1]
+    bars = ax.bar(x, means, yerr=sems, capsize=4,
+                  color=["white", "white"],
+                  edgecolor=[color_a, color_b], linewidth=1.5)
+    # Scatter dots, jittered
+    rng = np.random.default_rng(0)
+    if len(a):
+        ax.scatter(rng.uniform(-0.15, 0.15, len(a)), a,
+                   color=color_a, s=18, zorder=3)
+    if len(b):
+        ax.scatter(1 + rng.uniform(-0.15, 0.15, len(b)), b,
+                   color=color_b, s=18, zorder=3)
+    ax.set_xticks(x)
+    ax.set_xticklabels([label_a, label_b])
+    ax.set_ylabel(ylabel)
+    # Significance stars
+    p, stars = _stat_test(a, b)
+    if stars:
+        top = max([a.max() if len(a) else 0, b.max() if len(b) else 0]) * 1.05
+        if top <= 0:
+            top = max(means) * 1.5 if max(means) > 0 else 1
+        ax.plot([0, 0, 1, 1], [top, top * 1.03, top * 1.03, top], color="black", lw=0.8)
+        ax.text(0.5, top * 1.05, stars, ha="center", va="bottom", fontsize=11)
+        ax.set_ylim(0, top * 1.18)
+
+
+def compare_groups(folders_a, folders_b, label_a="Group A", label_b="Group B",
+                   output_dir=None, output_stem="comparison",
+                   panels=None, theme="light",
+                   color_a="#000000", color_b="#3b6ed8",
+                   progress_cb=None):
+    """Compare two groups of analysis output folders and render a multi-panel
+    figure plus a CSV summary table.
+
+    Parameters
+    ----------
+    folders_a, folders_b : list[str]
+        Paths to analysis output folders (or their `data/` subdir).
+    label_a, label_b : str
+        Group labels (e.g. "Pre", "Post").
+    output_dir : str or None
+        Where to save the figure + CSV.  If None, saves to current dir.
+    panels : set[str] or None
+        Subset of panels to render.  Default: all of {"msd", "auc",
+        "logd_dist", "mob_immob", "motion_classes", "track_length",
+        "jdd", "dwell_cdf", "turning_angles"}.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    summary_df : pandas.DataFrame  — per-folder scalar metrics
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib as _mpl
+
+    if panels is None:
+        panels = {"msd", "auc", "logd_dist", "mob_immob", "motion_classes",
+                  "track_length", "jdd", "dwell_cdf", "turning_angles"}
+
+    # ── Load data for both groups ─────────────────────────────────────────────
+    summaries_a, summaries_b = [], []
+    total = len(folders_a) + len(folders_b)
+    done = 0
+    for f in folders_a:
+        if progress_cb: progress_cb(done, total, f"Loading: {os.path.basename(f)}")
+        try:
+            summaries_a.append(load_summary_from_folder(f))
+        except Exception as e:
+            print(f"  Skipping {f}: {e}")
+        done += 1
+    for f in folders_b:
+        if progress_cb: progress_cb(done, total, f"Loading: {os.path.basename(f)}")
+        try:
+            summaries_b.append(load_summary_from_folder(f))
+        except Exception as e:
+            print(f"  Skipping {f}: {e}")
+        done += 1
+
+    if len(summaries_a) == 0 or len(summaries_b) == 0:
+        raise RuntimeError(
+            f"Need at least one valid folder per group "
+            f"({label_a}: {len(summaries_a)}, {label_b}: {len(summaries_b)})")
+
+    if progress_cb: progress_cb(total, total, "Computing scalars and rendering...")
+
+    # ── Compute per-folder scalars (one row per replicate) ────────────────────
+    summary_rows = []
+    def _row(group, summary):
+        p = summary["params"]
+        fi = float(p.get("frame_interval_s", 0.05))
+        d = summary["diffusion"]
+        return {
+            "group":            group,
+            "folder":           summary["folder"],
+            "stem":             summary["stem"],
+            "n_tracks":         len(d) if d is not None else 0,
+            "auc_msd":          _msd_auc(summary["ensemble_msd"], fi),
+            "mob_immob_ratio":  _mob_immob_ratio(d),
+            "median_D":         float(d["D"].median()) if d is not None and "D" in d.columns else np.nan,
+            "median_alpha":     float(d["alpha"].median()) if d is not None and "alpha" in d.columns else np.nan,
+            "mean_track_length_s": float(_track_lengths(summary["tracks"], fi).mean())
+                                   if summary["tracks"] is not None else np.nan,
+        }
+    for s in summaries_a: summary_rows.append(_row(label_a, s))
+    for s in summaries_b: summary_rows.append(_row(label_b, s))
+    summary_df = pd.DataFrame(summary_rows)
+
+    # ── Render the figure ────────────────────────────────────────────────────
+    panel_order = ["msd", "auc", "logd_dist", "mob_immob",
+                   "motion_classes", "track_length",
+                   "jdd", "dwell_cdf", "turning_angles"]
+    enabled = [p for p in panel_order if p in panels]
+    n_plots = len(enabled)
+    if n_plots == 0:
+        raise RuntimeError("No panels enabled")
+    ncols = 3 if n_plots > 4 else 2
+    nrows = (n_plots + ncols - 1) // ncols
+
+    if theme == "dark":
+        plt.style.use("dark_background")
+    else:
+        plt.style.use("default")
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 4.2, nrows * 3.6))
+    axes = np.array(axes).reshape(-1)
+    for ax in axes[n_plots:]:
+        ax.axis("off")
+
+    panel_idx = 0
+    def _next_ax():
+        nonlocal panel_idx
+        ax = axes[panel_idx]; panel_idx += 1
+        return ax
+
+    # ── 1. MSD overlay ────────────────────────────────────────────────────────
+    if "msd" in panels:
+        ax = _next_ax()
+        for grp, summaries, color in ((label_a, summaries_a, color_a),
+                                      (label_b, summaries_b, color_b)):
+            curves = []
+            tref = None
+            for s in summaries:
+                e = s["ensemble_msd"]
+                if e is None: continue
+                fi = float(s["params"].get("frame_interval_s", 0.05))
+                t = e["lag_frame"].values * fi
+                y = e["msd_um2"].values
+                order = np.argsort(t)
+                t, y = t[order], y[order]
+                if tref is None:
+                    tref = t
+                # Interpolate onto reference time axis if lengths differ
+                if len(t) != len(tref) or not np.allclose(t, tref):
+                    y = np.interp(tref, t, y)
+                curves.append(y)
+            if not curves:
+                continue
+            arr = np.vstack(curves)
+            mean = arr.mean(axis=0)
+            sem = arr.std(axis=0, ddof=1) / np.sqrt(len(curves)) if len(curves) > 1 else None
+            ax.plot(tref, mean, "-o", color=color, label=grp, ms=4, lw=1.5)
+            if sem is not None:
+                ax.fill_between(tref, mean - sem, mean + sem, color=color, alpha=0.15)
+        ax.set_xlabel("Time delta (s)")
+        ax.set_ylabel("MSD (µm²)")
+        ax.set_title("Mean Square Displacement")
+        ax.legend(frameon=False, loc="best")
+
+    # ── 2. AUC bar chart ──────────────────────────────────────────────────────
+    if "auc" in panels:
+        ax = _next_ax()
+        a = summary_df.loc[summary_df["group"] == label_a, "auc_msd"].values
+        b = summary_df.loc[summary_df["group"] == label_b, "auc_msd"].values
+        _bar_with_dots(ax, a, b, label_a, label_b, color_a, color_b,
+                       ylabel="AUC (µm²·s)")
+        ax.set_title("Area Under the Curve")
+
+    # ── 3. LogD frequency distribution ────────────────────────────────────────
+    if "logd_dist" in panels:
+        ax = _next_ax()
+        bins = np.linspace(-5, 1, 31)
+        for grp, summaries, color in ((label_a, summaries_a, color_a),
+                                      (label_b, summaries_b, color_b)):
+            all_logD = []
+            for s in summaries:
+                d = s["diffusion"]
+                if d is None or "D" not in d.columns: continue
+                vals = d["D"].values
+                vals = vals[vals > 0]
+                if len(vals): all_logD.append(np.log10(vals))
+            if not all_logD: continue
+            pooled = np.concatenate(all_logD)
+            counts, edges = np.histogram(pooled, bins=bins)
+            centers = 0.5 * (edges[:-1] + edges[1:])
+            frac = counts / counts.sum() if counts.sum() else counts
+            ax.plot(centers, frac, "-o", color=color, label=grp, ms=4, lw=1.2)
+        ax.axvline(np.log10(0.05), color="gray", ls="--", lw=0.8)  # mobile/immobile threshold
+        ax.set_xlabel("log₁₀ D  (µm²/s)")
+        ax.set_ylabel("Relative frequency")
+        ax.set_title("LogD Frequency Distribution")
+        ax.legend(frameon=False, loc="best")
+
+    # ── 4. Mobile/Immobile ratio bar ──────────────────────────────────────────
+    if "mob_immob" in panels:
+        ax = _next_ax()
+        a = summary_df.loc[summary_df["group"] == label_a, "mob_immob_ratio"].values
+        b = summary_df.loc[summary_df["group"] == label_b, "mob_immob_ratio"].values
+        _bar_with_dots(ax, a, b, label_a, label_b, color_a, color_b,
+                       ylabel="Mobile/Immobile ratio")
+        ax.set_title("Mobile/Immobile Ratio")
+
+    # ── 5. Motion class fractions (grouped bars) ──────────────────────────────
+    if "motion_classes" in panels:
+        ax = _next_ax()
+        classes = ["Immobile", "Confined", "Brownian", "Directed"]
+        # Per-folder fractions
+        def _fracs(summaries):
+            rows = []
+            for s in summaries:
+                f = _motion_fractions(s["diffusion"])
+                rows.append([f.get(c, 0.0) for c in classes])
+            return np.array(rows) if rows else np.zeros((0, len(classes)))
+        fa = _fracs(summaries_a)
+        fb = _fracs(summaries_b)
+        x = np.arange(len(classes))
+        w = 0.35
+        if len(fa):
+            ax.bar(x - w/2, fa.mean(axis=0), w,
+                   yerr=fa.std(axis=0, ddof=1)/np.sqrt(len(fa)) if len(fa) > 1 else None,
+                   color="white", edgecolor=color_a, linewidth=1.5,
+                   capsize=3, label=label_a)
+        if len(fb):
+            ax.bar(x + w/2, fb.mean(axis=0), w,
+                   yerr=fb.std(axis=0, ddof=1)/np.sqrt(len(fb)) if len(fb) > 1 else None,
+                   color="white", edgecolor=color_b, linewidth=1.5,
+                   capsize=3, label=label_b)
+        # Scatter dots
+        rng = np.random.default_rng(1)
+        for i in range(len(classes)):
+            if len(fa):
+                ax.scatter(np.full(len(fa), x[i] - w/2) + rng.uniform(-0.08, 0.08, len(fa)),
+                           fa[:, i], color=color_a, s=12, zorder=3)
+            if len(fb):
+                ax.scatter(np.full(len(fb), x[i] + w/2) + rng.uniform(-0.08, 0.08, len(fb)),
+                           fb[:, i], color=color_b, s=12, zorder=3)
+        ax.set_xticks(x); ax.set_xticklabels(classes, rotation=20)
+        ax.set_ylabel("Fraction of tracks")
+        ax.set_title("Motion Class Fractions")
+        ax.legend(frameon=False, loc="best", fontsize=8)
+
+    # ── 6. Track length distribution (CDF) ────────────────────────────────────
+    if "track_length" in panels:
+        ax = _next_ax()
+        for grp, summaries, color in ((label_a, summaries_a, color_a),
+                                      (label_b, summaries_b, color_b)):
+            pooled = []
+            for s in summaries:
+                fi = float(s["params"].get("frame_interval_s", 0.05))
+                pooled.append(_track_lengths(s["tracks"], fi))
+            if not any(len(x) for x in pooled): continue
+            pooled = np.concatenate(pooled) if pooled else np.array([])
+            if len(pooled) == 0: continue
+            x_sorted = np.sort(pooled)
+            y = np.arange(1, len(x_sorted) + 1) / len(x_sorted)
+            ax.plot(x_sorted, y, color=color, lw=1.5, label=grp)
+        ax.set_xlabel("Track length (s)")
+        ax.set_ylabel("Cumulative fraction")
+        ax.set_title("Track Length Distribution")
+        ax.legend(frameon=False, loc="best")
+
+    # ── 7. Jump Distance Distribution ─────────────────────────────────────────
+    if "jdd" in panels:
+        ax = _next_ax()
+        any_data = False
+        for grp, summaries, color in ((label_a, summaries_a, color_a),
+                                      (label_b, summaries_b, color_b)):
+            # Aggregate fitted D values across replicates
+            ds = [s["jdd"]["D_values"] for s in summaries
+                  if s.get("jdd") and "D_values" in s["jdd"]]
+            if not ds: continue
+            any_data = True
+            # Bar chart: x = population index (1..3), y = mean D across replicates
+            max_pop = max(len(x) for x in ds)
+            xs = np.arange(max_pop)
+            for i, d_arr in enumerate(ds):
+                ax.scatter(xs[:len(d_arr)] + (0 if grp == label_a else 0.3),
+                           d_arr, color=color, alpha=0.5, s=18,
+                           label=grp if i == 0 else None)
+        if any_data:
+            ax.set_xlabel("Diffusion population")
+            ax.set_ylabel("D (µm²/s)")
+            ax.set_yscale("log")
+            ax.set_title("JDD: per-population D")
+            ax.legend(frameon=False, loc="best")
+        else:
+            ax.text(0.5, 0.5, "No JDD data\n(re-run analysis to generate)",
+                    ha="center", va="center", transform=ax.transAxes,
+                    color="gray", fontsize=9)
+            ax.set_xticks([]); ax.set_yticks([])
+            ax.set_title("Jump Distance Distribution")
+
+    # ── 8. Dwell time CDF ─────────────────────────────────────────────────────
+    if "dwell_cdf" in panels:
+        ax = _next_ax()
+        any_data = False
+        for grp, summaries, color in ((label_a, summaries_a, color_a),
+                                      (label_b, summaries_b, color_b)):
+            pooled = []
+            for s in summaries:
+                d = s.get("dwell_times")
+                if d is None or len(d) == 0: continue
+                # try common column names
+                col = next((c for c in ("dwell_s", "dwell_time", "dwell", "tau_s")
+                            if c in d.columns), None)
+                if col is None and len(d.columns):
+                    col = d.columns[0]
+                if col is None: continue
+                pooled.extend(d[col].values)
+            if not pooled: continue
+            any_data = True
+            arr = np.sort(np.asarray(pooled, dtype=float))
+            arr = arr[arr > 0]
+            if len(arr) == 0: continue
+            y = 1 - np.arange(1, len(arr) + 1) / len(arr)  # survival
+            ax.plot(arr, y, color=color, lw=1.5, label=grp)
+        if any_data:
+            ax.set_xlabel("Dwell time (s)")
+            ax.set_ylabel("Survival fraction")
+            ax.set_title("Dwell Time Survival")
+            ax.set_yscale("log")
+            ax.legend(frameon=False, loc="best")
+        else:
+            ax.text(0.5, 0.5, "No dwell-time data\n(re-run analysis to generate)",
+                    ha="center", va="center", transform=ax.transAxes,
+                    color="gray", fontsize=9)
+            ax.set_xticks([]); ax.set_yticks([])
+            ax.set_title("Dwell Time Survival")
+
+    # ── 9. Turning angle distribution ─────────────────────────────────────────
+    if "turning_angles" in panels:
+        ax = _next_ax()
+        any_data = False
+        bins = np.linspace(-np.pi, np.pi, 37)
+        centers = 0.5 * (bins[:-1] + bins[1:])
+        for grp, summaries, color in ((label_a, summaries_a, color_a),
+                                      (label_b, summaries_b, color_b)):
+            pooled = []
+            for s in summaries:
+                ta = s.get("turning_angles")
+                if ta is None or len(ta) == 0: continue
+                pooled.extend(np.asarray(ta).ravel())
+            if not pooled: continue
+            any_data = True
+            counts, _ = np.histogram(pooled, bins=bins)
+            frac = counts / counts.sum() if counts.sum() else counts
+            ax.plot(centers, frac, color=color, lw=1.5, label=grp)
+        if any_data:
+            ax.set_xlabel("Turning angle (rad)")
+            ax.set_ylabel("Frequency")
+            ax.set_title("Turning Angle Distribution")
+            ax.legend(frameon=False, loc="best")
+        else:
+            ax.text(0.5, 0.5, "No turning-angle data\n(re-run analysis to generate)",
+                    ha="center", va="center", transform=ax.transAxes,
+                    color="gray", fontsize=9)
+            ax.set_xticks([]); ax.set_yticks([])
+            ax.set_title("Turning Angle Distribution")
+
+    fig.suptitle(f"{label_a}  (n={len(summaries_a)})   vs   {label_b}  (n={len(summaries_b)})",
+                 fontsize=12, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+
+    # ── Save outputs ──────────────────────────────────────────────────────────
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        png_path = os.path.join(output_dir, f"{output_stem}.png")
+        pdf_path = os.path.join(output_dir, f"{output_stem}.pdf")
+        csv_path = os.path.join(output_dir, f"{output_stem}_summary.csv")
+        fig.savefig(png_path, dpi=200, bbox_inches="tight",
+                    facecolor=fig.get_facecolor())
+        fig.savefig(pdf_path, bbox_inches="tight", facecolor=fig.get_facecolor())
+        summary_df.to_csv(csv_path, index=False)
+        print(f"  Saved: {png_path}")
+        print(f"  Saved: {pdf_path}")
+        print(f"  Saved: {csv_path}")
+
+    return fig, summary_df
+
+
 if __name__ == "__main__":
     main()
