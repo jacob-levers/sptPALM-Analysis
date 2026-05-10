@@ -2972,24 +2972,55 @@ def compare_groups(folders_a, folders_b, label_a="Group A", label_b="Group B",
         ax.legend(frameon=False, loc="best", fontsize=8)
 
     # ── 6. Track length distribution (CDF) ────────────────────────────────────
+    # Track length distributions in sptPALM have very long tails — typically
+    # 99 %+ of tracks are < a few seconds but a handful linger far longer.
+    # If we let matplotlib auto-range, the long tail dominates and the
+    # interesting "where do most tracks end?" rise gets compressed against
+    # the y-axis.  Clip x to the 99th percentile of the combined data so
+    # the bulk of the distribution is actually visible.
     if "track_length" in panels:
         ax = _next_ax()
-        for grp, summaries, color in ((label_a, summaries_a, color_a),
-                                      (label_b, summaries_b, color_b)):
-            pooled = []
+        # Pass 1: collect per-group pooled track lengths
+        pooled_per_group = {}
+        for grp, summaries in ((label_a, summaries_a), (label_b, summaries_b)):
+            arrs = []
             for s in summaries:
                 fi = float(s["params"].get("frame_interval_s", 0.05))
-                pooled.append(_track_lengths(s["tracks"], fi))
-            if not any(len(x) for x in pooled): continue
-            pooled = np.concatenate(pooled) if pooled else np.array([])
-            if len(pooled) == 0: continue
-            x_sorted = np.sort(pooled)
+                tl = _track_lengths(s["tracks"], fi)
+                if len(tl):
+                    arrs.append(tl)
+            if arrs:
+                pooled_per_group[grp] = np.concatenate(arrs)
+
+        # Pass 2: compute clip from combined 99th percentile
+        combined = (np.concatenate(list(pooled_per_group.values()))
+                    if pooled_per_group else np.array([]))
+        x_clip = float(np.percentile(combined, 99)) if len(combined) else None
+
+        # Pass 3: plot each group's CDF
+        for grp, color in ((label_a, color_a), (label_b, color_b)):
+            p = pooled_per_group.get(grp)
+            if p is None or len(p) == 0: continue
+            x_sorted = np.sort(p)
             y = np.arange(1, len(x_sorted) + 1) / len(x_sorted)
             ax.plot(x_sorted, y, color=color, lw=1.5, label=grp)
-        ax.set_xlabel("Track length (s)")
-        ax.set_ylabel("Cumulative fraction")
-        ax.set_title("Track Length Distribution")
-        ax.legend(frameon=False, loc="best")
+
+        if pooled_per_group:
+            if x_clip and x_clip > 0:
+                ax.set_xlim(0, x_clip)
+                ax.set_title(f"Track Length Distribution  (x clipped at 99th %ile)")
+            else:
+                ax.set_title("Track Length Distribution")
+            ax.set_ylim(0, 1.02)
+            ax.set_xlabel("Track length (s)")
+            ax.set_ylabel("Cumulative fraction")
+            ax.legend(frameon=False, loc="best")
+        else:
+            ax.text(0.5, 0.5, "No track-length data",
+                    ha="center", va="center", transform=ax.transAxes,
+                    color=pal["GRD"], fontsize=9)
+            ax.set_xticks([]); ax.set_yticks([])
+            ax.set_title("Track Length Distribution")
 
     # ── 7. Jump Distance Distribution: per-population D + fraction ────────────
     # Each replicate fits 1, 2 or 3 diffusing populations (Immobile / Mobile /
