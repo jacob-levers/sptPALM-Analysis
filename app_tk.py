@@ -230,23 +230,6 @@ if getattr(sys, "frozen", False):
     if _meipass and _meipass not in sys.path:
         sys.path.insert(0, _meipass)
 
-# ── Pre-load numpy + matplotlib at app startup ────────────────────────────────
-# These were previously imported lazily inside the worker thread, where any
-# import failure (numpy DLL, matplotlib backend) silently killed the thread
-# with no visible error — the symptom is "stuck on Worker thread started, no
-# further logs."  Loading them at module level surfaces any error as a visible
-# startup crash with full traceback in the PyInstaller bootloader dialog.
-try:
-    import numpy as _np_preload  # noqa: F401
-    import matplotlib as _mpl_preload
-    _mpl_preload.use("Agg")
-    from matplotlib.figure import Figure as _Figure_preload  # noqa: F401
-    from matplotlib.backends.backend_agg import FigureCanvasAgg as _FCA_preload  # noqa: F401
-except Exception:
-    import traceback as _tb
-    _tb.print_exc()
-    raise
-
 # Must be set before any other imports on macOS
 if sys.platform == "darwin":
     try:
@@ -2924,23 +2907,32 @@ class SPTPalmApp(tk.Tk):
         self._q.put(("log", "── Worker thread started ──"))
         self._q.put(("progress", ("Initialising…", 1)))
 
-        # These modules are pre-loaded at app startup (see top of this file),
-        # so the imports here are O(1) cache lookups.  Wrap in try/except so
-        # any unexpected failure shows in the GUI log instead of silently
-        # killing the worker thread.
+        # Import each module SEPARATELY with a log line before each.  In
+        # PyInstaller onefile mode on Windows, the first numpy / matplotlib
+        # import in a thread can take many seconds (DLLs from %TEMP%) — and
+        # if any one HANGS, the last log line tells us exactly which.
         try:
+            self._q.put(("log", "  → import numpy"))
             import numpy as np
+            self._q.put(("log", "  ✓ numpy"))
+
+            self._q.put(("log", "  → import time"))
             import time as _time
+            self._q.put(("log", "  ✓ time"))
+
+            self._q.put(("log", "  → import matplotlib.figure"))
             from matplotlib.figure import Figure
+            self._q.put(("log", "  ✓ matplotlib.figure"))
+
+            self._q.put(("log", "  → import matplotlib.backends.backend_agg"))
             from matplotlib.backends.backend_agg import FigureCanvasAgg
+            self._q.put(("log", "  ✓ matplotlib.backends.backend_agg"))
         except Exception as _exc:
             import traceback as _tb
             self._q.put(("log", f"FATAL import error in worker: {type(_exc).__name__}: {_exc}"))
             self._q.put(("log", _tb.format_exc()))
             self._q.put(("error", f"Import error: {_exc}"))
             return
-
-        self._q.put(("log", "  matplotlib + numpy ready"))
 
         stop = self._stop_event  # local alias for speed
 
