@@ -1473,6 +1473,13 @@ def msd_linear(t, D, offset):
 # triple so users can tune the boundaries to their lab's convention.
 ALPHA_THRESHOLDS_DEFAULT = (0.5, 0.9, 1.1)
 
+# Default D cutoff for splitting Mobile / Immobile populations (µm²/s).
+# 0.05 is the conventional membrane-protein threshold used throughout the
+# sptPALM literature; tracks with D ≥ this value are considered Mobile.
+# Defined here at the top so functions defined later in the file can use
+# it as a default argument (Python evaluates defaults at definition time).
+MOBILE_D_THRESHOLD_DEFAULT = 0.05
+
 
 def classify_motion(alpha, thresholds=ALPHA_THRESHOLDS_DEFAULT):
     """Classify a track by its anomalous exponent α.
@@ -2684,12 +2691,6 @@ def _msd_auc(emsd_df, frame_interval):
     # NumPy 2.x renamed trapz → trapezoid
     _trap = getattr(np, "trapezoid", None) or np.trapz
     return float(_trap(y[order], t[order]))
-
-
-# Default D cutoff for splitting Mobile / Immobile populations (µm²/s).
-# 0.05 is the conventional membrane-protein threshold used throughout the
-# sptPALM literature; tracks with D ≥ this value are considered Mobile.
-MOBILE_D_THRESHOLD_DEFAULT = 0.05
 
 
 def _mob_immob_ratio(diff_df, d_threshold=MOBILE_D_THRESHOLD_DEFAULT):
