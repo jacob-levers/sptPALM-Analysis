@@ -2717,7 +2717,7 @@ class SPTPalmApp(_APP_BASE):
         st_outdir = tk.StringVar(value="")
         panel_keys = ["msd", "auc", "logd_dist", "mob_immob",
                       "motion_classes", "track_length",
-                      "jdd", "dwell_cdf", "turning_angles"]
+                      "jdd", "dwell_cdf", "turning_angles", "radial_dist"]
         panel_labels = {
             "msd":             "MSD curve overlay",
             "auc":             "AUC bar chart",
@@ -2728,6 +2728,7 @@ class SPTPalmApp(_APP_BASE):
             "jdd":             "Jump distance distribution",
             "dwell_cdf":       "Dwell time survival",
             "turning_angles":  "Turning angle distribution",
+            "radial_dist":     "Radial distribution (polar)",
         }
         panel_vars = {k: tk.BooleanVar(value=True) for k in panel_keys}
         st_pdf = tk.BooleanVar(value=True)
@@ -3408,7 +3409,7 @@ class SPTPalmApp(_APP_BASE):
                         b_dwell_df.to_csv(
                             os.path.join(data_dir, f"{stem}_dwell_times.csv"), index=False)
                     if b_ta is not None and len(b_ta):
-                        _pd.DataFrame({"turning_angle_rad": b_ta}).to_csv(
+                        _pd.DataFrame({"turning_angle_deg": b_ta}).to_csv(
                             os.path.join(data_dir, f"{stem}_turning_angles.csv"), index=False)
                     if b_mf is not None and len(b_mf):
                         b_mf.to_csv(

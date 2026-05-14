@@ -586,10 +586,43 @@ def _parse_ome_metadata(tif):
     return px_um, fi_s
 
 
-def load_tif(path, stop_event=None):
+def _find_tif_series(path):
+    """Find split TIFF files like name.tif, name(1).tif, name(2).tif"""
+    import glob, re
+    directory = os.path.dirname(path) or "."
+    basename  = os.path.splitext(os.path.basename(path))[0]
+    ext       = os.path.splitext(path)[1].lower()  # .tif or .tiff
+
+    # Strip any trailing "(N)" so we get the root name
+    root = re.sub(r"\(\d+\)$", "", basename).rstrip()
+
+    # Collect all matching files
+    pattern  = os.path.join(directory, glob.escape(root) + "*" + ext)
+    candidates = sorted(glob.glob(pattern))
+
+    # Keep only: root.tif and root(N).tif
+    series_re = re.compile(
+        r"^" + re.escape(root) + r"(\(\d+\))?" + re.escape(ext) + r"$", re.IGNORECASE)
+    series = [f for f in candidates
+              if series_re.match(os.path.basename(f))]
+
+    # Natural sort so (1) < (2) < (10)
+    def _nat_key(s):
+        m = re.search(r"\((\d+)\)" + re.escape(ext) + r"$", s, re.IGNORECASE)
+        return int(m.group(1)) if m else -1
+
+    series.sort(key=_nat_key)
+
+    if len(series) > 1:
+        print(f"  Multi-file TIF series detected ({len(series)} files):")
+        for f in series:
+            print(f"    {os.path.basename(f)}")
+    return series if series else [path]
+
+def _load_single_tif(path, stop_event=None):
+    """Load a single TIF file and return its stack, pixel size, and frame interval."""
     if not HAS_TIFFFILE:
         raise RuntimeError("Run: pip install tifffile")
-    print(f"  Loading TIF: {path}")
     with tifffile.TiffFile(path) as tif:
         px_um, fi_s = _parse_ome_metadata(tif)
         n_pages = len(tif.pages)
@@ -609,14 +642,41 @@ def load_tif(path, stop_event=None):
     if   stack.ndim == 2: stack = stack[np.newaxis]
     elif stack.ndim == 4:
         stack = stack[:, 0] if stack.shape[1] == 1 else stack.mean(axis=1)
-    print(f"  Shape: {stack.shape}  (T x Y x X)")
-
-    if px_um is not None:
-        print(f"  Pixel size  : {px_um} µm  (from file metadata)")
-    if fi_s is not None:
-        print(f"  Frame interval: {fi_s} s  (from file metadata)")
 
     return stack, px_um, fi_s
+
+
+def load_tif(path, stop_event=None):
+    series = _find_tif_series(path)
+
+    if len(series) == 1:
+        # Single file — straightforward load
+        print(f"  Loading TIF: {path}")
+        stack, px_um, fi_s = _load_single_tif(path, stop_event)
+        print(f"  Shape: {stack.shape}  (T x Y x X)")
+        if px_um is not None: print(f"  Pixel size  : {px_um} µm  (from file metadata)")
+        if fi_s is not None:  print(f"  Frame interval: {fi_s} s  (from file metadata)")
+        return stack, px_um, fi_s
+
+    # Multi-file series — load each file and concatenate along time axis.
+    print(f"  Loading TIF series: {len(series)} files", flush=True)
+    stacks   = []
+    px_um_out  = None
+    fi_s_out   = None
+    for i, fpath in enumerate(series):
+        print(f"  [{i+1}/{len(series)}] {os.path.basename(fpath)}", flush=True)
+        st, px, fi = _load_single_tif(fpath, stop_event)
+        stacks.append(st)
+        if i == 0:
+            # Metadata is only taken from the first file
+            px_um_out = px
+            fi_s_out  = fi
+
+    combined = np.concatenate(stacks, axis=0)
+    print(f"  Combined shape: {combined.shape}  (T x Y x X)", flush=True)
+    if px_um_out is not None: print(f"  Pixel size  : {px_um_out} µm  (from file metadata)")
+    if fi_s_out is not None:  print(f"  Frame interval: {fi_s_out} s  (from file metadata)")
+    return combined, px_um_out, fi_s_out
 
 
 def load_file(path, channel=0, stop_event=None):
@@ -1722,10 +1782,23 @@ def compute_jdd(tracks, pixel_size_um, frame_interval_s, n_components=2):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compute_turning_angles(tracks):
-    """
-    For each track with ≥3 points, compute step-to-step turning angles in degrees.
+    """For each track with ≥3 points, compute step-to-step **signed** turning
+    angles in degrees, in the range (-180°, +180°].
 
-    Returns a flat np.array of all angles across all tracks.
+    Sign convention (standard 2D right-handed):
+        +90°  =  90° left turn (counter-clockwise rotation from v1 to v2)
+        -90°  =  90° right turn (clockwise rotation)
+          0°  =  continued straight
+        ±180° =  full reversal
+
+    Computation: for consecutive step vectors v1 = r(t_{i+1}) - r(t_i)
+    and v2 = r(t_{i+2}) - r(t_{i+1}),
+
+        θ = atan2( v1.x · v2.y - v1.y · v2.x,    v1 · v2 )
+
+    where the first argument is the z-component of the 3-D cross product
+    v1 × v2 (positive for counter-clockwise rotation). Returns a flat
+    array of all angles across all tracks, in degrees.
     """
     print(f"  Turning angles    : {tracks['particle'].nunique():,} tracks")
     all_angles = []
@@ -1736,12 +1809,16 @@ def compute_turning_angles(tracks):
             continue
         v1 = np.diff(xy, axis=0)[:-1]   # shape (n-2, 2)
         v2 = np.diff(xy, axis=0)[1:]    # shape (n-2, 2)
+        cross = v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0]
         dot   = np.sum(v1 * v2, axis=1)
+        # Skip steps where either vector is zero-length (atan2(0,0) is 0
+        # but isn't meaningful for a non-existent rotation).
         norm1 = np.linalg.norm(v1, axis=1)
         norm2 = np.linalg.norm(v2, axis=1)
-        cos_a = dot / (norm1 * norm2 + 1e-12)
-        cos_a = np.clip(cos_a, -1.0, 1.0)
-        angles = np.degrees(np.arccos(cos_a))
+        valid = (norm1 > 0) & (norm2 > 0)
+        if not valid.any():
+            continue
+        angles = np.degrees(np.arctan2(cross[valid], dot[valid]))
         all_angles.append(angles)
     if all_angles:
         return np.concatenate(all_angles)
@@ -1984,9 +2061,11 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
         "font.family":      _font})
 
     _has_jdd = jdd is not None
-    fig = plt.figure(figsize=(20, 32), facecolor=BG)
-    gs  = GridSpec(5, 3, figure=fig, hspace=0.42, wspace=0.32,
-                   left=0.06, right=0.97, top=0.94, bottom=0.04)
+    # Grid expanded from 5 to 6 rows in v1.0.64 to fit the new Radial
+    # Distribution polar panel.
+    fig = plt.figure(figsize=(20, 38), facecolor=BG)
+    gs  = GridSpec(6, 3, figure=fig, hspace=0.45, wspace=0.32,
+                   left=0.06, right=0.97, top=0.95, bottom=0.035)
 
     _panels          = []   # (letter, axes) collected for per-panel export
     _letter_artists  = []   # text objects for letter labels (hidden for panel renders)
@@ -2185,22 +2264,32 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
         pass
     sax(ax, "H", "Position Density Map")
 
-    # I — Turning Angle Distribution
+    # I — Turning Angle Distribution (signed, -180° .. +180°)
     ax = fig.add_subplot(gs[2, 2])
     if turning_angles is None or len(turning_angles) < 10:
         ax.text(0.5, 0.5, "Insufficient data", transform=ax.transAxes,
                 ha="center", va="center", color=TXT, fontsize=12)
     else:
-        _ta_bins = np.linspace(0, 180, 37)
-        ax.hist(turning_angles, bins=_ta_bins, color=ACC, alpha=0.8, edgecolor="none")
-        ax.axvline(90, color=GRD, lw=1.5, ls="--", label="90°")
-        ax.text(45,  ax.get_ylim()[1] * 0.85 if ax.get_ylim()[1] > 0 else 1,
-                "← Confined", ha="center", color="#f78166", fontsize=9)
-        ax.text(135, ax.get_ylim()[1] * 0.85 if ax.get_ylim()[1] > 0 else 1,
-                "Directed →", ha="center", color="#3fb950", fontsize=9)
+        ta_arr = np.asarray(turning_angles, dtype=float)
+        # Auto-detect signed vs legacy unsigned: if values lie wholly in
+        # [0, 180] we're looking at an old run.  Plot accordingly.
+        is_signed = bool(np.any(ta_arr < -1e-3))
+        if is_signed:
+            _ta_bins = np.linspace(-180, 180, 73)   # 5° bins, full circle
+            ax.hist(ta_arr, bins=_ta_bins, color=ACC, alpha=0.8, edgecolor="none")
+            ax.axvline(0,    color=GRD, lw=1.0, ls="--")
+            ax.axvline(180,  color=GRD, lw=0.8, ls=":")
+            ax.axvline(-180, color=GRD, lw=0.8, ls=":")
+            ax.set_xlim(-180, 180)
+            ax.set_xticks([-180, -90, 0, 90, 180])
+        else:
+            _ta_bins = np.linspace(0, 180, 37)
+            ax.hist(ta_arr, bins=_ta_bins, color=ACC, alpha=0.8, edgecolor="none")
+            ax.axvline(90, color=GRD, lw=1.0, ls="--")
+            ax.set_xlim(0, 180)
+            ax.set_xticks([0, 45, 90, 135, 180])
         ax.set_xlabel("Turning angle (°)", fontsize=9)
         ax.set_ylabel("Count", fontsize=9)
-        ax.legend(fontsize=8, framealpha=0.6, facecolor=PNL, edgecolor=GRD, labelcolor=TXT)
         ax.grid(True, ls=":", alpha=0.3)
     sax(ax, "I", "Turning Angle Distribution")
 
@@ -2326,6 +2415,42 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
         ax.text(0.5, 0.5, "MSS not computed\n(tracks too short)",
                 transform=ax.transAxes, ha="center", va="center", color=MUTED, fontsize=10)
     sax(ax, "N", "Moment Scaling Spectrum  (MSS slope)")
+
+    # O — Radial Distribution of turning angles (polar)
+    # A polar histogram of signed turning angles.  Bars radiate outward from
+    # the origin; their angular position is the turning direction (0° =
+    # straight ahead, ±180° = full reversal, ±90° = right-angle turns) and
+    # their height is the relative frequency.  A uniform circle indicates
+    # Brownian motion; a lobe at 0° indicates directional persistence; a
+    # lobe at ±180° indicates back-tracking / confinement.
+    ax = fig.add_subplot(gs[5, 0], projection="polar")
+    if turning_angles is None or len(turning_angles) < 10:
+        ax.text(0.5, 0.5, "Insufficient data", transform=ax.transAxes,
+                ha="center", va="center", color=TXT, fontsize=11)
+        ax.set_xticks([]); ax.set_yticks([])
+    else:
+        ta_arr = np.asarray(turning_angles, dtype=float)
+        is_signed = bool(np.any(ta_arr < -1e-3))
+        if not is_signed:
+            # Legacy unsigned data: mirror to make the polar plot symmetric so
+            # the visualisation still works (no rotational-direction info).
+            ta_arr = np.concatenate([ta_arr, -ta_arr])
+        angles_rad = np.deg2rad(ta_arr)
+        n_bins = 36
+        bins   = np.linspace(-np.pi, np.pi, n_bins + 1)
+        counts, edges = np.histogram(angles_rad, bins=bins, density=True)
+        theta = 0.5 * (edges[:-1] + edges[1:])
+        width = bins[1] - bins[0]
+        ax.bar(theta, counts, width=width * 0.95, bottom=0.0,
+               color=ACC, alpha=0.75, edgecolor=GRD, linewidth=0.5)
+        ax.set_theta_zero_location("E")    # 0° at right (east)
+        ax.set_theta_direction(1)           # counter-clockwise positive
+        ax.set_xticks(np.deg2rad([0, 45, 90, 135, 180, -135, -90, -45]))
+        ax.set_xticklabels(["0°", "+45°", "+90°", "+135°", "±180°",
+                            "−135°", "−90°", "−45°"], fontsize=8)
+        ax.tick_params(axis="y", labelsize=7, colors=TXT)
+        ax.grid(True, ls=":", alpha=0.4)
+    sax(ax, "O", "Radial Distribution  (signed turning angles)")
 
     md = diff_df["D"].dropna().median()
     ma = diff_df["alpha"].dropna().median()
@@ -2674,9 +2799,21 @@ def load_summary_from_folder(folder):
     # Turning angles
     ta_path = os.path.join(data_dir, f"{stem}_turning_angles.csv")
     if os.path.isfile(ta_path):
-        s["turning_angles"] = pd.read_csv(ta_path)["turning_angle_rad"].values
+        # Always stored in DEGREES.  Newer runs use the correctly named
+        # `turning_angle_deg` (signed, -180..+180°).  Older runs (pre-v1.0.64)
+        # used `turning_angle_rad` despite the values being in degrees and
+        # unsigned (0..180°).  We accept either column and the consumer
+        # (compare_groups) handles the value range gracefully.
+        _ta_df = pd.read_csv(ta_path)
+        col = ("turning_angle_deg" if "turning_angle_deg" in _ta_df.columns
+               else "turning_angle_rad" if "turning_angle_rad" in _ta_df.columns
+               else None)
+        s["turning_angles"] = _ta_df[col].values if col else None
+        # Mark whether these are signed (new format) or unsigned (legacy)
+        s["turning_angles_signed"] = (col == "turning_angle_deg")
     else:
         s["turning_angles"] = None
+        s["turning_angles_signed"] = False
 
     return s
 
@@ -3029,7 +3166,8 @@ def compare_groups(groups=None,
 
     if panels is None:
         panels = {"msd", "auc", "logd_dist", "mob_immob", "motion_classes",
-                  "track_length", "jdd", "dwell_cdf", "turning_angles"}
+                  "track_length", "jdd", "dwell_cdf", "turning_angles",
+                  "radial_dist"}
 
     n_groups = len(groups)
     labels   = [g.get("label", f"Group {i+1}") for i, g in enumerate(groups)]
@@ -3088,7 +3226,7 @@ def compare_groups(groups=None,
     # ── Render the figure ────────────────────────────────────────────────────
     panel_order = ["msd", "auc", "logd_dist", "mob_immob",
                    "motion_classes", "track_length",
-                   "jdd", "dwell_cdf", "turning_angles"]
+                   "jdd", "dwell_cdf", "turning_angles", "radial_dist"]
     enabled = [p for p in panel_order if p in panels]
     n_plots = len(enabled)
     if n_plots == 0:
@@ -3361,28 +3499,41 @@ def compare_groups(groups=None,
             ax.set_xticks([]); ax.set_yticks([])
             ax.set_title("Dwell Time Survival")
 
-    # ── 9. Turning angle distribution (N groups, deg 0-180) ───────────────────
+    # ── 9. Turning angle distribution (N groups, signed deg -180..+180) ───────
     if "turning_angles" in panels:
         ax = _next_ax()
         any_data = False
-        bins = np.linspace(0, 180, 37)
-        centers = 0.5 * (bins[:-1] + bins[1:])
+        # Collect first to decide whether to plot signed or legacy unsigned
+        pooled_per_group = []
+        any_signed = False
         for grp_label, summaries, color in _zip_groups():
             pooled = []
             for s in summaries:
                 ta = s.get("turning_angles")
                 if ta is None or len(ta) == 0: continue
-                pooled.extend(np.asarray(ta).ravel())
+                arr = np.asarray(ta).ravel()
+                if np.any(arr < -1e-3):
+                    any_signed = True
+                pooled.extend(arr)
+            pooled_per_group.append((grp_label, color, pooled))
+        if any_signed:
+            bins = np.linspace(-180, 180, 73)   # 5° bins, full circle
+            x_lim = (-180, 180); x_ticks = [-180, -90, 0, 90, 180]
+        else:
+            bins = np.linspace(0, 180, 37)
+            x_lim = (0, 180);    x_ticks = [0, 45, 90, 135, 180]
+        centers = 0.5 * (bins[:-1] + bins[1:])
+        for grp_label, color, pooled in pooled_per_group:
             if not pooled: continue
             any_data = True
             counts, _ = np.histogram(pooled, bins=bins)
             frac = counts / counts.sum() if counts.sum() else counts
             ax.plot(centers, frac, color=color, lw=1.5, label=grp_label)
         if any_data:
-            ax.set_xlabel("Turning angle (deg)")
+            ax.set_xlabel("Turning angle (deg)" + (" — signed" if any_signed else ""))
             ax.set_ylabel("Relative frequency")
-            ax.set_xlim(0, 180)
-            ax.set_xticks([0, 45, 90, 135, 180])
+            ax.set_xlim(*x_lim)
+            ax.set_xticks(x_ticks)
             ax.set_title("Turning Angle Distribution")
             ax.legend(frameon=False, loc="best")
         else:
@@ -3391,6 +3542,68 @@ def compare_groups(groups=None,
                     color=pal["GRD"], fontsize=9)
             ax.set_xticks([]); ax.set_yticks([])
             ax.set_title("Turning Angle Distribution")
+
+    # ── 10. Radial distribution (polar, signed turning angles) ────────────────
+    # Polar histogram showing the angular distribution of step-to-step
+    # turning angles.  Each group is plotted as a separate set of bars
+    # offset around each bin centre.  Replace the auto-created cartesian
+    # axis with a polar one at the same grid position.
+    if "radial_dist" in panels:
+        old_ax = axes[panel_idx]
+        pos = old_ax.get_position()
+        old_ax.remove()
+        ax = fig.add_axes(pos.bounds, projection="polar")
+        axes[panel_idx] = ax
+        panel_idx += 1
+
+        any_data = False
+        n_bins = 36
+        bin_edges   = np.linspace(-np.pi, np.pi, n_bins + 1)
+        bin_centres = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+        bar_width   = (bin_edges[1] - bin_edges[0]) / max(1, n_groups) * 0.9
+
+        for gi in range(n_groups):
+            grp_label = labels[gi]
+            color     = colors[gi]
+            pooled = []
+            for s in all_summaries[gi]:
+                ta = s.get("turning_angles")
+                if ta is None or len(ta) == 0: continue
+                pooled.extend(np.asarray(ta).ravel())
+            if not pooled:
+                continue
+            arr = np.asarray(pooled, dtype=float)
+            # Legacy unsigned data has no rotational-direction info; mirror
+            # it so the polar plot is symmetric but readable.
+            if not np.any(arr < -1e-3):
+                arr = np.concatenate([arr, -arr])
+            angles_rad = np.deg2rad(arr)
+            counts, _ = np.histogram(angles_rad, bins=bin_edges, density=True)
+            any_data = True
+            offset = (gi - (n_groups - 1) / 2) * bar_width
+            ax.bar(bin_centres + offset, counts, width=bar_width,
+                   bottom=0.0, color=color, alpha=0.7,
+                   edgecolor=pal["GRD"], linewidth=0.4,
+                   label=grp_label)
+
+        if any_data:
+            ax.set_theta_zero_location("E")
+            ax.set_theta_direction(1)
+            ax.set_xticks(np.deg2rad([0, 45, 90, 135, 180, -135, -90, -45]))
+            ax.set_xticklabels(["0°", "+45°", "+90°", "+135°", "±180°",
+                                "−135°", "−90°", "−45°"], fontsize=7)
+            ax.tick_params(axis="y", labelsize=6, colors=pal["TXT"])
+            ax.set_title("Radial Distribution  (signed turning angles)",
+                         pad=14, fontsize=10)
+            ax.legend(loc="upper right", bbox_to_anchor=(1.20, 1.10),
+                      frameon=False, fontsize=8)
+            ax.grid(True, ls=":", alpha=0.4)
+        else:
+            ax.text(0.5, 0.5, "No turning-angle data",
+                    ha="center", va="center", transform=ax.transAxes,
+                    color=pal["GRD"], fontsize=9)
+            ax.set_xticks([]); ax.set_yticks([])
+            ax.set_title("Radial Distribution")
 
     # ── Suptitle: Group A (n=…) vs Group B (n=…) [vs Group C …] ───────────────
     parts = [f"{labels[i]}  (n={len(all_summaries[i])})" for i in range(n_groups)]
