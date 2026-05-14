@@ -3128,19 +3128,62 @@ class SPTPalmApp(_APP_BASE):
             return
 
         exts = (".czi", ".tif", ".tiff")
-        files = sorted(
+        all_files = sorted(
             f for f in os.listdir(folder)
             if os.path.splitext(f)[1].lower() in exts
             and not f.startswith(".")
         )
-        if not files:
+        if not all_files:
             messagebox.showinfo("Batch", "No CZI or TIF files found in that folder.")
             return
 
-        if not messagebox.askyesno(
-                "Batch Process",
-                f"Found {len(files)} file(s) in:\n{folder}\n\n"
-                f"Run analysis on all of them with current settings?"):
+        # Group multi-file series together so each logical experiment is
+        # analysed once.  Zeiss splits long acquisitions into companion files
+        # named e.g. experiment.czi, experiment(1).czi, experiment(2).czi —
+        # load_file auto-detects and stitches them, so passing every file
+        # individually to the batch worker would re-analyse the same data
+        # 2-4 times.  Strip the trailing "(N)" from each basename, group by
+        # the resulting root, and keep one representative per group.
+        import re as _re
+        groups = {}   # root → list of (filename, suffix_index)
+        for f in all_files:
+            stem, ext = os.path.splitext(f)
+            m = _re.search(r"\((\d+)\)$", stem)
+            if m:
+                root = stem[:m.start()].rstrip() + ext
+                idx  = int(m.group(1))
+            else:
+                root = f
+                idx  = -1     # no-suffix file sorts before any (N) file
+            groups.setdefault(root, []).append((f, idx))
+        # Pick the representative (no-suffix file if present, otherwise
+        # lowest-numbered companion) for each group.
+        files  = []
+        series_info = []   # for the confirmation dialog
+        for root, members in sorted(groups.items()):
+            members.sort(key=lambda m: m[1])
+            primary = members[0][0]
+            files.append(primary)
+            if len(members) > 1:
+                series_info.append(
+                    f"  {primary}  +  {len(members) - 1} companion(s)")
+
+        # Build a friendly confirmation
+        n_series  = len(files)
+        n_files   = len(all_files)
+        msg_lines = [f"Found {n_files} file(s) in:\n{folder}\n"]
+        if series_info:
+            msg_lines.append(
+                f"{len(series_info)} multi-file series detected:\n"
+                + "\n".join(series_info[:10])
+                + ("" if len(series_info) <= 10 else
+                   f"\n  …and {len(series_info) - 10} more"))
+            msg_lines.append("")
+        msg_lines.append(
+            f"This will run {n_series} analysis run(s) "
+            f"(one per file or series).\n\n"
+            f"Continue with current settings?")
+        if not messagebox.askyesno("Batch Process", "\n".join(msg_lines)):
             return
 
         self._running = True
