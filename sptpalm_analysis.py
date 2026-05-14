@@ -2417,13 +2417,16 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
     sax(ax, "N", "Moment Scaling Spectrum  (MSS slope)")
 
     # O — Radial Distribution of turning angles (polar)
-    # A polar histogram of signed turning angles.  Bars radiate outward from
-    # the origin; their angular position is the turning direction (0° =
-    # straight ahead, ±180° = full reversal, ±90° = right-angle turns) and
-    # their height is the relative frequency.  A uniform circle indicates
-    # Brownian motion; a lobe at 0° indicates directional persistence; a
-    # lobe at ±180° indicates back-tracking / confinement.
-    ax = fig.add_subplot(gs[5, 0], projection="polar")
+    # A polar histogram of signed turning angles, oriented so 0° (straight
+    # ahead) is at the top and positive angles sweep CLOCKWISE around to the
+    # right (i.e. right hemisphere = positive turns, left hemisphere =
+    # negative turns).  The bars radiate outward; their angular position is
+    # the turning direction, their height the relative frequency.  Uniform
+    # circle = Brownian motion; lobe at 0° = directional persistence; lobe
+    # at ±180° = back-tracking / confinement.
+    # Placed at the centre column of row 5 so it sits visually balanced
+    # rather than pinned to a corner.
+    ax = fig.add_subplot(gs[5, 1], projection="polar")
     if turning_angles is None or len(turning_angles) < 10:
         ax.text(0.5, 0.5, "Insufficient data", transform=ax.transAxes,
                 ha="center", va="center", color=TXT, fontsize=11)
@@ -2443,8 +2446,8 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
         width = bins[1] - bins[0]
         ax.bar(theta, counts, width=width * 0.95, bottom=0.0,
                color=ACC, alpha=0.75, edgecolor=GRD, linewidth=0.5)
-        ax.set_theta_zero_location("E")    # 0° at right (east)
-        ax.set_theta_direction(1)           # counter-clockwise positive
+        ax.set_theta_zero_location("N")     # 0° at the top
+        ax.set_theta_direction(-1)          # clockwise positive (right = +)
         ax.set_xticks(np.deg2rad([0, 45, 90, 135, 180, -135, -90, -45]))
         ax.set_xticklabels(["0°", "+45°", "+90°", "+135°", "±180°",
                             "−135°", "−90°", "−45°"], fontsize=8)
@@ -3587,8 +3590,10 @@ def compare_groups(groups=None,
                    label=grp_label)
 
         if any_data:
-            ax.set_theta_zero_location("E")
-            ax.set_theta_direction(1)
+            # Conventional orientation: 0° at top (straight ahead),
+            # right hemisphere = positive turns, left hemisphere = negative.
+            ax.set_theta_zero_location("N")
+            ax.set_theta_direction(-1)
             ax.set_xticks(np.deg2rad([0, 45, 90, 135, 180, -135, -90, -45]))
             ax.set_xticklabels(["0°", "+45°", "+90°", "+135°", "±180°",
                                 "−135°", "−90°", "−45°"], fontsize=7)
