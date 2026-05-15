@@ -3261,6 +3261,11 @@ def compare_groups(groups=None,
     n_plots = len(enabled)
     if n_plots == 0:
         raise RuntimeError("No panels enabled")
+    print(f"  Compare: rendering {n_plots} panel(s): {enabled}")
+    if "radial_dist" not in panels:
+        print(f"  Compare: 'radial_dist' NOT in requested panels — "
+              f"check the 'Radial distribution (polar)' tickbox in the "
+              f"Compare tab to include it.")
     ncols = 3 if n_plots > 4 else 2
     nrows = (n_plots + ncols - 1) // ncols
 
