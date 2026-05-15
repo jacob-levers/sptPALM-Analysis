@@ -3620,38 +3620,26 @@ def compare_groups(groups=None,
                 any_data = True
 
         if any_data:
-            # ── First normalise each group to ITS OWN total ──────────────────
-            # Otherwise the larger-sample group dominates every bin just by
-            # virtue of sample size, hiding any real shape difference between
-            # groups.  After this step each group's normalised values sum to
-            # 1.0 across the full circle, so the polar bars compare shapes,
-            # not raw counts.
-            normalised_per_group = []
+            # ── Normalise each group to ITS OWN total ─────────────────────
+            # Otherwise a group with more total angles automatically draws
+            # bigger bars everywhere — a sample-size artefact, not a real
+            # shape difference.  After dividing by the per-group total, each
+            # group's values sum to 1.0 across the full circle, so the bars
+            # compare distribution SHAPE.
+            # Bars from different groups are offset around each bin centre
+            # for easy side-by-side comparison.
+            per_bar_width = bar_width / max(1, n_groups) * 0.95
             for gi, counts in counts_per_group:
                 total = counts.sum()
-                normalised = counts / total if total > 0 else counts
-                normalised_per_group.append((gi, normalised))
-
-            # ── Now stack to 100 % per angular bin ───────────────────────────
-            # The bin's total is the sum of all groups' normalised values at
-            # that angle.  A bin where every group has the same RELATIVE
-            # density contributes 1/N from each group → the stack at that
-            # bin is split evenly; an asymmetric peak in one group widens
-            # that group's segment at that angle.
-            stacked_totals = np.sum([n for _, n in normalised_per_group],
-                                    axis=0)
-            safe_totals    = np.where(stacked_totals > 0, stacked_totals, 1.0)
-
-            bottom = np.zeros(n_bins)
-            for gi, normalised in normalised_per_group:
-                segment = normalised / safe_totals
-                ax.bar(bin_centres, segment,
-                       width=bar_width, bottom=bottom,
+                if total <= 0:
+                    continue
+                normalised = counts / total
+                offset = (gi - (n_groups - 1) / 2) * per_bar_width
+                ax.bar(bin_centres + offset, normalised,
+                       width=per_bar_width, bottom=0.0,
                        color=colors[gi], alpha=0.85,
                        edgecolor=pal["GRD"], linewidth=0.3,
                        label=labels[gi])
-                bottom = bottom + segment
-            ax.set_ylim(0, 1.0)
 
         if any_data:
             # Conventional orientation: 0° at top (straight ahead),
@@ -3666,8 +3654,8 @@ def compare_groups(groups=None,
             # interpreted comparatively, not in absolute density units.
             ax.set_yticklabels([])
             ax.tick_params(axis="y", which="both", left=False)
-            ax.set_title("Radial Distribution  (per-bin group composition, "
-                         "100 % stacked)", pad=14, fontsize=9)
+            ax.set_title("Radial Distribution  (each group normalised to "
+                         "its own total)", pad=14, fontsize=9)
             ax.legend(loc="upper right", bbox_to_anchor=(1.20, 1.10),
                       frameon=False, fontsize=8)
             ax.grid(True, ls=":", alpha=0.4)
