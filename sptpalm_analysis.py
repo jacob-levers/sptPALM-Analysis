@@ -3592,37 +3592,51 @@ def compare_groups(groups=None,
 
         any_data = False
         n_bins = 36
-        # See the equivalent comment in make_figure: matplotlib polar bar()
-        # only renders correctly when theta ∈ [0, 2π).  Shift the data
-        # accordingly; the xticks are placed at positive-only angles but
-        # labelled with the signed equivalents the user expects.
+        # matplotlib polar bar() only renders correctly when theta ∈ [0, 2π);
+        # shift the data accordingly.  The xticks are placed at positive-only
+        # angles but labelled with their signed equivalents.
         bin_edges   = np.linspace(0, 2 * np.pi, n_bins + 1)
         bin_centres = 0.5 * (bin_edges[:-1] + bin_edges[1:])
-        bar_width   = (bin_edges[1] - bin_edges[0]) / max(1, n_groups) * 0.9
+        bar_width   = (bin_edges[1] - bin_edges[0]) * 0.95
 
+        # First pass: get raw counts per group per bin.
+        counts_per_group = []     # list of (group_idx, counts_array)
         for gi in range(n_groups):
-            grp_label = labels[gi]
-            color     = colors[gi]
             pooled = []
             for s in all_summaries[gi]:
                 ta = s.get("turning_angles")
                 if ta is None or len(ta) == 0: continue
                 pooled.extend(np.asarray(ta).ravel())
             if not pooled:
+                counts_per_group.append((gi, np.zeros(n_bins)))
                 continue
             arr = np.asarray(pooled, dtype=float)
-            # Legacy unsigned data has no rotational-direction info; mirror
-            # it so the polar plot is symmetric but readable.
             if not np.any(arr < -1e-3):
                 arr = np.concatenate([arr, -arr])
             angles_rad = np.mod(np.deg2rad(arr), 2 * np.pi)
-            counts, _ = np.histogram(angles_rad, bins=bin_edges, density=True)
-            any_data = True
-            offset = (gi - (n_groups - 1) / 2) * bar_width
-            ax.bar(bin_centres + offset, counts, width=bar_width,
-                   bottom=0.0, color=color, alpha=0.7,
-                   edgecolor=pal["GRD"], linewidth=0.4,
-                   label=grp_label)
+            counts, _ = np.histogram(angles_rad, bins=bin_edges)
+            counts_per_group.append((gi, counts.astype(float)))
+            if counts.sum() > 0:
+                any_data = True
+
+        if any_data:
+            # Per-bin total across all groups.  Bins with zero data get a
+            # tiny denominator so their fractions are 0 (avoids /0).
+            totals = np.sum([c for _, c in counts_per_group], axis=0)
+            safe   = np.where(totals > 0, totals, 1.0)
+
+            # Stack each group's fractional contribution to each bin so
+            # every bar sums to 1.0 (= 100% of the data in that direction).
+            bottom = np.zeros(n_bins)
+            for gi, counts in counts_per_group:
+                frac = counts / safe
+                ax.bar(bin_centres, frac,
+                       width=bar_width, bottom=bottom,
+                       color=colors[gi], alpha=0.85,
+                       edgecolor=pal["GRD"], linewidth=0.3,
+                       label=labels[gi])
+                bottom = bottom + frac
+            ax.set_ylim(0, 1.0)
 
         if any_data:
             # Conventional orientation: 0° at top (straight ahead),
@@ -3637,8 +3651,8 @@ def compare_groups(groups=None,
             # interpreted comparatively, not in absolute density units.
             ax.set_yticklabels([])
             ax.tick_params(axis="y", which="both", left=False)
-            ax.set_title("Radial Distribution  (signed turning angles)",
-                         pad=14, fontsize=10)
+            ax.set_title("Radial Distribution  (per-bin group composition, "
+                         "100 % stacked)", pad=14, fontsize=9)
             ax.legend(loc="upper right", bbox_to_anchor=(1.20, 1.10),
                       frameon=False, fontsize=8)
             ax.grid(True, ls=":", alpha=0.4)
