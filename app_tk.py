@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-sptPALM Analysis Pipeline — Zeiss Elyra — By Jacob Levers
+FIREFLY — Fluorescence Inference & Reconstruction Engine:
+Framework for Localization Yields — By Jacob Levers
 Tkinter GUI | Cross-platform, PyInstaller-ready
 Run with:  python app_tk.py
 """
@@ -83,7 +84,7 @@ def _bootstrap():
               "Consolas" if sys.platform == "win32"  else "DejaVu Sans Mono")
 
     root = tk.Tk()
-    root.title("sptPALM — First-time Setup")
+    root.title("FIREFLY — First-time Setup")
     root.configure(bg=_BG)
     root.resizable(False, False)
     W, H = 520, 400
@@ -91,7 +92,7 @@ def _bootstrap():
     sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
     root.geometry(f"{W}x{H}+{(sw - W) // 2}+{(sh - H) // 2}")
 
-    tk.Label(root, text="sptPALM", bg=_BG, fg=_ACC,
+    tk.Label(root, text="FIREFLY", bg=_BG, fg=_ACC,
              font=(_FF, 22, "bold")).pack(pady=(28, 2))
     tk.Label(root, text="First-time setup  —  installing required libraries",
              bg=_BG, fg=_MUTED, font=(_FF, 11)).pack(pady=(0, 14))
@@ -165,7 +166,7 @@ def _bootstrap():
                 else:
                     _log(f"  ✓ {pkg}", "acc")
 
-            _log("\nAll done!  Launching sptPALM…", "green")
+            _log("\nAll done!  Launching FIREFLY…", "green")
             _set_status("Done — launching…")
             root.after(0, lambda: pbar.configure(mode="determinate",
                                                   value=100))
@@ -1021,7 +1022,8 @@ class _ROIEditorDialog(tk.Toplevel):
 class SPTPalmApp(_APP_BASE):
     def __init__(self):
         super().__init__()
-        self.title("sptPALM Analysis Pipeline — Zeiss Elyra — By Jacob Levers")
+        self.title("FIREFLY — Fluorescence Inference & Reconstruction Engine: "
+                   "Framework for Localization Yields — By Jacob Levers")
         self.geometry("1280x820")
         self.minsize(960, 640)
         self.configure(bg=BG)
@@ -1109,8 +1111,9 @@ class SPTPalmApp(_APP_BASE):
         self._drawn_roi_mask = None   # numpy bool array set by ROI editor
 
         # Acquisition
-        # Defaults are tuned for Drosophila neurons on Zeiss Elyra 7.
-        # CZI files override pixel_size and frame_interval automatically.
+        # Default values are typical for membrane-protein PALM acquisitions
+        # at ~100 nm pixel size and 50 ms frame interval; CZI files override
+        # pixel_size and frame_interval automatically.
         self.v_pixel_size     = tk.DoubleVar(value=0.104)
         self.v_frame_interval = tk.DoubleVar(value=0.020)
         self.v_override_px    = tk.BooleanVar(value=False)
@@ -1208,11 +1211,13 @@ class SPTPalmApp(_APP_BASE):
         hdr.pack(fill="x")
         inner_hdr = tk.Frame(hdr, bg=SIDEBAR)
         inner_hdr.pack(fill="x", padx=18, pady=12)
-        tk.Label(inner_hdr, text="sptPALM",
+        tk.Label(inner_hdr, text="FIREFLY",
                  bg=SIDEBAR, fg=ACC, font=F(22, "bold")).pack(side="left")
         tk.Label(inner_hdr, text=" Analysis Pipeline",
                  bg=SIDEBAR, fg=TXT, font=F(18)).pack(side="left")
-        tk.Label(inner_hdr, text="Zeiss Elyra  ·  Jacob Levers",
+        tk.Label(inner_hdr,
+                 text="Fluorescence Inference & Reconstruction Engine: "
+                      "Framework for Localization Yields  ·  Jacob Levers",
                  bg=SIDEBAR, fg=MUTED, font=F(11)).pack(side="right")
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x")  # separator
 
@@ -1530,11 +1535,11 @@ class SPTPalmApp(_APP_BASE):
                   info=(
                       "Physical size of one camera pixel in µm.\n\n"
                       "Auto-read from file metadata when available:\n"
-                      "  • CZI  — always present in Zeiss metadata\n"
+                      "  • CZI  — always present in Carl Zeiss metadata\n"
                       "  • OME-TIFF — PhysicalSizeX from OME-XML\n"
                       "  • ImageJ TIFF — XResolution + unit tag\n\n"
                       "Typical values:\n"
-                      "  • Zeiss Elyra 7, 63× oil (1.4 NA): ~0.106 µm/px\n"
+                      "  • 63× oil (1.4 NA): ~0.106 µm/px\n"
                       "  • 100× oil (1.46 NA): ~0.067 µm/px\n\n"
                       "Incorrect values scale all diffusion coefficients and "
                       "displacements proportionally — verify before running."
@@ -1555,7 +1560,7 @@ class SPTPalmApp(_APP_BASE):
                   info=(
                       "Time between consecutive frames in seconds.\n\n"
                       "Auto-read from file metadata when available:\n"
-                      "  • CZI  — always present in Zeiss metadata\n"
+                      "  • CZI  — always present in Carl Zeiss metadata\n"
                       "  • OME-TIFF — TimeIncrement from OME-XML\n"
                       "  • ImageJ TIFF — finterval / fps tag\n\n"
                       "Typical values:\n"
@@ -1619,7 +1624,7 @@ class SPTPalmApp(_APP_BASE):
                       "Expected diameter of a single fluorophore's point-spread "
                       "function (PSF) in pixels. Must be an odd integer.\n\n"
                       "Estimated as: diameter ≈ 2.4 × λ / (NA × pixel_size)\n\n"
-                      "Typical values (Zeiss Elyra 7, 0.106 µm/px, 1.4 NA):\n"
+                      "Typical values (0.106 µm/px, 1.4 NA objective):\n"
                       "  • 488 nm / 561 nm channel: 7 px\n"
                       "  • 642 nm channel: 9 px\n\n"
                       "Too small → misses dim particles. "

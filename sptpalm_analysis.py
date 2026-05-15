@@ -11,9 +11,10 @@ if sys.platform == "darwin":
         pass  # Already set
 
 """
-sptPALM Analysis Pipeline for Zeiss Elyra Microscope Data  (OPTIMISED)
+FIREFLY — Fluorescence Inference & Reconstruction Engine  (OPTIMISED)
 =======================================================================
-Supports .czi (native Zeiss) and .tif/.tiff files.
+Framework for Localization Yields.  Supports .czi (Zeiss native) and
+.tif / .tiff files.
 Pixel size and frame interval are read automatically from CZI metadata.
 
 Speed optimisations vs the original version:
@@ -2277,31 +2278,30 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
         pass
     sax(ax, "H", "Position Density Map")
 
-    # I — Turning Angle Distribution (signed, -180° .. +180°)
+    # I — Turning Angle Distribution
+    # Plotted as a single LINE following the count of each |angle| bin,
+    # using UNSIGNED magnitudes (|θ|) so the x-axis runs 0°–180° regardless
+    # of whether the underlying data is signed (v1.0.64+) or legacy
+    # unsigned.  0° = continued straight; 180° = full reversal; 90° = right-
+    # angle deflection; the radial-distribution panel (O) shows the
+    # rotational direction (sign) separately.
     ax = fig.add_subplot(gs[2, 2])
     if turning_angles is None or len(turning_angles) < 10:
         ax.text(0.5, 0.5, "Insufficient data", transform=ax.transAxes,
                 ha="center", va="center", color=TXT, fontsize=12)
     else:
-        ta_arr = np.asarray(turning_angles, dtype=float)
-        # Auto-detect signed vs legacy unsigned: if values lie wholly in
-        # [0, 180] we're looking at an old run.  Plot accordingly.
-        is_signed = bool(np.any(ta_arr < -1e-3))
-        if is_signed:
-            _ta_bins = np.linspace(-180, 180, 73)   # 5° bins, full circle
-            ax.hist(ta_arr, bins=_ta_bins, color=ACC, alpha=0.8, edgecolor="none")
-            ax.axvline(0,    color=GRD, lw=1.0, ls="--")
-            ax.axvline(180,  color=GRD, lw=0.8, ls=":")
-            ax.axvline(-180, color=GRD, lw=0.8, ls=":")
-            ax.set_xlim(-180, 180)
-            ax.set_xticks([-180, -90, 0, 90, 180])
-        else:
-            _ta_bins = np.linspace(0, 180, 37)
-            ax.hist(ta_arr, bins=_ta_bins, color=ACC, alpha=0.8, edgecolor="none")
-            ax.axvline(90, color=GRD, lw=1.0, ls="--")
-            ax.set_xlim(0, 180)
-            ax.set_xticks([0, 45, 90, 135, 180])
-        ax.set_xlabel("Turning angle (°)", fontsize=9)
+        ta_unsigned = np.abs(np.asarray(turning_angles, dtype=float))
+        _ta_bins = np.linspace(0, 180, 37)            # 5° bins
+        _ta_centres = 0.5 * (_ta_bins[:-1] + _ta_bins[1:])
+        _ta_counts, _ = np.histogram(ta_unsigned, bins=_ta_bins)
+        ax.plot(_ta_centres, _ta_counts, "-o",
+                color=ACC, lw=2, ms=3, alpha=0.95)
+        # Reference lines: 90° (right-angle), and 180° (full reversal)
+        ax.axvline(90,  color=GRD, lw=0.8, ls="--")
+        ax.axvline(180, color=GRD, lw=0.6, ls=":")
+        ax.set_xlim(0, 180)
+        ax.set_xticks([0, 45, 90, 135, 180])
+        ax.set_xlabel("|Turning angle|  (°)", fontsize=9)
         ax.set_ylabel("Count", fontsize=9)
         ax.grid(True, ls=":", alpha=0.3)
     sax(ax, "I", "Turning Angle Distribution")
@@ -2484,7 +2484,7 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
     md = diff_df["D"].dropna().median()
     ma = diff_df["alpha"].dropna().median()
     fig.suptitle(
-        f"sptPALM Analysis  |  {diff_df.shape[0]:,} trajectories  |  "
+        f"FIREFLY Analysis  |  {diff_df.shape[0]:,} trajectories  |  "
         f"Median D = {md:.4f} um2/s  |  Median alpha = {ma:.2f}",
         fontsize=13,color=TXT,y=0.97,fontweight="bold")
 
@@ -2548,7 +2548,8 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="sptPALM for Zeiss Elyra CZI/TIF (optimised)",
+        description="FIREFLY — Fluorescence Inference & Reconstruction Engine "
+                    "(CZI / TIF, optimised)",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("input")
     p.add_argument("--pixel-size",       type=float, default=None)
@@ -3528,41 +3529,34 @@ def compare_groups(groups=None,
             ax.set_xticks([]); ax.set_yticks([])
             ax.set_title("Dwell Time Survival")
 
-    # ── 9. Turning angle distribution (N groups, signed deg -180..+180) ───────
+    # ── 9. Turning angle distribution (N groups, unsigned |angle|) ────────────
+    # Single line per group, plotting the count of each |θ| bin on
+    # the same 0°–180° x-axis.  Sign / rotational direction is handled
+    # separately by the Radial Distribution panel.
     if "turning_angles" in panels:
         ax = _next_ax()
         any_data = False
-        # Collect first to decide whether to plot signed or legacy unsigned
+        bins = np.linspace(0, 180, 37)                 # 5° bins
+        centers = 0.5 * (bins[:-1] + bins[1:])
         pooled_per_group = []
-        any_signed = False
         for grp_label, summaries, color in _zip_groups():
             pooled = []
             for s in summaries:
                 ta = s.get("turning_angles")
                 if ta is None or len(ta) == 0: continue
-                arr = np.asarray(ta).ravel()
-                if np.any(arr < -1e-3):
-                    any_signed = True
-                pooled.extend(arr)
+                pooled.extend(np.abs(np.asarray(ta).ravel()))
             pooled_per_group.append((grp_label, color, pooled))
-        if any_signed:
-            bins = np.linspace(-180, 180, 73)   # 5° bins, full circle
-            x_lim = (-180, 180); x_ticks = [-180, -90, 0, 90, 180]
-        else:
-            bins = np.linspace(0, 180, 37)
-            x_lim = (0, 180);    x_ticks = [0, 45, 90, 135, 180]
-        centers = 0.5 * (bins[:-1] + bins[1:])
         for grp_label, color, pooled in pooled_per_group:
             if not pooled: continue
             any_data = True
             counts, _ = np.histogram(pooled, bins=bins)
             frac = counts / counts.sum() if counts.sum() else counts
-            ax.plot(centers, frac, color=color, lw=1.5, label=grp_label)
+            ax.plot(centers, frac, "-o", color=color, lw=1.5, ms=3, label=grp_label)
         if any_data:
-            ax.set_xlabel("Turning angle (deg)" + (" — signed" if any_signed else ""))
+            ax.set_xlabel("|Turning angle|  (°)")
             ax.set_ylabel("Relative frequency")
-            ax.set_xlim(*x_lim)
-            ax.set_xticks(x_ticks)
+            ax.set_xlim(0, 180)
+            ax.set_xticks([0, 45, 90, 135, 180])
             ax.set_title("Turning Angle Distribution")
             ax.legend(frameon=False, loc="best")
         else:

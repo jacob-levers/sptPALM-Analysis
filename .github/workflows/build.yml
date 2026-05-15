@@ -16,7 +16,7 @@ env:
 
 jobs:
   # ──────────────────────────────────────────────────────────────────────────
-  #  macOS  →  sptPALM.app  →  sptPALM-macOS.dmg
+  #  macOS  →  FIREFLY.app  →  FIREFLY-macOS.dmg
   # ──────────────────────────────────────────────────────────────────────────
   build-macos:
     runs-on: macos-latest          # arm64 (M-series); change to macos-13 for Intel
@@ -42,28 +42,28 @@ jobs:
       - name: Create DMG
         run: |
           hdiutil create \
-            -volname "sptPALM" \
-            -srcfolder "dist/sptPALM.app" \
+            -volname "FIREFLY" \
+            -srcfolder "dist/FIREFLY.app" \
             -ov -format UDZO \
-            "dist/sptPALM-macOS.dmg"
+            "dist/FIREFLY-macOS.dmg"
 
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sptPALM-macOS
-          path: dist/sptPALM-macOS.dmg
+          name: FIREFLY-macOS
+          path: dist/FIREFLY-macOS.dmg
           retention-days: 30
 
       - name: Upload to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/sptPALM-macOS.dmg
+          files: dist/FIREFLY-macOS.dmg
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # ──────────────────────────────────────────────────────────────────────────
-  #  Windows  →  sptPALM folder  →  sptPALM-Windows.zip
+  #  Windows  →  FIREFLY folder  →  FIREFLY-Windows.zip
   # ──────────────────────────────────────────────────────────────────────────
   build-windows:
     runs-on: windows-latest
@@ -85,7 +85,7 @@ jobs:
           pip install "pyinstaller==6.11.1"   # pinned for reproducible Tcl/Tk bundling behaviour
 
       - name: Build exe (onefile)
-        # Spec produces a single self-contained sptPALM.exe.  Tcl/Tk and all
+        # Spec produces a single self-contained FIREFLY.exe.  Tcl/Tk and all
         # binaries are bundled INSIDE the exe and extracted to %TEMP% at
         # runtime — no chance of user extraction dropping files.
         run: pyinstaller sptpalm.spec --noconfirm --clean
@@ -93,13 +93,13 @@ jobs:
       - name: Verify exe exists and is reasonable size
         shell: pwsh
         run: |
-          $exe = "dist\sptPALM.exe"
+          $exe = "dist\FIREFLY.exe"
           if (-not (Test-Path $exe)) {
             Write-Error "FATAL: $exe not produced by build"
             exit 1
           }
           $sizeMB = (Get-Item $exe).Length / 1MB
-          Write-Host ("sptPALM.exe size: {0:N1} MB" -f $sizeMB)
+          Write-Host ("FIREFLY.exe size: {0:N1} MB" -f $sizeMB)
           if ($sizeMB -lt 50) {
             Write-Error "FATAL: $exe is suspiciously small ($sizeMB MB) — bundle is incomplete"
             exit 1
@@ -111,7 +111,7 @@ jobs:
           # Marker-file handshake: app writes a file only AFTER Tk fully
           # initialises.  Catches startup crashes that PyInstaller hides
           # behind an error dialog (which would otherwise keep HasExited false).
-          $exe    = "dist\sptPALM.exe"
+          $exe    = "dist\FIREFLY.exe"
           $marker = Join-Path $env:RUNNER_TEMP "sptpalm_ready.marker"
           Remove-Item -Path $marker -ErrorAction SilentlyContinue
           $env:SPTPALM_READY_MARKER = $marker
@@ -144,14 +144,14 @@ jobs:
       - name: Upload exe artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sptPALM-Windows
-          path: dist\sptPALM.exe
+          name: FIREFLY-Windows
+          path: dist\FIREFLY.exe
           retention-days: 30
 
       - name: Upload to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist\sptPALM.exe
+          files: dist\FIREFLY.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

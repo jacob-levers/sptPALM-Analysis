@@ -193,7 +193,7 @@ if sys.platform == "win32":
         a.zipfiles,
         a.datas,
         [],
-        name="sptPALM",
+        name="FIREFLY",
         debug=False,
         bootloader_ignore_signals=False,
         strip=False,
@@ -213,7 +213,7 @@ else:
         a.scripts,
         [],
         exclude_binaries=True,
-        name="sptPALM",
+        name="FIREFLY",
         debug=False,
         bootloader_ignore_signals=False,
         strip=False,
@@ -232,18 +232,18 @@ else:
         strip=False,
         upx=False,
         upx_exclude=[],
-        name="sptPALM",
+        name="FIREFLY",
     )
 
     if sys.platform == "darwin":
         app = BUNDLE(
             coll,
-            name="sptPALM.app",
+            name="FIREFLY.app",
             icon=None,
-            bundle_identifier="com.jacoblevers.sptpalm",
+            bundle_identifier="com.jacoblevers.firefly",
             info_plist={
-                "CFBundleName": "sptPALM",
-                "CFBundleDisplayName": "sptPALM Analysis Pipeline",
+                "CFBundleName": "FIREFLY",
+                "CFBundleDisplayName": "FIREFLY — Fluorescence Inference & Reconstruction Engine",
                 "CFBundleVersion": "1.0.0",
                 "CFBundleShortVersionString": "1.0.0",
                 "NSHighResolutionCapable": True,
