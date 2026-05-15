@@ -3130,20 +3130,29 @@ def _bar_with_dots_n(ax, data_per_group, labels, colors, palette,
     top_data = max([a.max() if len(a) else 0 for a in arrs] + [max(means) * 1.2 if max(means) > 0 else 1])
     if n == 2 and pairwise:
         pair = pairwise[0]
-        if pair["stars"]:
+        if pair["stars"] and np.isfinite(pair["p"]):
             top = top_data * 1.05
             ax.plot([0, 0, 1, 1], [top, top * 1.03, top * 1.03, top],
                     color=sig_col, lw=0.8)
-            ax.text(0.5, top * 1.05, pair["stars"], ha="center", va="bottom",
-                    fontsize=11, color=sig_col)
-            ax.set_ylim(0, top * 1.20)
+            # Numeric p plus stars, e.g. "p = 0.003  **"
+            p_str = (f"p = {pair['p']:.2e}" if pair['p'] < 0.001
+                     else f"p = {pair['p']:.3f}")
+            label = f"{p_str}  {pair['stars']}"
+            ax.text(0.5, top * 1.05, label, ha="center", va="bottom",
+                    fontsize=9, color=sig_col)
+            # Make room above the bracket for the longer label
+            ax.set_ylim(0, top * 1.30)
     elif n > 2 and omnibus:
-        # Show omnibus p as a small annotation in the upper-left corner
-        text = f"{omnibus['test']}: p={omnibus['p']:.3g}  {omnibus['stars']}"
+        # Show test name + omnibus p + stars in the upper-left corner.
+        # Numeric format adapts to magnitude: scientific < 0.001, fixed otherwise.
+        p_val = omnibus['p']
+        p_str = (f"p = {p_val:.2e}" if p_val < 0.001
+                 else f"p = {p_val:.3f}")
+        text = f"{omnibus['test']}\n{p_str}   {omnibus['stars']}"
         ax.text(0.02, 0.98, text, transform=ax.transAxes,
                 ha="left", va="top", fontsize=8, color=sig_col,
                 bbox=dict(facecolor=palette["PNL"], edgecolor="none",
-                          alpha=0.7, pad=2))
+                          alpha=0.7, pad=3))
 
 
 def compare_groups(groups=None,
