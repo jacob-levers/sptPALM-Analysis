@@ -2447,6 +2447,12 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
     else:
         ta_arr = np.asarray(turning_angles, dtype=float)
         is_signed = bool(np.any(ta_arr < -1e-3))
+        # Diagnostic print so we can verify the data on disk matches what
+        # the polar panel actually receives.
+        print(f"  Radial-dist input: n={len(ta_arr):,}  "
+              f"signed={is_signed}  "
+              f"pos={int((ta_arr>0).sum()):,}  neg={int((ta_arr<0).sum()):,}  "
+              f"min={ta_arr.min():.1f}°  max={ta_arr.max():.1f}°")
         if not is_signed:
             # Legacy unsigned data: mirror to make the polar plot symmetric so
             # the visualisation still works (no rotational-direction info).
@@ -2464,7 +2470,11 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
         ax.set_xticks(np.deg2rad([0, 45, 90, 135, 180, -135, -90, -45]))
         ax.set_xticklabels(["0°", "+45°", "+90°", "+135°", "±180°",
                             "−135°", "−90°", "−45°"], fontsize=8)
-        ax.tick_params(axis="y", labelsize=7, colors=TXT)
+        # Hide the radial axis labels and tick marks — the magnitude of the
+        # density is implicit from bar length and rarely interpretable in
+        # absolute units, so removing the numbers cleans up the figure.
+        ax.set_yticklabels([])
+        ax.tick_params(axis="y", which="both", left=False)
         ax.grid(True, ls=":", alpha=0.4)
     sax(ax, "O", "Radial Distribution  (signed turning angles)")
 
@@ -3616,7 +3626,10 @@ def compare_groups(groups=None,
             ax.set_xticks(np.deg2rad([0, 45, 90, 135, 180, -135, -90, -45]))
             ax.set_xticklabels(["0°", "+45°", "+90°", "+135°", "±180°",
                                 "−135°", "−90°", "−45°"], fontsize=7)
-            ax.tick_params(axis="y", labelsize=6, colors=pal["TXT"])
+            # Hide the radial-axis numeric labels — bar length is
+            # interpreted comparatively, not in absolute density units.
+            ax.set_yticklabels([])
+            ax.tick_params(axis="y", which="both", left=False)
             ax.set_title("Radial Distribution  (signed turning angles)",
                          pad=14, fontsize=10)
             ax.legend(loc="upper right", bbox_to_anchor=(1.20, 1.10),
