@@ -185,6 +185,13 @@ pyz = PYZ(a.pure, a.zipped_data)
 # special chars), and Defender quarantines .tcl scripts.  Onefile sidesteps
 # this entirely: the bundle is a single .exe that extracts itself to %TEMP%
 # at runtime where no user/AV can accidentally damage it.
+_ICON_WIN = os.path.join(SPECPATH, "assets", "icon.ico") if (
+    'SPECPATH' in dir() and os.path.isfile(
+        os.path.join(SPECPATH, "assets", "icon.ico"))) else None
+_ICON_MAC = os.path.join(SPECPATH, "assets", "icon.icns") if (
+    'SPECPATH' in dir() and os.path.isfile(
+        os.path.join(SPECPATH, "assets", "icon.icns"))) else None
+
 if sys.platform == "win32":
     exe = EXE(
         pyz,
@@ -205,6 +212,7 @@ if sys.platform == "win32":
         target_arch=None,
         codesign_identity=None,
         entitlements_file=None,
+        icon=_ICON_WIN,
     )
 else:
     # macOS/Linux: ONEDIR mode (then wrap in .app/.dmg on macOS)
@@ -239,7 +247,7 @@ else:
         app = BUNDLE(
             coll,
             name="FIREFLY.app",
-            icon=None,
+            icon=_ICON_MAC,
             bundle_identifier="com.jacoblevers.firefly",
             info_plist={
                 "CFBundleName": "FIREFLY",
