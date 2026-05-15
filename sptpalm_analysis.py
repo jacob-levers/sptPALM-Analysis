@@ -2447,19 +2447,22 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
     else:
         ta_arr = np.asarray(turning_angles, dtype=float)
         is_signed = bool(np.any(ta_arr < -1e-3))
-        # Diagnostic print so we can verify the data on disk matches what
-        # the polar panel actually receives.
         print(f"  Radial-dist input: n={len(ta_arr):,}  "
               f"signed={is_signed}  "
               f"pos={int((ta_arr>0).sum()):,}  neg={int((ta_arr<0).sum()):,}  "
               f"min={ta_arr.min():.1f}°  max={ta_arr.max():.1f}°")
         if not is_signed:
-            # Legacy unsigned data: mirror to make the polar plot symmetric so
-            # the visualisation still works (no rotational-direction info).
             ta_arr = np.concatenate([ta_arr, -ta_arr])
-        angles_rad = np.deg2rad(ta_arr)
+        # CRITICAL: matplotlib polar's ax.bar() does NOT render correctly
+        # when theta values are in (-π, +π].  Half the bars (the side with
+        # negative theta after applying set_theta_direction) silently fail
+        # to draw, producing only a half-circle of bars.
+        # Empirical fix: shift the angles to [0, 2π) before histogramming.
+        # The xticks are then placed at positive-only angles too, but
+        # *labelled* with the signed values the user expects.
+        angles_rad = np.mod(np.deg2rad(ta_arr), 2 * np.pi)
         n_bins = 36
-        bins   = np.linspace(-np.pi, np.pi, n_bins + 1)
+        bins   = np.linspace(0, 2 * np.pi, n_bins + 1)
         counts, edges = np.histogram(angles_rad, bins=bins, density=True)
         theta = 0.5 * (edges[:-1] + edges[1:])
         width = bins[1] - bins[0]
@@ -2467,12 +2470,12 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
                color=ACC, alpha=0.75, edgecolor=GRD, linewidth=0.5)
         ax.set_theta_zero_location("N")     # 0° at the top
         ax.set_theta_direction(-1)          # clockwise positive (right = +)
-        ax.set_xticks(np.deg2rad([0, 45, 90, 135, 180, -135, -90, -45]))
+        # xticks at 0°, 45°, ..., 315° (positive only); labels show signed
+        # equivalents so the reader still sees "-45°" on the left, etc.
+        ax.set_xticks(np.deg2rad([0, 45, 90, 135, 180, 225, 270, 315]))
         ax.set_xticklabels(["0°", "+45°", "+90°", "+135°", "±180°",
                             "−135°", "−90°", "−45°"], fontsize=8)
-        # Hide the radial axis labels and tick marks — the magnitude of the
-        # density is implicit from bar length and rarely interpretable in
-        # absolute units, so removing the numbers cleans up the figure.
+        # Hide the radial-axis numeric labels.
         ax.set_yticklabels([])
         ax.tick_params(axis="y", which="both", left=False)
         ax.grid(True, ls=":", alpha=0.4)
@@ -3590,7 +3593,11 @@ def compare_groups(groups=None,
 
         any_data = False
         n_bins = 36
-        bin_edges   = np.linspace(-np.pi, np.pi, n_bins + 1)
+        # See the equivalent comment in make_figure: matplotlib polar bar()
+        # only renders correctly when theta ∈ [0, 2π).  Shift the data
+        # accordingly; the xticks are placed at positive-only angles but
+        # labelled with the signed equivalents the user expects.
+        bin_edges   = np.linspace(0, 2 * np.pi, n_bins + 1)
         bin_centres = 0.5 * (bin_edges[:-1] + bin_edges[1:])
         bar_width   = (bin_edges[1] - bin_edges[0]) / max(1, n_groups) * 0.9
 
@@ -3609,7 +3616,7 @@ def compare_groups(groups=None,
             # it so the polar plot is symmetric but readable.
             if not np.any(arr < -1e-3):
                 arr = np.concatenate([arr, -arr])
-            angles_rad = np.deg2rad(arr)
+            angles_rad = np.mod(np.deg2rad(arr), 2 * np.pi)
             counts, _ = np.histogram(angles_rad, bins=bin_edges, density=True)
             any_data = True
             offset = (gi - (n_groups - 1) / 2) * bar_width
@@ -3623,7 +3630,8 @@ def compare_groups(groups=None,
             # right hemisphere = positive turns, left hemisphere = negative.
             ax.set_theta_zero_location("N")
             ax.set_theta_direction(-1)
-            ax.set_xticks(np.deg2rad([0, 45, 90, 135, 180, -135, -90, -45]))
+            # Positive-only xticks; labelled with signed equivalents.
+            ax.set_xticks(np.deg2rad([0, 45, 90, 135, 180, 225, 270, 315]))
             ax.set_xticklabels(["0°", "+45°", "+90°", "+135°", "±180°",
                                 "−135°", "−90°", "−45°"], fontsize=7)
             # Hide the radial-axis numeric labels — bar length is
