@@ -1821,7 +1821,20 @@ def compute_turning_angles(tracks):
         angles = np.degrees(np.arctan2(cross[valid], dot[valid]))
         all_angles.append(angles)
     if all_angles:
-        return np.concatenate(all_angles)
+        result = np.concatenate(all_angles)
+        # Distribution sanity check — Brownian motion should produce a
+        # roughly symmetric distribution around 0°.  Strong asymmetry can
+        # indicate uncorrected drift, an asymmetric cellular geometry, or
+        # a real biological turn bias.  Printed for diagnostic verification.
+        if len(result) > 0:
+            pos = int((result > 0).sum())
+            neg = int((result < 0).sum())
+            zer = int((result == 0).sum())
+            print(f"    signed turning angles: "
+                  f"{pos:,} positive  /  {neg:,} negative  /  {zer:,} zero  "
+                  f"|  min={result.min():.1f}°  max={result.max():.1f}°  "
+                  f"mean={result.mean():.2f}°  median={np.median(result):.2f}°")
+        return result
     return np.array([])
 
 
@@ -3549,13 +3562,19 @@ def compare_groups(groups=None,
     # ── 10. Radial distribution (polar, signed turning angles) ────────────────
     # Polar histogram showing the angular distribution of step-to-step
     # turning angles.  Each group is plotted as a separate set of bars
-    # offset around each bin centre.  Replace the auto-created cartesian
-    # axis with a polar one at the same grid position.
+    # offset around each bin centre.
+    #
+    # Implementation note: we replace the auto-created cartesian axis with
+    # a polar one at the SAME SubplotSpec (not via fig.add_axes with raw
+    # bounds), so that the polar axis remains a managed gridspec member.
+    # If we used add_axes(bounds), tight_layout would later reposition the
+    # other (gridspec-managed) subplots but leave the polar in its original
+    # location, causing visible overlap.
     if "radial_dist" in panels:
         old_ax = axes[panel_idx]
-        pos = old_ax.get_position()
+        ss = old_ax.get_subplotspec()
         old_ax.remove()
-        ax = fig.add_axes(pos.bounds, projection="polar")
+        ax = fig.add_subplot(ss, projection="polar")
         axes[panel_idx] = ax
         panel_idx += 1
 
