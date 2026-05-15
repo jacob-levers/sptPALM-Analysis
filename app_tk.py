@@ -308,113 +308,41 @@ def FM(size=10, weight="normal"):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _generate_icon(size: int = 256):
-    """
-    App icon: a palm tree made of glowing particle traces on a dark circle.
-    Trunk and fronds are drawn as localisation dots connected by trajectory
-    lines, matching the UI colour palette.
-    Returns a PIL Image, or None if Pillow is unavailable.
+    """Load the FIREFLY app icon from assets/icon.png and return a square
+    PIL Image at the requested size.  Returns None if Pillow is missing or
+    the file cannot be found.
+
+    The icon is bundled by PyInstaller as a data file at the spec's
+    `_ICON_PNG_RESOLVE` path (assets/icon.png).  When the app runs frozen
+    it lives under ``sys._MEIPASS/assets/icon.png``; in source mode it
+    lives at ``<project_root>/assets/icon.png``.
     """
     try:
-        from PIL import Image, ImageDraw, ImageFilter
-        import math
+        from PIL import Image
     except ImportError:
         return None
 
-    s  = size
-    m  = s // 18
-    AC = (88, 166, 255)       # accent blue
-    BR = (210, 230, 255)      # bright white-blue for dots
+    # Candidate locations to try, in priority order.
+    candidates = []
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(os.path.join(meipass, "assets", "icon.png"))
+            candidates.append(os.path.join(meipass, "icon.png"))
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates.append(os.path.join(here, "assets", "icon.png"))
+    candidates.append(os.path.join(here, "icon.png"))
 
-    def p(fx, fy):
-        return (int(fx * s), int(fy * s))
-
-    def bezier(p0, p1, p2, n=7):
-        """Sample n points along a quadratic bezier curve."""
-        pts = []
-        for i in range(n):
-            t  = i / (n - 1)
-            u  = 1 - t
-            x  = u*u*p0[0] + 2*u*t*p1[0] + t*t*p2[0]
-            y  = u*u*p0[1] + 2*u*t*p1[1] + t*t*p2[1]
-            pts.append((int(x), int(y)))
-        return pts
-
-    # Trunk: gentle S-curve from base to crown
-    trunk = [
-        p(0.500, 0.900),
-        p(0.498, 0.820),
-        p(0.496, 0.740),
-        p(0.497, 0.660),
-        p(0.500, 0.580),
-        p(0.504, 0.510),
-        p(0.508, 0.450),
-        p(0.510, 0.390),   # crown
-    ]
-    crown = trunk[-1]
-
-    # Fronds: quadratic bezier (start=crown, control, tip)
-    # each tuple is (control_frac, tip_frac)
-    frond_defs = [
-        (p(0.36, 0.29), p(0.14, 0.33)),   # far left, drooping
-        (p(0.40, 0.22), p(0.27, 0.16)),   # mid left, upswept
-        (p(0.50, 0.20), p(0.50, 0.10)),   # straight up centre
-        (p(0.61, 0.22), p(0.74, 0.16)),   # mid right, upswept
-        (p(0.65, 0.29), p(0.87, 0.33)),   # far right, drooping
-    ]
-    fronds = [bezier(crown, ctrl, tip, n=7) for ctrl, tip in frond_defs]
-
-    # Collect all particle positions
-    all_pts = list(trunk)
-    for frond in fronds:
-        all_pts.extend(frond[1:])  # crown already in trunk
-
-    # ── Base circle ──────────────────────────────────────────────────────────
-    base = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-    d    = ImageDraw.Draw(base)
-    d.ellipse([m, m, s - m, s - m], fill=(13, 17, 23, 255))
-
-    # ── Glow layer ───────────────────────────────────────────────────────────
-    glow   = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-    g      = ImageDraw.Draw(glow)
-    spot_r = max(4, s // 30)
-    for x, y in all_pts:
-        for gr in range(spot_r * 4, 0, -1):
-            a = int(110 * (1 - gr / (spot_r * 4)) ** 2.0)
-            g.ellipse([x - gr, y - gr, x + gr, y + gr], fill=(*AC, a))
-    glow_blur = glow.filter(ImageFilter.GaussianBlur(radius=max(2, s // 36)))
-
-    # ── Sharp layer ──────────────────────────────────────────────────────────
-    sharp = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-    sh    = ImageDraw.Draw(sharp)
-
-    tlw = max(2, s // 56)   # trunk line width
-    flw = max(1, s // 80)   # frond line width
-
-    # Trunk lines (slightly brighter, thicker)
-    for i in range(len(trunk) - 1):
-        sh.line([trunk[i], trunk[i + 1]], fill=(*AC, 200), width=tlw)
-
-    # Frond lines (fade toward tip)
-    for frond in fronds:
-        n = len(frond)
-        for i in range(n - 1):
-            a = int(220 - 120 * (i / (n - 1)))
-            sh.line([frond[i], frond[i + 1]], fill=(*AC, a), width=flw)
-
-    # Particle dots
-    cr = max(2, s // 56)
-    for x, y in all_pts:
-        sh.ellipse([x - cr, y - cr, x + cr, y + cr], fill=(*BR, 255))
-
-    # Border ring
-    bw = max(2, s // 70)
-    sh.ellipse([m, m, s - m, s - m], outline=(*AC, 210), width=bw)
-
-    # ── Composite ────────────────────────────────────────────────────────────
-    final = base.copy()
-    final = Image.alpha_composite(final, glow_blur)
-    final = Image.alpha_composite(final, sharp)
-    return final
+    for path in candidates:
+        if os.path.isfile(path):
+            try:
+                img = Image.open(path).convert("RGBA")
+                if img.size != (size, size):
+                    img = img.resize((size, size), Image.LANCZOS)
+                return img
+            except Exception:
+                continue
+    return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════

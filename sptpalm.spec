@@ -74,6 +74,10 @@ try:
 except Exception:
     pass
 datas += [("sptpalm_analysis.py", ".")]
+# Bundle the app icon PNG so the Tk window/taskbar icon can be loaded
+# at runtime from sys._MEIPASS/assets/icon.png in frozen mode.
+if os.path.isfile(os.path.join(SPECPATH, "assets", "icon.png")):
+    datas += [(os.path.join(SPECPATH, "assets", "icon.png"), "assets")]
 
 # ── Tcl/Tk data (Windows only) ─────────────────────────────────────────────────
 # PyInstaller's pyi_rthkinter runtime hook looks for _tcl_data / _tk_data
