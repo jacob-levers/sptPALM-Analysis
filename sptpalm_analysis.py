@@ -2294,16 +2294,25 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
         _ta_bins = np.linspace(0, 180, 37)            # 5° bins
         _ta_centres = 0.5 * (_ta_bins[:-1] + _ta_bins[1:])
         _ta_counts, _ = np.histogram(ta_unsigned, bins=_ta_bins)
-        ax.plot(_ta_centres, _ta_counts, "-o",
+        # Normalise to relative frequency so the shape is comparable across
+        # runs (and consistent with the Compare-mode panel).  Total track
+        # count is already reported in the suptitle / Summary tab.
+        _ta_freq = (_ta_counts / _ta_counts.sum()
+                    if _ta_counts.sum() else _ta_counts)
+        ax.plot(_ta_centres, _ta_freq, "-o",
                 color=ACC, lw=2, ms=3, alpha=0.95)
-        # Reference lines: 90° (right-angle), and 180° (full reversal)
+        # Uniform-distribution reference line (1/N_bins)
+        ax.axhline(1.0 / len(_ta_centres),
+                   color=GRD, lw=0.6, ls=":", label="uniform")
+        # Reference verticals: 90° (right-angle), 180° (full reversal)
         ax.axvline(90,  color=GRD, lw=0.8, ls="--")
         ax.axvline(180, color=GRD, lw=0.6, ls=":")
         ax.set_xlim(0, 180)
         ax.set_xticks([0, 45, 90, 135, 180])
         ax.set_xlabel("|Turning angle|  (°)", fontsize=9)
-        ax.set_ylabel("Count", fontsize=9)
+        ax.set_ylabel("Relative frequency", fontsize=9)
         ax.grid(True, ls=":", alpha=0.3)
+        ax.legend(fontsize=7, frameon=False, loc="best")
     sax(ax, "I", "Turning Angle Distribution")
 
     # J — Mobile Fraction Over Time
