@@ -3620,22 +3620,37 @@ def compare_groups(groups=None,
                 any_data = True
 
         if any_data:
-            # Per-bin total across all groups.  Bins with zero data get a
-            # tiny denominator so their fractions are 0 (avoids /0).
-            totals = np.sum([c for _, c in counts_per_group], axis=0)
-            safe   = np.where(totals > 0, totals, 1.0)
-
-            # Stack each group's fractional contribution to each bin so
-            # every bar sums to 1.0 (= 100% of the data in that direction).
-            bottom = np.zeros(n_bins)
+            # ── First normalise each group to ITS OWN total ──────────────────
+            # Otherwise the larger-sample group dominates every bin just by
+            # virtue of sample size, hiding any real shape difference between
+            # groups.  After this step each group's normalised values sum to
+            # 1.0 across the full circle, so the polar bars compare shapes,
+            # not raw counts.
+            normalised_per_group = []
             for gi, counts in counts_per_group:
-                frac = counts / safe
-                ax.bar(bin_centres, frac,
+                total = counts.sum()
+                normalised = counts / total if total > 0 else counts
+                normalised_per_group.append((gi, normalised))
+
+            # ── Now stack to 100 % per angular bin ───────────────────────────
+            # The bin's total is the sum of all groups' normalised values at
+            # that angle.  A bin where every group has the same RELATIVE
+            # density contributes 1/N from each group → the stack at that
+            # bin is split evenly; an asymmetric peak in one group widens
+            # that group's segment at that angle.
+            stacked_totals = np.sum([n for _, n in normalised_per_group],
+                                    axis=0)
+            safe_totals    = np.where(stacked_totals > 0, stacked_totals, 1.0)
+
+            bottom = np.zeros(n_bins)
+            for gi, normalised in normalised_per_group:
+                segment = normalised / safe_totals
+                ax.bar(bin_centres, segment,
                        width=bar_width, bottom=bottom,
                        color=colors[gi], alpha=0.85,
                        edgecolor=pal["GRD"], linewidth=0.3,
                        label=labels[gi])
-                bottom = bottom + frac
+                bottom = bottom + segment
             ax.set_ylim(0, 1.0)
 
         if any_data:
