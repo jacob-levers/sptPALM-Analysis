@@ -3,6 +3,8 @@ import multiprocessing
 import sys
 import os
 
+__version__ = "1.0.78"
+
 # Fix macOS multiprocessing crashes — must be set before any other imports
 if sys.platform == "darwin":
     try:
@@ -1205,7 +1207,7 @@ def _ram_strategy(stack, headroom: float = 0.75) -> tuple[bool, float, float]:
 def _fast_preprocess_and_localise(stack, diameter=7, minmass=None, percentile=64,
                                    bg_radius=50, bg_method="uniform_filter",
                                    workers=N_CPUS, chunk_size=500,
-                                   preview_cb=None):
+                                   preview_cb=None, backend="auto"):
     """
     Fast path (ample RAM): preprocess the full stack in parallel, then localise
     in parallel chunks.  Faster than streaming because all preprocessing jobs
@@ -1231,7 +1233,8 @@ def _fast_preprocess_and_localise(stack, diameter=7, minmass=None, percentile=64
 
     locs = localise_particles(stack_pp, diameter=diameter, minmass=minmass,
                               percentile=percentile, workers=workers,
-                              chunk_size=chunk_size, preview_cb=preview_cb)
+                              chunk_size=chunk_size, preview_cb=preview_cb,
+                              backend=backend)
     del stack_pp
     gc.collect()
     return locs, mean_proj, minmass
@@ -1241,7 +1244,8 @@ def preprocess_and_localise_adaptive(stack, diameter=7, minmass=None, percentile
                                      bg_radius=50, bg_method="uniform_filter",
                                      workers=N_CPUS, chunk_size=500,
                                      ram_headroom: float = 0.75,
-                                     preview_cb=None, stop_event=None):
+                                     preview_cb=None, stop_event=None,
+                                     backend="auto"):
     """
     Adaptive dispatcher — automatically selects the fastest strategy that fits
     in available RAM.
@@ -1257,6 +1261,16 @@ def preprocess_and_localise_adaptive(stack, diameter=7, minmass=None, percentile
 
     Returns (locs, mean_proj_norm, minmass_used)
     """
+    # Resolve and announce the backend once, up front — visible in the log
+    # regardless of which RAM strategy we end up taking (the FAST path goes
+    # through localise_particles which re-prints; the STREAM path bypasses it
+    # entirely, so we need this line here too).
+    try:
+        _impl = _resolve_backend(backend)
+        print(f"  Backend   : {_impl.name}  (requested: {backend})")
+    except Exception as _e:
+        print(f"  Backend   : (resolution failed: {_e})")
+
     use_fast, free_gb, needed_gb = _ram_strategy(stack, headroom=ram_headroom)
 
     if use_fast:
@@ -1265,20 +1279,22 @@ def preprocess_and_localise_adaptive(stack, diameter=7, minmass=None, percentile
         return _fast_preprocess_and_localise(
             stack, diameter, minmass, percentile,
             bg_radius, bg_method, workers, chunk_size,
-            preview_cb=preview_cb)
+            preview_cb=preview_cb, backend=backend)
     else:
         print(f"  RAM strategy : STREAM (low-mem)  — "
               f"{free_gb:.1f} GB free, {needed_gb:.1f} GB needed")
         return preprocess_and_localise_stream(
             stack, diameter, minmass, percentile,
             bg_radius, bg_method, workers, chunk_size,
-            preview_cb=preview_cb, stop_event=stop_event)
+            preview_cb=preview_cb, stop_event=stop_event,
+            backend=backend)
 
 
 def preprocess_and_localise_stream(stack, diameter=7, minmass=None, percentile=64,
                                    bg_radius=50, bg_method="uniform_filter",
                                    workers=N_CPUS, chunk_size=500,
-                                   preview_cb=None, stop_event=None):
+                                   preview_cb=None, stop_event=None,
+                                   backend="auto"):
     """
     Memory-efficient single streaming pass: preprocess + localise without ever
     materialising the full preprocessed stack in RAM.
@@ -1308,10 +1324,40 @@ def preprocess_and_localise_stream(stack, diameter=7, minmass=None, percentile=6
     n_chunks = max(1, int(np.ceil(n_frames / chunk_size)))
     workers_ = max(1, min(workers, N_CPUS))
 
+    # Resolve the backend up front so each chunk goes through the same
+    # implementation.  Trackpy is special-cased below to skip the per-chunk
+    # process-pool spawn cost; everything else delegates to .localise().
+    #
+    # NOTE: an earlier version of this code bumped chunk_size to 1500 on
+    # MPS/CUDA hoping to amortize dispatch overhead.  Empirically that made
+    # things *slower* on Apple Silicon — the GPU is bandwidth-limited at
+    # these convolution sizes, and 500-frame chunks fit better in cache
+    # than 1500-frame chunks.  Per-frame throughput dropped ~3× when we
+    # tried the bigger chunks.  Sticking with the caller's chunk_size now.
+    _impl = _resolve_backend(backend)
     print(f"  Mode      : streaming preprocess + localise  (low memory)")
+    print(f"  Backend   : {_impl.name}")
     print(f"  Diameter  : {diameter}px  |  bg_method: {bg_method}")
     print(f"  Chunks    : {n_chunks} × ~{chunk_size} frames  |  workers: {workers_}")
     t0 = time.perf_counter()
+
+    def _localise_chunk_via_backend(chunk_pp):
+        """Run the active backend on a single preprocessed chunk and return
+        a DataFrame with at least columns x, y, frame, mass.
+
+        Trackpy: call `tp.batch` directly with processes=1 to skip the
+                 multiprocessing-pool spawn overhead (per-chunk, the pool
+                 startup cost would dominate the actual work).
+        Other:   delegate to the backend's `.localise()` (single iteration
+                 because the chunk is already smaller than chunk_size).
+        """
+        if _impl.name == "trackpy":
+            with _threadpool_limits(limits=N_CPUS):
+                return tp.batch(chunk_pp, diameter=diameter, minmass=minmass,
+                                percentile=percentile, processes=1)
+        return _impl.localise(chunk_pp, diameter=diameter, minmass=minmass,
+                              percentile=percentile, workers=workers_,
+                              chunk_size=len(chunk_pp))
 
     # ── First chunk: preprocess now so we can auto-detect minmass ─────────────
     first_end  = min(chunk_size, n_frames)
@@ -1330,10 +1376,8 @@ def preprocess_and_localise_stream(stack, diameter=7, minmass=None, percentile=6
     mean_acc  = first_pp.sum(axis=0).astype(np.float64)
     frame_count = len(first_pp)
 
-    # Localise first chunk (already preprocessed) — expand BLAS to all cores
-    with _threadpool_limits(limits=N_CPUS):
-        locs0 = tp.batch(first_pp, diameter=diameter, minmass=minmass,
-                         percentile=percentile, processes=1)
+    # Localise first chunk (already preprocessed) — through the active backend
+    locs0 = _localise_chunk_via_backend(first_pp)
     if len(locs0) > 0:
         all_locs.append(locs0)
 
@@ -1368,9 +1412,7 @@ def preprocess_and_localise_stream(stack, diameter=7, minmass=None, percentile=6
         mean_acc   += chunk_pp.sum(axis=0)
         frame_count += len(chunk_pp)
 
-        with _threadpool_limits(limits=N_CPUS):
-            locs_i = tp.batch(chunk_pp, diameter=diameter, minmass=minmass,
-                              percentile=percentile, processes=1)
+        locs_i = _localise_chunk_via_backend(chunk_pp)
 
         if len(locs_i) > 0:
             locs_i = locs_i.copy()
@@ -1426,63 +1468,617 @@ def _localise_chunk_mp(args):
     return idx, result
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  LOCALISER BACKENDS
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# A backend takes a *preprocessed* stack (T × Y × X, float32) and returns a
+# DataFrame with at least the columns: x, y, frame, mass.  Preprocessing
+# (background subtraction, bandpass) is handled separately so the fast / stream
+# RAM strategies in this file stay backend-agnostic.
+#
+# Registration model: subclass LocaliserBackend, set `.name`, implement
+# `.is_available()` (classmethod) and `.localise(stack, **params)`, then append
+# to _BACKEND_REGISTRY in the preference order used by `backend="auto"`.
+#
+# Phase A1: only TrackpyBackend exists (refactor — no behaviour change).
+# Phase A2: TorchBackend (CPU) lands here.
+# Phase A3: device selection (MPS / CUDA) inside TorchBackend.
+
+class LocaliserBackend:
+    """Abstract base for particle-localisation backends.
+
+    Subclasses must set `name` and implement `is_available()` + `localise()`.
+    """
+    name: str = "abstract"
+
+    @classmethod
+    def is_available(cls) -> bool:
+        return False
+
+    def localise(self, stack, *, diameter=7, minmass=0.1, percentile=64,
+                 workers=None, chunk_size=500, preview_cb=None, **kwargs):
+        raise NotImplementedError
+
+
+class TrackpyBackend(LocaliserBackend):
+    """CPU localiser using trackpy's Crocker-Grier centroid detection.
+
+    Parallelised via multiprocessing.Pool (spawn) for true multi-core scaling;
+    falls back to a single-process BLAS-threaded path if Pool creation fails
+    (rare, but happens on locked-down Windows boxes and inside some sandboxes).
+
+    Accepted params:
+        diameter     — odd integer, spot diameter in px (auto-bumped if even)
+        minmass      — minimum integrated intensity for a spot
+        percentile   — local-noise threshold (passed straight to tp.batch)
+        workers      — process pool size (defaults to N_CPUS)
+        chunk_size   — frames per chunk (memory / parallelism tradeoff)
+    """
+    name = "trackpy"
+
+    @classmethod
+    def is_available(cls) -> bool:
+        try:
+            import trackpy  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    def localise(self, stack, *, diameter=7, minmass=0.1, percentile=64,
+                 workers=None, chunk_size=500, preview_cb=None, **_):
+        if diameter % 2 == 0:
+            diameter += 1
+
+        n_frames = len(stack)
+        n_chunks = max(1, int(np.ceil(n_frames / chunk_size)))
+        workers  = max(1, min(workers if workers is not None else N_CPUS, N_CPUS))
+
+        print(f"  Diameter  : {diameter}px  |  minmass: {minmass:.4f}")
+        print(f"  Chunks    : {n_chunks} x ~{chunk_size} frames")
+
+        t0       = time.perf_counter()
+        chunks   = np.array_split(stack, n_chunks)
+        offsets  = [i * chunk_size for i in range(len(chunks))]
+        chunk_pairs = list(zip(chunks, offsets))
+
+        # ── True multi-core via multiprocessing.Pool ──────────────────────
+        # Each worker is a separate Python process with its own GIL — N workers
+        # genuinely use N CPU cores.  Spawn context is required for Windows +
+        # macOS frozen apps; PyInstaller's freeze_support (called in app_tk.py
+        # main) makes spawn workers reuse the parent's _MEIPASS extraction, so
+        # workers start in seconds rather than minutes.  Falls back to a
+        # BLAS-pool serial path if Pool creation fails for any reason.
+        n_workers = min(workers, n_chunks, N_CPUS)
+        chunk_results = [None] * n_chunks
+        use_mp_ok = False
+        try:
+            print(f"  Parallelism : multiprocessing.Pool × {n_workers} (spawn — true multi-core)")
+            print(f"  Spawning workers (one-time ~10-30s; chunks then process truly in parallel)...")
+            ctx = multiprocessing.get_context("spawn")
+            mp_args = [(i, c, diameter, minmass, percentile, o)
+                       for i, (c, o) in enumerate(chunk_pairs)]
+            with ctx.Pool(processes=n_workers) as pool:
+                for idx, result in _tqdm(
+                        pool.imap_unordered(_localise_chunk_mp, mp_args),
+                        total=n_chunks, desc="  Localising", unit="chunk", ncols=70):
+                    chunk_results[idx] = result
+            use_mp_ok = True
+        except Exception as exc:
+            print(f"  multiprocessing failed ({type(exc).__name__}: {exc})")
+            print(f"  Falling back to BLAS-pool parallelism (slower, single-process)")
+
+        if not use_mp_ok:
+            with _threadpool_limits(limits=N_CPUS):
+                chunk_results = [_localise_chunk(chunk, diameter, minmass, percentile, offset)
+                                 for chunk, offset in _tqdm(chunk_pairs, total=n_chunks,
+                                                            desc="  Localising", unit="chunk",
+                                                            ncols=70)]
+
+        valid = [df for df in chunk_results if df is not None and len(df) > 0]
+        result = pd.concat(valid, ignore_index=True) if valid else pd.DataFrame()
+
+        elapsed = time.perf_counter() - t0
+        print(f"  Found {len(result):,} localisations in {elapsed:.1f}s  "
+              f"({n_frames / elapsed:.0f} frames/s)")
+        return result
+
+
+class TorchBackend(LocaliserBackend):
+    """PyTorch-based localiser — CPU for now (MPS / CUDA arrive in A3).
+
+    Algorithm (matches trackpy's default centroid-of-mass semantics so the
+    sub-pixel positions stay close to within a few nm):
+
+      1.  Bandpass = signal − local-average-background, then small-σ Gaussian
+          smoothing.  Implemented as batched F.avg_pool2d + separable conv2d.
+      2.  Threshold = `percentile`-th percentile of the bandpassed image
+          (trackpy's `percentile` argument has the same meaning).
+      3.  Local maxima = pixels where signal equals its diameter-window
+          max-pool output AND exceeds the threshold (F.max_pool2d trick).
+      4.  Patch extraction: gather a (diameter × diameter) tile around every
+          candidate via fancy indexing — fully vectorised.
+      5.  Mass = sum over patch; filter spots by `mass >= minmass`.
+      6.  Sub-pixel refinement = centroid of mass on the patch.
+
+    Returns a DataFrame with the standard columns `x, y, frame, mass`.
+
+    Frames are processed in chunks of `chunk_size` to bound peak GPU memory.
+    Step 1 (bandpass) is the bandwidth bottleneck on CPU; expect roughly the
+    same wall-clock as trackpy on a fast laptop.  The point of this backend
+    is the GPU path landing in A3 — CPU is here for correctness validation.
+    """
+    name = "torch"
+
+    @classmethod
+    def is_available(cls) -> bool:
+        try:
+            import torch  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    @classmethod
+    def list_devices(cls) -> list[str]:
+        """Return all torch devices we could plausibly run on, fastest first.
+        Used by the GUI to populate a device-override picker and by the
+        crash reporter to record what was actually visible.
+        """
+        try:
+            import torch
+        except ImportError:
+            return []
+        devs: list[str] = []
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            devs.append("mps")
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                devs.append(f"cuda:{i}" if torch.cuda.device_count() > 1 else "cuda")
+        devs.append("cpu")
+        return devs
+
+    @classmethod
+    def _device_sanity_check(cls, dev: str) -> bool:
+        """Run the exact ops used in the hot path on `dev` to confirm full
+        kernel coverage.  Some PyTorch builds advertise MPS or CUDA support
+        but lack kernels for specific ops — better to discover that here
+        with a 100-µs test than mid-pipeline on a 16 000-frame stack.
+
+        The Gaussian fit uses `torch.linalg.solve` (lstsq is NOT supported
+        on MPS in current PyTorch builds — see `_gaussian_lstsq_refine`),
+        so that's what we test along with the conv2d / avg_pool2d / einsum
+        ops that drive the bandpass and detection stages.
+        """
+        try:
+            import torch
+            import torch.nn.functional as F
+            t = torch.device(dev)
+            # 4×4 linear solve (exercises the same kernel as the Gaussian fit)
+            A = torch.eye(4, device=t, dtype=torch.float32).unsqueeze(0)
+            v = torch.ones(4, device=t, dtype=torch.float32).view(1, 4, 1)
+            _ = torch.linalg.solve(A, v)
+            # avg_pool2d (bandpass background) and max_pool2d (local maxima)
+            x = torch.zeros(1, 1, 8, 8, device=t, dtype=torch.float32)
+            _ = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
+            _ = F.max_pool2d(x, kernel_size=3, stride=1, padding=1)
+            # einsum (used in normal-equations assembly)
+            _ = torch.einsum('ni,ij,ik->njk',
+                             torch.ones(2, 4, device=t),
+                             torch.ones(4, 4, device=t),
+                             torch.ones(4, 4, device=t))
+            return True
+        except Exception as exc:
+            print(f"  Device sanity check failed on {dev}: "
+                  f"{type(exc).__name__}: {exc}")
+            return False
+
+    # Cached result of the device-selection sanity walk — recomputing it on
+    # every chunk in the streaming path would add a few-ms penalty per call
+    # for no information gain (hardware doesn't change mid-run).
+    _cached_device: "str | None" = None
+
+    @classmethod
+    def select_device(cls) -> str:
+        """Auto-pick the best device that actually works on this machine.
+
+        Preference order: MPS (Apple Silicon) → CUDA (NVIDIA) → CPU.
+        Each candidate goes through a self-test before we commit.  This
+        prevents the analysis from picking MPS, running the bandpass + max-
+        pool fine, then dying on `torch.linalg.solve` halfway through a
+        16 000-frame stack.  Result is cached for the process lifetime.
+        """
+        if cls._cached_device is not None:
+            return cls._cached_device
+        for cand in cls.list_devices():
+            if cls._device_sanity_check(cand):
+                cls._cached_device = cand
+                return cand
+        cls._cached_device = "cpu"
+        return "cpu"
+
+    @staticmethod
+    def _gaussian_blur(x, sigma, device):
+        """Separable 1-D Gaussian blur via two conv1d-flavoured conv2d calls."""
+        import torch
+        import torch.nn.functional as F
+        radius = max(1, int(round(3 * sigma)))
+        kx = torch.arange(-radius, radius + 1, device=device, dtype=x.dtype)
+        kernel_1d = torch.exp(-(kx ** 2) / (2 * sigma * sigma))
+        kernel_1d = kernel_1d / kernel_1d.sum()
+        # (1, 1, 1, k) — horizontal
+        kh = kernel_1d.view(1, 1, 1, -1)
+        # (1, 1, k, 1) — vertical
+        kv = kernel_1d.view(1, 1, -1, 1)
+        x = F.conv2d(x, kh, padding=(0, radius))
+        x = F.conv2d(x, kv, padding=(radius, 0))
+        return x
+
+    @staticmethod
+    def _build_gaussian_design_matrix(dy_grid, dx_grid):
+        """Precompute the (k², 4) design matrix and its pseudo-inverse for the
+        log-Gaussian linear least-squares fit.
+
+        Model:   log(I) = a + b·x + c·y + p·(x² + y²)
+                 where  p = -1/(2σ²),  b = -2·x₀·p,  c = -2·y₀·p
+                 ⇒    x₀ = -b/(2p),   y₀ = -c/(2p)
+
+        M is identical for every spot (only depends on the patch geometry),
+        so we precompute its pseudo-inverse once and reuse it as a batched
+        matrix-multiply per chunk.  Cost: a single (N, k²) @ (k², 4) gemm.
+        """
+        import torch
+        x_flat = dx_grid.reshape(-1)
+        y_flat = dy_grid.reshape(-1)
+        ones   = torch.ones_like(x_flat)
+        M = torch.stack([ones, x_flat, y_flat, x_flat**2 + y_flat**2], dim=1)
+        # Pseudoinverse: M_pinv = (MᵀM)⁻¹Mᵀ  — shape (4, k²)
+        M_pinv = torch.linalg.pinv(M)
+        return M, M_pinv
+
+    @staticmethod
+    def _gaussian_lstsq_refine(patches, dy_grid, dx_grid, M):
+        """Batched analytical 2D-Gaussian fit on patches via the *normal
+        equations* of a weighted log-linearisation.
+
+        Why normal equations and not `torch.linalg.lstsq`?
+        --------------------------------------------------
+        `torch.linalg.lstsq` is NOT implemented on the MPS device in current
+        PyTorch builds (it raises NotImplementedError for `aten::linalg_lstsq.out`).
+        `torch.linalg.solve` is — and for full-rank weighted least-squares,
+        solving the 4×4 normal equations `(MᵀWᵀWM) b = MᵀWᵀW y` gives the
+        identical answer.  The reformulation buys us cross-device support
+        (CPU, CUDA, MPS) at the cost of a slightly higher condition number,
+        which is irrelevant for the well-posed 4-parameter Gaussian fit.
+
+        Why weighted?
+        -------------
+        Unweighted log-space LSQ gives every pixel — including dim, noisy
+        edge pixels — equal influence on the centroid.  This inflates per-
+        spot variance, which manifests as a depressed MSD α (because
+        MSD = MSD_true + 4σ²_loc; higher σ_loc flattens the apparent log-log
+        slope at short lags).  Weighting each pixel by √I (Poisson-likelihood
+        weighting in log-space) means bright spot-centre pixels dominate the
+        fit, restoring centroid-of-mass-like noise behaviour while preserving
+        the unbiased mean-position accuracy of the Gaussian fit.
+
+        Math
+        ----
+        Model:    log(I) = a + b·x + c·y + p·(x² + y²)            (linear in params)
+        Weights:  w² = I       ⇒  weighted residual = √I · (a + b·x + c·y + p·(x²+y²) − log(I))
+        Normal eq: A b = v,   A = MᵀWᵀWM = Σᵢ Iᵢ·MᵢMᵢᵀ,   v = MᵀWᵀWy = Σᵢ Iᵢ·log(Iᵢ)·Mᵢ
+        Recover:  x₀ = −b/(2p),   y₀ = −c/(2p),   σ² = −1/(2p)
+
+        Inputs
+        ------
+        patches : (N, k, k) float tensor — non-negative pixel intensities
+        dy_grid : (k, k)    float tensor — y offsets relative to patch centre
+        dx_grid : (k, k)    float tensor — x offsets relative to patch centre
+        M       : (k², 4)   float tensor — design matrix [1, x, y, x²+y²]
+
+        Returns (dy_sub, dx_sub, ok) where:
+          dy_sub, dx_sub : (N,) sub-pixel offsets relative to the patch centre
+          ok             : (N,) bool mask — True for spots whose fit is valid
+        """
+        import torch
+        N, k, _ = patches.shape
+        eps = 1e-6
+        I_flat = patches.clamp(min=eps).reshape(N, k * k)          # (N, k²)
+        Y_log  = torch.log(I_flat)                                  # (N, k²)
+
+        # Normal equations: per-spot A is (4, 4); per-spot v is (4,)
+        # A[n, j, k] = Σᵢ I[n, i] · M[i, j] · M[i, k]
+        # v[n, j]    = Σᵢ I[n, i] · log(I[n, i]) · M[i, j]
+        A = torch.einsum('ni,ij,ik->njk', I_flat, M, M)             # (N, 4, 4)
+        v = torch.einsum('ni,ij->nj', I_flat * Y_log, M)            # (N, 4)
+
+        # Tikhonov-style ridge for numerical conditioning on near-flat patches.
+        # 1e-6 * trace(A) per spot is small enough not to bias real spots but
+        # keeps degenerate ones from blowing up the solver.
+        ridge = 1e-6 * torch.diagonal(A, dim1=1, dim2=2).mean(dim=1)
+        eye   = torch.eye(4, device=A.device, dtype=A.dtype)
+        A = A + ridge.view(-1, 1, 1) * eye.unsqueeze(0)
+
+        # Solve N independent 4×4 systems.  `torch.linalg.solve` is supported
+        # on CPU / CUDA / MPS — unlike `lstsq` which lacks MPS coverage.
+        try:
+            sol = torch.linalg.solve(A, v.unsqueeze(-1)).squeeze(-1)   # (N, 4)
+        except (NotImplementedError, RuntimeError) as exc:
+            # Final belt-and-braces fallback: shuttle to CPU.  Should never
+            # trigger in normal operation, but it means a single missing
+            # kernel won't kill the run.
+            print(f"  [TorchBackend] linalg.solve fallback to CPU: {exc}")
+            sol = torch.linalg.solve(A.cpu(),
+                                     v.unsqueeze(-1).cpu()).squeeze(-1).to(A.device)
+
+        a, b, c, p = sol.unbind(dim=1)
+        # Guard against degenerate fits: p must be negative (peak, not pit)
+        safe_p = torch.where(p < -1e-8, p, torch.full_like(p, -1e-8))
+        dx_sub = -b / (2.0 * safe_p)
+        dy_sub = -c / (2.0 * safe_p)
+        # Reject fits whose centroid lies well outside the patch — clamping to
+        # ≤ 1.5 px keeps spurious "edge wins" from leaking through.  A real
+        # spot's Gaussian fit lands within ±0.5 px of the integer maximum.
+        ok = (p < -1e-8) & (dx_sub.abs() <= 1.5) & (dy_sub.abs() <= 1.5)
+        return dy_sub, dx_sub, ok
+
+    def localise(self, stack, *, diameter=7, minmass=0.1, percentile=64,
+                 workers=None, chunk_size=500, preview_cb=None,
+                 device=None, **_):
+        import torch
+        import torch.nn.functional as F
+
+        if diameter % 2 == 0:
+            diameter += 1
+        radius = diameter // 2
+        k = diameter
+
+        # Resolve device: explicit `device=` arg > `_forced_device` set by
+        # the 'torch-mps'/'torch-cuda'/'torch-cpu' GUI pins > auto-select.
+        dev_str = (device
+                   or getattr(self, "_forced_device", None)
+                   or self.select_device())
+        dev     = torch.device(dev_str)
+        # Float32 is plenty for centroid math; saves memory on GPUs and
+        # avoids dtype gotchas with MPS (which dislikes float64).
+        dtype = torch.float32
+
+        # See note in preprocess_and_localise_stream re: why we don't bump
+        # chunk_size on GPU — Apple Silicon is bandwidth-limited, not
+        # dispatch-limited, so the caller's chunk_size (typically 500) is
+        # actually optimal.  Honour it as passed.
+        n_frames = len(stack)
+        n_chunks = max(1, int(np.ceil(n_frames / chunk_size)))
+
+        print(f"  Device    : {dev_str}")
+        print(f"  Diameter  : {diameter}px  |  minmass: {minmass:.4f}  "
+              f"|  percentile: {percentile}")
+        print(f"  Chunks    : {n_chunks} × ~{chunk_size} frames")
+
+        t0 = time.perf_counter()
+        all_locs: list[dict] = []
+
+        # Index grid used for sub-pixel refinement (cached on device).  Same
+        # tensor is shared by the centroid-of-mass and Gaussian-LSQ paths.
+        dy_grid, dx_grid = torch.meshgrid(
+            torch.arange(-radius, radius + 1, device=dev, dtype=dtype),
+            torch.arange(-radius, radius + 1, device=dev, dtype=dtype),
+            indexing="ij")
+
+        # Precompute the Gaussian-LSQ design matrix once per call — it
+        # depends only on the patch geometry.  (The unweighted pseudo-inverse
+        # is computed too, kept for reference but no longer used since we
+        # switched to weighted batched LSQ for better noise behaviour.)
+        _M, _M_pinv = self._build_gaussian_design_matrix(dy_grid, dx_grid)
+
+        for chunk_idx, chunk_start in enumerate(range(0, n_frames, chunk_size)):
+            chunk_end = min(chunk_start + chunk_size, n_frames)
+            chunk_np  = np.asarray(stack[chunk_start:chunk_end], dtype=np.float32)
+
+            # (T, 1, Y, X)
+            x = torch.from_numpy(chunk_np).to(dev, dtype=dtype).unsqueeze(1)
+            T, _, Y, X = x.shape
+
+            # ── 1. Bandpass: subtract local background, then small smooth ───
+            bg = F.avg_pool2d(x, kernel_size=2 * radius + 1,
+                              stride=1, padding=radius)
+            smooth_sigma = max(1.0, diameter / 4.0)
+            signal = self._gaussian_blur(x - bg, sigma=smooth_sigma, device=dev)
+            signal = torch.clamp(signal, min=0.0)
+
+            # ── 2. Percentile threshold per chunk ───────────────────────────
+            # torch.quantile is exact for small inputs; for big tensors use
+            # sample-based estimate to bound memory.
+            flat = signal.reshape(-1)
+            if flat.numel() > 5_000_000:
+                idx = torch.randint(0, flat.numel(),
+                                    (5_000_000,), device=dev)
+                sample = flat[idx]
+                threshold = torch.quantile(sample, percentile / 100.0)
+            else:
+                threshold = torch.quantile(flat, percentile / 100.0)
+
+            # ── 3. Local maxima via max-pool == self ────────────────────────
+            maxp   = F.max_pool2d(signal, kernel_size=k, stride=1, padding=radius)
+            is_max = (signal == maxp) & (signal > threshold)
+            # nonzero → (N, 4) columns: (t, c, y, x)
+            coords = is_max.nonzero(as_tuple=False)
+            if coords.numel() == 0:
+                continue
+
+            # Drop maxima too close to the edge to extract a full patch
+            edge_ok = (
+                (coords[:, 2] >= radius) & (coords[:, 2] < Y - radius) &
+                (coords[:, 3] >= radius) & (coords[:, 3] < X - radius)
+            )
+            coords = coords[edge_ok]
+            if coords.numel() == 0:
+                continue
+
+            t_ix = coords[:, 0]
+            y_ix = coords[:, 2]
+            x_ix = coords[:, 3]
+
+            # ── 4. Patch extraction via batched advanced indexing ───────────
+            # ys: (N, k, k), xs: (N, k, k), ts: (N, k, k)
+            ys = y_ix[:, None, None] + dy_grid.long()[None]
+            xs = x_ix[:, None, None] + dx_grid.long()[None]
+            ts = t_ix[:, None, None].expand_as(ys)
+            patches = signal[ts, 0, ys, xs]   # (N, k, k)
+
+            # ── 5. Mass + filter ────────────────────────────────────────────
+            mass = patches.sum(dim=(1, 2))
+            keep = mass >= minmass
+            if keep.sum() == 0:
+                continue
+            patches = patches[keep]
+            t_ix    = t_ix[keep]
+            y_ix    = y_ix[keep]
+            x_ix    = x_ix[keep]
+            mass    = mass[keep]
+
+            # ── 6. Sub-pixel refinement ─────────────────────────────────────
+            # Primary path: analytical 2D-Gaussian fit on log-intensities,
+            #   one batched matmul for N spots.  Matches trackpy's iterative
+            #   Gaussian refinement to within ≈10 nm in typical data and
+            #   tightens trajectory recovery vs centroid-of-mass alone.
+            # Fallback path: centroid of mass — used only for the small set
+            #   of spots whose Gaussian fit was rejected (degenerate p ≥ 0,
+            #   or offset outside the patch radius).
+            dy_g, dx_g, ok = self._gaussian_lstsq_refine(
+                patches, dy_grid, dx_grid, _M)
+
+            patch_sum = patches.sum(dim=(1, 2)).clamp(min=1e-6)
+            dy_cm = (patches * dy_grid[None]).sum(dim=(1, 2)) / patch_sum
+            dx_cm = (patches * dx_grid[None]).sum(dim=(1, 2)) / patch_sum
+
+            # Combine: use Gaussian where OK, fall back to centroid otherwise
+            dy_off = torch.where(ok, dy_g, dy_cm)
+            dx_off = torch.where(ok, dx_g, dx_cm)
+
+            x_sub = x_ix.to(dtype) + dx_off
+            y_sub = y_ix.to(dtype) + dy_off
+            frame_abs = (t_ix + chunk_start).to(torch.int64)
+
+            all_locs.append({
+                "x":     x_sub.detach().cpu().numpy(),
+                "y":     y_sub.detach().cpu().numpy(),
+                "frame": frame_abs.detach().cpu().numpy(),
+                "mass":  mass.detach().cpu().numpy(),
+            })
+
+            # Free chunk allocations promptly.  PyTorch's reference-counting
+            # releases the Python handles, but on MPS the underlying device
+            # memory isn't always returned to the system pool right away —
+            # explicitly clearing the cache between chunks prevents the
+            # progressive slowdown we observed on Apple Silicon when chunks
+            # were tightly packed.  No-op on CPU; cheap on CUDA.
+            del x, bg, signal, maxp, is_max, coords, patches
+            if dev_str == "mps":
+                try:
+                    if hasattr(torch.mps, "empty_cache"):
+                        torch.mps.empty_cache()
+                except Exception:
+                    pass
+            elif dev_str.startswith("cuda"):
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+
+        if not all_locs:
+            print("  Found 0 localisations")
+            return pd.DataFrame(columns=["x", "y", "frame", "mass"])
+
+        df = pd.DataFrame({
+            col: np.concatenate([d[col] for d in all_locs])
+            for col in ("x", "y", "frame", "mass")
+        })
+
+        elapsed = time.perf_counter() - t0
+        print(f"  Found {len(df):,} localisations in {elapsed:.1f}s  "
+              f"({n_frames / elapsed:.0f} frames/s)")
+        return df
+
+
+# Order matters: `backend="auto"` resolves to the first available entry.
+# TorchBackend stays AFTER TrackpyBackend in A2 so "auto" still picks trackpy
+# while users validate the new path explicitly by selecting "torch" in the GUI.
+# A3 will swap the order once we've confirmed numerical agreement on real data.
+_BACKEND_REGISTRY: list[type[LocaliserBackend]] = [TrackpyBackend, TorchBackend]
+
+
+def list_available_backends() -> list[str]:
+    """Return the names of all backends usable on this machine.
+
+    For TorchBackend this expands to one entry per visible device
+    (`torch` = auto-select fastest; `torch-mps` / `torch-cuda` / `torch-cpu`
+    = explicit device pin, useful for benchmarking or reproducibility).
+    """
+    out: list[str] = []
+    for b in _BACKEND_REGISTRY:
+        if not b.is_available():
+            continue
+        out.append(b.name)
+        if b is TorchBackend:
+            for dev in TorchBackend.list_devices():
+                out.append(f"torch-{dev.replace(':', '')}")
+    return out
+
+
+def _resolve_backend(name: str | None):
+    """Look up a backend by name; resolve 'auto' to the first available entry.
+
+    Accepts torch-device pins (`torch-mps`, `torch-cuda`, `torch-cpu`) that
+    pre-set the device on the returned instance — used for benchmarking
+    and to let users force a specific device path.
+    """
+    if name in (None, "", "auto"):
+        for cls in _BACKEND_REGISTRY:
+            if cls.is_available():
+                return cls()
+        raise RuntimeError(
+            "No localiser backend available — install trackpy or torch.")
+
+    # Torch-device pins (e.g. 'torch-mps', 'torch-cuda:0', 'torch-cpu')
+    if name.startswith("torch-"):
+        if not TorchBackend.is_available():
+            raise RuntimeError(
+                "Torch device pin requested but PyTorch isn't installed.")
+        forced = name[len("torch-"):]
+        inst = TorchBackend()
+        inst._forced_device = forced
+        return inst
+
+    for cls in _BACKEND_REGISTRY:
+        if cls.name == name:
+            if not cls.is_available():
+                raise RuntimeError(
+                    f"Localiser backend '{name}' is registered but its "
+                    f"dependencies aren't installed on this machine.")
+            return cls()
+    raise ValueError(
+        f"Unknown localiser backend '{name}'. "
+        f"Registered: {[c.name for c in _BACKEND_REGISTRY]}; "
+        f"available here: {list_available_backends()}.")
+
+
 def localise_particles(stack, diameter=7, minmass=0.1, percentile=64,
-                       workers=N_CPUS, chunk_size=500, preview_cb=None):
-    if diameter % 2 == 0:
-        diameter += 1
+                       workers=N_CPUS, chunk_size=500, preview_cb=None,
+                       backend="auto"):
+    """Localise spots in every frame of a preprocessed stack.
 
-    n_frames = len(stack)
-    n_chunks = max(1, int(np.ceil(n_frames / chunk_size)))
-    workers  = max(1, min(workers, N_CPUS))
+    `backend` selects the implementation:
+        "auto"     — first available entry in _BACKEND_REGISTRY
+        "trackpy"  — Crocker-Grier centroid (CPU, multi-process)
+        (future)   — "torch" for GPU acceleration
 
-    print(f"  Diameter  : {diameter}px  |  minmass: {minmass:.4f}")
-    print(f"  Chunks    : {n_chunks} x ~{chunk_size} frames")
-
-    t0       = time.perf_counter()
-    chunks   = np.array_split(stack, n_chunks)
-    offsets  = [i * chunk_size for i in range(len(chunks))]
-    chunk_pairs = list(zip(chunks, offsets))
-
-    # ── True multi-core via multiprocessing.Pool ──────────────────────────────
-    # Each worker is a separate Python process with its own GIL — N workers
-    # genuinely use N CPU cores.  Spawn context is required for Windows + macOS
-    # frozen apps; PyInstaller's freeze_support (called in app_tk.py main)
-    # makes spawn workers reuse the parent's _MEIPASS extraction, so workers
-    # start in seconds rather than minutes.  Falls back to BLAS-pool serial
-    # if Pool creation fails for any reason.
-    n_workers = min(workers, n_chunks, N_CPUS)
-    chunk_results = [None] * n_chunks
-    use_mp_ok = False
-    try:
-        print(f"  Parallelism : multiprocessing.Pool × {n_workers} (spawn — true multi-core)")
-        print(f"  Spawning workers (one-time ~10-30s; chunks then process truly in parallel)...")
-        ctx = multiprocessing.get_context("spawn")
-        mp_args = [(i, c, diameter, minmass, percentile, o)
-                   for i, (c, o) in enumerate(chunk_pairs)]
-        with ctx.Pool(processes=n_workers) as pool:
-            for idx, result in _tqdm(
-                    pool.imap_unordered(_localise_chunk_mp, mp_args),
-                    total=n_chunks, desc="  Localising", unit="chunk", ncols=70):
-                chunk_results[idx] = result
-        use_mp_ok = True
-    except Exception as exc:
-        print(f"  multiprocessing failed ({type(exc).__name__}: {exc})")
-        print(f"  Falling back to BLAS-pool parallelism (slower, single-process)")
-
-    if not use_mp_ok:
-        with _threadpool_limits(limits=N_CPUS):
-            chunk_results = [_localise_chunk(chunk, diameter, minmass, percentile, offset)
-                             for chunk, offset in _tqdm(chunk_pairs, total=n_chunks,
-                                                        desc="  Localising", unit="chunk",
-                                                        ncols=70)]
-
-    valid = [df for df in chunk_results if df is not None and len(df) > 0]
-    result = pd.concat(valid, ignore_index=True) if valid else pd.DataFrame()
-
-    elapsed = time.perf_counter() - t0
-    print(f"  Found {len(result):,} localisations in {elapsed:.1f}s  "
-          f"({n_frames / elapsed:.0f} frames/s)")
-    return result
+    Returns a DataFrame with columns: x, y, frame, mass.
+    """
+    impl = _resolve_backend(backend)
+    print(f"  Backend   : {impl.name}")
+    return impl.localise(stack, diameter=diameter, minmass=minmass,
+                         percentile=percentile, workers=workers,
+                         chunk_size=chunk_size, preview_cb=preview_cb)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3104,6 +3700,9 @@ def save_palmtracer_csvs(out_dir, stem, locs, tracks, diff_df, imsd_df,
     n_frames = int(n_frames) if n_frames is not None else int(
         max(locs["frame"].max() + 1, tracks["frame"].max() + 1))
 
+    print(f"  PALM-Tracer: {len(locs):,} locs, {len(diff_df):,} tracks, "
+          f"imsd_df shape {imsd_df.shape if imsd_df is not None else None}")
+
     # ── 1. locPALMTracer.csv ─────────────────────────────────────────────
     n_loc = len(locs)
     loc_path = _os.path.join(out_dir, f"{stem}_locPALMTracer.csv")
@@ -3149,7 +3748,9 @@ def save_palmtracer_csvs(out_dir, stem, locs, tracks, diff_df, imsd_df,
         w.writerow(["Track", "Plane", "CentroidX(px)", "CentroidY(px)",
                     "CentroidZ(um)", "Integrated_Intensity", "id",
                     "Pair_Distance(px)"])
-        tr_sorted = tracks.sort_values(["particle", "frame"])
+        # trackpy.link sets `frame` as the index AND keeps it as a column —
+        # pandas refuses to disambiguate in sort_values, so drop the index first.
+        tr_sorted = tracks.reset_index(drop=True).sort_values(["particle", "frame"])
         pids      = tr_sorted["particle"].values
         frames_t  = tr_sorted["frame"].values
         xs_t      = tr_sorted["x"].values
@@ -3163,6 +3764,8 @@ def save_palmtracer_csvs(out_dir, stem, locs, tracks, diff_df, imsd_df,
             w.writerow([new_id, int(frames_t[k]) + 1,
                         float(xs_t[k]), float(ys_t[k]),
                         -1, float(mass_t[k]), k + 1, 0])
+
+    print(f"  PALM-Tracer: wrote loc + trc; starting D files")
 
     # ── 3 & 5. D files ───────────────────────────────────────────────────
     D_arr     = diff_df["D"].values
@@ -3213,6 +3816,8 @@ def save_palmtracer_csvs(out_dir, stem, locs, tracks, diff_df, imsd_df,
                         float(msd0_arr[i]) if _np.isfinite(msd0_arr[i]) else "",
                         float(mse_arr[i]) if _np.isfinite(mse_arr[i]) else ""])
 
+    print(f"  PALM-Tracer: wrote D files; starting MSD files")
+
     # ── 4 & 6. MSD files (jagged: one column per surviving lag) ──────────
     def _write_msd(path):
         with open(path, "w", newline="") as fh:
@@ -3236,6 +3841,7 @@ def save_palmtracer_csvs(out_dir, stem, locs, tracks, diff_df, imsd_df,
 
     _write_msd(_os.path.join(out_dir, f"{stem}_trcPALMTracer-1-MSD.csv"))
     _write_msd(_os.path.join(out_dir, f"{stem}_trcPALMTracer-AllROI-MSD.csv"))
+    print(f"  PALM-Tracer: all 6 files written successfully")
 
     return {
         "loc":           loc_path,

@@ -1094,8 +1094,9 @@ class SPTPalmApp(_APP_BASE):
         self.v_drift_segment = tk.IntVar(value=500)   # sparse labelling
 
         # Performance
-        self.v_workers    = tk.IntVar(value=N_CPUS)
-        self.v_chunk_size = tk.IntVar(value=500)
+        self.v_workers          = tk.IntVar(value=N_CPUS)
+        self.v_chunk_size       = tk.IntVar(value=500)
+        self.v_localise_backend = tk.StringVar(value="auto")  # auto / trackpy / torch
 
         # Figure style
         self.v_fig_theme      = tk.StringVar(value="Dark")
@@ -1864,6 +1865,24 @@ class SPTPalmApp(_APP_BASE):
                       "  • 8 GB RAM or large images: 100–300 frames\n\n"
                       "Reduce if you see out-of-memory errors."
                   ))
+        self._row(f, "Detection backend",
+                  lambda P: self._combo(P, self.v_localise_backend,
+                                        self._available_backends()),
+                  info=(
+                      "Which implementation FIREFLY uses to find spots in "
+                      "each frame.\n\n"
+                      "  • auto       — pick the fastest available backend.\n"
+                      "  • trackpy    — Crocker-Grier centroid on CPU "
+                      "(reference; bit-identical across machines).\n"
+                      "  • torch      — PyTorch backend, device auto-selected "
+                      "(MPS on Apple Silicon, CUDA on NVIDIA, CPU fallback).\n"
+                      "  • torch-mps  — force PyTorch on Apple GPU.\n"
+                      "  • torch-cuda — force PyTorch on NVIDIA GPU.\n"
+                      "  • torch-cpu  — force PyTorch on CPU (slow; useful "
+                      "for cross-platform reproducibility tests).\n\n"
+                      "The torch-* device pins exist for benchmarking and "
+                      "debugging. For normal use, leave it on 'auto'."
+                  ))
 
         # ── Figure Style ──────────────────────────────────────────────────────
         f = self._section(p, "Figure Style")
@@ -2016,6 +2035,7 @@ class SPTPalmApp(_APP_BASE):
             "drift_segment":   self.v_drift_segment.get(),
             "workers":         self.v_workers.get(),
             "chunk_size":      self.v_chunk_size.get(),
+            "localise_backend": self.v_localise_backend.get(),
             "fig_theme":       self.v_fig_theme.get(),
             "proj_cmap":       self.v_proj_cmap.get(),
             "cluster_eps_nm":      self.v_cluster_eps_nm.get(),
@@ -2061,8 +2081,9 @@ class SPTPalmApp(_APP_BASE):
         _s(self.v_roi_mask_mode,  "roi_mask_mode")
         _s(self.v_drift_correct,  "drift_correct")
         _s(self.v_drift_segment,  "drift_segment")
-        _s(self.v_workers,        "workers")
-        _s(self.v_chunk_size,     "chunk_size")
+        _s(self.v_workers,         "workers")
+        _s(self.v_chunk_size,      "chunk_size")
+        _s(self.v_localise_backend, "localise_backend")
         _s(self.v_fig_theme,      "fig_theme")
         _s(self.v_proj_cmap,      "proj_cmap")
         _s(self.v_cluster_eps_nm,      "cluster_eps_nm")
@@ -2319,6 +2340,23 @@ class SPTPalmApp(_APP_BASE):
         self._log_box.see("end")
         self._log_box.configure(state="disabled")
 
+    def _available_backends(self) -> list[str]:
+        """Return the localiser-backend names selectable in the GUI dropdown.
+
+        Always begins with 'auto', then appends each backend that's actually
+        importable on this machine.  Imports happen lazily so app startup
+        isn't gated on the analysis module loading numpy + scipy first.
+        """
+        names = ["auto"]
+        try:
+            from sptpalm_analysis import list_available_backends
+            for n in list_available_backends():
+                if n not in names:
+                    names.append(n)
+        except Exception:
+            names.append("trackpy")  # safe fallback
+        return names
+
     # ── Crash reporter integration ────────────────────────────────────────────
     def _install_crash_hooks(self):
         """Wire FIREFLY into the global crash reporter:
@@ -2347,6 +2385,16 @@ class SPTPalmApp(_APP_BASE):
                 s["Min mass"]       = self.v_minmass.get() if hasattr(self, "v_minmass") else "?"
                 s["Search range"]   = self.v_search_range.get() if hasattr(self, "v_search_range") else "?"
                 s["Min track len"]  = self.v_min_track_len.get() if hasattr(self, "v_min_track_len") else "?"
+                s["Detection backend"] = (self.v_localise_backend.get()
+                                          if hasattr(self, "v_localise_backend") else "?")
+                s["Available backends"] = ", ".join(self._available_backends()[1:])  # skip 'auto'
+                # Capture torch device visibility for crash diagnosis
+                try:
+                    from sptpalm_analysis import TorchBackend
+                    if TorchBackend.is_available():
+                        s["Torch devices"] = ", ".join(TorchBackend.list_devices())
+                except Exception:
+                    pass
                 s["Drag-and-drop"]  = "available" if _HAS_DND else "disabled"
                 s["Running"]        = self._running
                 s["Stop requested"] = self._stop_event.is_set()
@@ -3204,8 +3252,10 @@ class SPTPalmApp(_APP_BASE):
         stop  = self._stop_event
         n     = len(files)
         rows  = []
+        run_log_buf: list = []
 
         def _emit_log(text):
+            run_log_buf.append(text)
             self._q.put(("log", text))
 
         def _emit_progress(msg, pct):
@@ -3302,7 +3352,12 @@ class SPTPalmApp(_APP_BASE):
                         bg_radius=self.v_bg_radius.get(),
                         bg_method=bg_method_raw,
                         workers=workers, chunk_size=chunk_size,
-                        stop_event=stop)
+                        stop_event=stop,
+                        backend=self.v_localise_backend.get())
+                    # Capture dimensions before freeing — PALM-Tracer writer
+                    # needs them later, after `stack` is gone.
+                    stack_height = stack.shape[1] if stack.ndim >= 3 else 0
+                    stack_width  = stack.shape[2] if stack.ndim >= 3 else 0
                     del stack
 
                     if roi_mask is not None:
@@ -3375,14 +3430,15 @@ class SPTPalmApp(_APP_BASE):
                     # PALM-Tracer-compatible CSVs (for cross-tool compatibility)
                     try:
                         from sptpalm_analysis import save_palmtracer_csvs as _save_pt
-                        _h = stack.shape[1] if stack.ndim >= 3 else 0
-                        _w = stack.shape[2] if stack.ndim >= 3 else 0
                         _save_pt(data_dir, stem, locs, tracks, diff_df, imsd_df,
                                  pixel_size_um=float(px), frame_interval_s=float(fi),
-                                 width=_w, height=_h,
-                                 n_frames=int(n_frames) if "n_frames" in dir() else int(len(stack)))
+                                 width=stack_width, height=stack_height,
+                                 n_frames=int(n_frames) if "n_frames" in dir() else int(tracks["frame"].max() + 1))
+                        _emit_log("  Saved (data/): PALM-Tracer CSVs (loc / trc / D / MSD)")
                     except Exception as _e:
+                        import traceback as _tb
                         _emit_log(f"  WARN: PALM-Tracer CSV export failed: {_e}")
+                        _emit_log(_tb.format_exc())
 
                     # Ensemble MSD CSV (needed by the Compare feature)
                     (emsd_df.to_frame("msd_um2")
@@ -3404,6 +3460,7 @@ class SPTPalmApp(_APP_BASE):
                             "memory":            int(self.v_memory.get()),
                             "min_track_length":  int(self.v_min_track_len.get()),
                             "max_lagtime":       int(self.v_max_lagtime.get()),
+                            "localise_backend":  self.v_localise_backend.get(),
                             "n_localisations":   int(len(locs)),
                             "n_tracks":          int(diff_df.shape[0]),
                             "n_frames":          int(n_frames) if "n_frames" in dir() else int(len(tracks)),
@@ -3549,6 +3606,14 @@ class SPTPalmApp(_APP_BASE):
             else:
                 self._q.put(("error", traceback.format_exc()))
         finally:
+            # Persist the full batch log so it survives the results screen.
+            try:
+                if "batch_root" in dir():
+                    _log_path = os.path.join(batch_root, "batch_run.log")
+                    with open(_log_path, "w", encoding="utf-8") as _lf:
+                        _lf.write("\n".join(run_log_buf))
+            except Exception:
+                pass
             try:
                 sys.stdout.flush()
             except Exception:
@@ -3632,7 +3697,13 @@ class SPTPalmApp(_APP_BASE):
             if stop.is_set():
                 raise _Stopped()
 
+        # Buffer the full run log in memory so we can dump it to disk when the
+        # run finishes (the GUI log scrolls behind the results screen once
+        # analysis completes — see firefly_extras/<stem>_run.log).
+        run_log_buf: list = []
+
         def _emit_log(text: str):
+            run_log_buf.append(text)
             self._q.put(("log", text))
 
         def _emit_progress(msg: str, pct: int):
@@ -3933,7 +4004,8 @@ class SPTPalmApp(_APP_BASE):
                 workers=workers,
                 chunk_size=chunk_size,
                 preview_cb=None,
-                stop_event=stop)
+                stop_event=stop,
+                backend=self.v_localise_backend.get())
 
             # Post-localisation preview: mean projection with all detected spots.
             try:
@@ -3959,6 +4031,10 @@ class SPTPalmApp(_APP_BASE):
 
             _emit_log(f"  → {len(locs):,} localisations  |  minmass={_minmass:.4f}")
             _emit_log("  Freeing stack memory…")
+            # Capture dimensions before freeing — the PALM-Tracer CSV writer
+            # later wants width/height/n_frames after `stack` is gone.
+            stack_height = stack.shape[1] if stack.ndim >= 3 else 0
+            stack_width  = stack.shape[2] if stack.ndim >= 3 else 0
             del stack; gc.collect()
             _emit_log("  Memory freed.")
             _check_stop()
@@ -4206,13 +4282,15 @@ class SPTPalmApp(_APP_BASE):
             # ── PALM-Tracer-format CSVs (the lab-standard outputs) ───────────
             try:
                 from sptpalm_analysis import save_palmtracer_csvs as _save_pt
-                _h, _w = (stack.shape[1], stack.shape[2]) if stack.ndim >= 3 else (0, 0)
                 _save_pt(data_dir, stem, locs, tracks, diff_df, imsd_df,
                          pixel_size_um=float(px), frame_interval_s=float(fi),
-                         width=_w, height=_h, n_frames=int(n_frames))
+                         width=stack_width, height=stack_height,
+                         n_frames=int(n_frames))
                 _emit_log("  Saved (data/): PALM-Tracer CSVs (loc / trc / D / MSD)")
             except Exception as _e:
+                import traceback as _tb
                 _emit_log(f"  WARN: PALM-Tracer CSV export failed: {_e}")
+                _emit_log(_tb.format_exc())
 
             # ── FIREFLY-only outputs (for re-analysis & Compare tab) ────────
             locs.to_csv(
@@ -4249,6 +4327,7 @@ class SPTPalmApp(_APP_BASE):
                     "memory":            int(self.v_memory.get()),
                     "min_track_length":  int(self.v_min_track_len.get()),
                     "max_lagtime":       int(self.v_max_lagtime.get()),
+                    "localise_backend":  self.v_localise_backend.get(),
                     "n_localisations":   int(len(locs)),
                     "n_tracks":          int(diff_df.shape[0]),
                     "n_frames":          int(n_frames),
@@ -4280,6 +4359,15 @@ class SPTPalmApp(_APP_BASE):
         except Exception:
             self._q.put(("error", traceback.format_exc()))
         finally:
+            # Persist the full run log to disk so it survives the results
+            # screen taking over the GUI.  Best-effort — never fails the run.
+            try:
+                if "extras_dir" in dir() and "stem" in dir():
+                    _log_path = os.path.join(extras_dir, f"{stem}_run.log")
+                    with open(_log_path, "w", encoding="utf-8") as _lf:
+                        _lf.write("\n".join(run_log_buf))
+            except Exception:
+                pass
             try:
                 sys.stdout.flush()
             except Exception:
