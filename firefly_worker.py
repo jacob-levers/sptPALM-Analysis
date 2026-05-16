@@ -338,12 +338,58 @@ def _run_one_analysis(params: dict, msg_queue, cancel_event,
 
     _log(f"\n  Output folder: {out_dir}")
     _prog(100, "Complete!")
+
+    # ── Summary stats for the GUI results panel ──────────────────────────
+    # Computed defensively so a partial pipeline still returns a valid
+    # payload (e.g. when filter-by-D produced an empty diff_df).
+    summary = {
+        "n_tracks":     int(diff_df.shape[0]) if diff_df is not None else 0,
+        "n_locs":       int(len(locs))         if locs    is not None else 0,
+        "median_d":     None,
+        "median_alpha": None,
+        "motion_counts": {},
+        "mobile_fraction": None,
+        "n_clusters":   0,
+        "dwell_tau_s":  None,
+        "frames":       int(n_frames),
+        "px_um":        float(px),
+        "fi_s":         float(fi),
+    }
+    try:
+        if diff_df is not None and len(diff_df):
+            if "D" in diff_df.columns:
+                summary["median_d"] = float(diff_df["D"].median())
+            if "alpha" in diff_df.columns:
+                summary["median_alpha"] = float(diff_df["alpha"].median())
+            if "motion" in diff_df.columns:
+                summary["motion_counts"] = {
+                    str(k): int(v) for k, v
+                    in diff_df["motion"].value_counts().to_dict().items()
+                }
+            if "D" in diff_df.columns:
+                d_thresh = float(p.get("mobile_d_threshold", 0.05))
+                summary["mobile_fraction"] = float(
+                    (diff_df["D"] > d_thresh).mean())
+        if cluster_stats_df is not None and len(cluster_stats_df):
+            summary["n_clusters"] = int(len(cluster_stats_df))
+        if dwell_tau is not None:
+            try:
+                summary["dwell_tau_s"] = float(dwell_tau)
+            except Exception:
+                pass
+    except Exception:
+        # Best-effort: don't let a stats-computation hiccup break the run
+        pass
+
     return {
         "stem":        stem,
         "out_dir":     out_dir,
         "figure_path": figure_path,
-        "n_tracks":    int(diff_df.shape[0]) if diff_df is not None else 0,
-        "n_locs":      int(len(locs)) if locs is not None else 0,
+        "summary":     summary,
+        # Legacy top-level keys preserved for compatibility with callers
+        # that haven't been updated yet.
+        "n_tracks":    summary["n_tracks"],
+        "n_locs":      summary["n_locs"],
     }
 
 

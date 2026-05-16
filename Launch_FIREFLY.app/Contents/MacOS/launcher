@@ -1,0 +1,91 @@
+#!/bin/bash
+# FIREFLY — macOS launcher
+#
+# On first run (or after upgrading from a v1.x install whose venv predates
+# PySide6 / napari / torch) this script:
+#   1. detects the missing venv (or stale one without PySide6),
+#   2. opens a Terminal window where the user can watch pip install
+#      progress live — installs take 3–8 minutes on first run depending on
+#      network speed because napari + PyTorch are large wheels,
+#   3. launches FIREFLY when the install finishes.
+#
+# On subsequent runs (healthy venv present) it launches FIREFLY directly
+# with no Terminal window.
+
+set -eu
+
+# Resolve the project folder.  Launch_sptPALM.app/Contents/MacOS/launcher
+# is the executable; the project root sits three levels above it.
+FOLDER="$(cd "$(dirname "$0")/../../.." && pwd)"
+APP="$FOLDER/app_qt.py"
+VENV="$FOLDER/sptpalm-env"
+VENV_PY="$VENV/bin/python3"
+REQ="$FOLDER/requirements.txt"
+
+# Helper: GUI alert (dialog) via osascript
+alert() {
+    /usr/bin/osascript -e \
+        "display alert \"FIREFLY\" message \"$1\" buttons {\"OK\"} default button \"OK\""
+}
+
+# ── Sanity check: project files in place ─────────────────────────────────────
+if [ ! -f "$APP" ]; then
+    alert "FIREFLY files not found at $FOLDER. Re-extract the FIREFLY folder and try again."
+    exit 1
+fi
+
+# ── Detect system Python ─────────────────────────────────────────────────────
+SYS_PY="$(command -v python3 2>/dev/null || true)"
+if [ -z "$SYS_PY" ]; then
+    alert "Python 3 is not installed. Install it from https://www.python.org/downloads/ and try again."
+    exit 1
+fi
+
+# ── Check if venv exists AND has PySide6 (i.e. it's a 2.x venv, not a 1.x one) ──
+NEEDS_SETUP=0
+if [ ! -f "$VENV_PY" ]; then
+    NEEDS_SETUP=1
+elif ! "$VENV_PY" -c "import PySide6" 2>/dev/null; then
+    # venv exists but is from v1.x (Tkinter era) — needs to install Qt + napari
+    NEEDS_SETUP=1
+fi
+
+# ── First-time setup (or upgrade) ────────────────────────────────────────────
+if [ "$NEEDS_SETUP" -eq 1 ]; then
+    # Open a Terminal so the user can SEE pip install progress.  Without
+    # this the launcher would appear frozen for ~5 minutes during a big
+    # napari + PyTorch download.
+    /usr/bin/osascript <<EOF
+tell application "Terminal"
+    activate
+    do script "set -e; cd '$FOLDER'; \
+        echo ''; \
+        echo '────────────────────────────────────────────────'; \
+        echo '  FIREFLY first-time setup'; \
+        echo '  Installs PySide6, napari, PyTorch, scipy, etc.'; \
+        echo '  Expect 3-8 minutes depending on network speed.'; \
+        echo '────────────────────────────────────────────────'; \
+        echo ''; \
+        if [ ! -d sptpalm-env ]; then \
+            echo '> python3 -m venv sptpalm-env'; \
+            python3 -m venv sptpalm-env; \
+        fi; \
+        echo '> upgrading pip'; \
+        sptpalm-env/bin/python3 -m pip install --upgrade pip; \
+        echo ''; \
+        echo '> installing requirements (this is the slow step)'; \
+        sptpalm-env/bin/python3 -m pip install -r requirements.txt; \
+        echo ''; \
+        echo '────────────────────────────────────────────────'; \
+        echo '  Setup complete — launching FIREFLY...'; \
+        echo '────────────────────────────────────────────────'; \
+        echo ''; \
+        sptpalm-env/bin/python3 app_qt.py"
+end tell
+EOF
+    exit 0
+fi
+
+# ── Normal launch ────────────────────────────────────────────────────────────
+cd "$FOLDER"
+exec "$VENV_PY" "$APP"

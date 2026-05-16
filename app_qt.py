@@ -106,6 +106,320 @@ _run_compare_in_subprocess  = firefly_worker.run_comparison
 # need to inspect or modify the worker, see firefly_worker.py.
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  SPINBOX SUBCLASSES — no up/down buttons, no scroll-wheel value changes
+# ══════════════════════════════════════════════════════════════════════════════
+# Two issues with Qt's default spinboxes that surfaced during user testing:
+#   1. The little up/down stepper buttons on the right edge clutter the
+#      look at the small sizes used in our compact parameter form.
+#   2. Scrolling the mouse wheel over a spinbox silently changes the value
+#      — easy to do by accident when scrolling the sidebar past a control,
+#      with no visual cue that the value just changed.
+#
+# These subclasses fix both by setting NoButtons + AlignCenter at construction
+# and ignoring wheel events.  Wheel events bubble up to the parent (the
+# QScrollArea) so the user can scroll the sidebar past them as expected.
+class _QuietSpinBox(QtWidgets.QSpinBox):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+    def wheelEvent(self, e):
+        # Pass to parent so the sidebar can scroll; don't change the value
+        e.ignore()
+
+
+class _QuietDoubleSpinBox(QtWidgets.QDoubleSpinBox):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+    def wheelEvent(self, e):
+        e.ignore()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  COLLAPSIBLE SECTION — reusable accordion-style header + content panel
+# ══════════════════════════════════════════════════════════════════════════════
+class _CollapsibleSection(QtWidgets.QWidget):
+    """A section with a clickable header (with ▶/▼ arrow) that toggles
+    visibility of its content panel below.
+
+    Usage:
+        sec = _CollapsibleSection("My Section")
+        form = QtWidgets.QFormLayout()
+        sec.content_layout.addLayout(form)
+        form.addRow("Field", widget)
+        parent_layout.addWidget(sec)
+    """
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        self._title = title
+
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self._header = QtWidgets.QToolButton()
+        self._header.setObjectName("section_header")
+        self._header.setText(f"▼   {title}")
+        self._header.setCheckable(True)
+        self._header.setChecked(True)
+        self._header.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed)
+        self._header.toggled.connect(self._on_toggled)
+        outer.addWidget(self._header)
+
+        self._content = QtWidgets.QFrame()
+        self._content.setObjectName("section_content")
+        self._content_layout = QtWidgets.QVBoxLayout(self._content)
+        self._content_layout.setContentsMargins(10, 8, 10, 10)
+        self._content_layout.setSpacing(6)
+        outer.addWidget(self._content)
+
+    def _on_toggled(self, checked: bool):
+        self._header.setText(f"{'▼' if checked else '▶'}   {self._title}")
+        self._content.setVisible(checked)
+
+    @property
+    def content_layout(self) -> QtWidgets.QVBoxLayout:
+        return self._content_layout
+
+    def set_expanded(self, expanded: bool):
+        if self._header.isChecked() != expanded:
+            self._header.setChecked(expanded)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  RESULTS PANEL — shown after a run completes (replaces the figure canvas)
+# ══════════════════════════════════════════════════════════════════════════════
+class _ResultsPanel(QtWidgets.QFrame):
+    """Compact "results" panel shown below the progress bar on each tab.
+
+    Replaces the in-app matplotlib canvas — figures are now saved to disk
+    only, per user preference.  After a run completes, this panel lists
+    the saved files and offers a button to open the output folder in the
+    system file manager.
+    """
+    def __init__(self, idle_text: str, parent=None):
+        super().__init__(parent)
+        self.setObjectName("results_panel")
+        v = QtWidgets.QVBoxLayout(self)
+        v.setContentsMargins(16, 16, 16, 16)
+        v.setSpacing(10)
+
+        # Header line — big-ish status text
+        self._headline = QtWidgets.QLabel(idle_text)
+        self._headline.setStyleSheet(
+            f"color: {_THEME['TXT_MUTED']}; font-size: 13px;")
+        self._headline.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._headline.setWordWrap(True)
+        v.addWidget(self._headline)
+
+        # Stats grid — populated post-run with key numbers (median D / α,
+        # motion-class breakdown, cluster count, etc.).
+        self._stats_grid = QtWidgets.QGridLayout()
+        self._stats_grid.setColumnStretch(0, 0)
+        self._stats_grid.setColumnStretch(1, 1)
+        self._stats_grid.setHorizontalSpacing(16)
+        self._stats_grid.setVerticalSpacing(4)
+        stats_container = QtWidgets.QWidget()
+        stats_container.setLayout(self._stats_grid)
+        self._stats_container = stats_container
+        self._stats_container.hide()
+        v.addWidget(self._stats_container)
+
+        # Output-folder row (visible only after a run)
+        self._folder_row = QtWidgets.QWidget()
+        fr = QtWidgets.QHBoxLayout(self._folder_row)
+        fr.setContentsMargins(0, 0, 0, 0)
+        self._folder_label = QtWidgets.QLabel("")
+        self._folder_label.setStyleSheet(f"color: {_THEME['TXT']};")
+        self._folder_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._folder_label.setWordWrap(True)
+        fr.addWidget(self._folder_label, 1)
+        self._open_btn = QtWidgets.QPushButton("Open folder")
+        self._open_btn.clicked.connect(self._on_open_folder)
+        fr.addWidget(self._open_btn)
+        self._folder_row.hide()
+        v.addWidget(self._folder_row)
+
+        # File list (the saved CSVs / PDFs / PNGs)
+        self._files = QtWidgets.QListWidget()
+        self._files.setObjectName("results_files")
+        self._files.setAlternatingRowColors(True)
+        self._files.itemDoubleClicked.connect(self._on_file_dbl)
+        self._files.hide()
+        v.addWidget(self._files, stretch=1)
+
+        # Trailing stretch when idle so the headline centres vertically
+        self._stretch_when_idle = True
+        v.addStretch(1)
+
+        self._out_dir = ""
+
+    def reset(self, idle_text: str = ""):
+        if idle_text:
+            self._headline.setText(idle_text)
+        self._headline.setStyleSheet(
+            f"color: {_THEME['TXT_MUTED']}; font-size: 13px;")
+        self._headline.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._folder_row.hide()
+        self._files.clear()
+        self._files.hide()
+        self._clear_stats()
+        self._stats_container.hide()
+        self._out_dir = ""
+
+    def _clear_stats(self):
+        while self._stats_grid.count():
+            item = self._stats_grid.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+    def _add_stat_row(self, row: int, label: str, value: str,
+                      value_colour: str | None = None):
+        lbl = QtWidgets.QLabel(label)
+        lbl.setStyleSheet(
+            f"color: {_THEME['TXT_MUTED']}; font-size: 12px;")
+        val = QtWidgets.QLabel(value)
+        col = value_colour or _THEME['TXT']
+        val.setStyleSheet(
+            f"color: {col}; font-size: 13px; font-weight: 600;")
+        val.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._stats_grid.addWidget(lbl, row, 0,
+                                   Qt.AlignmentFlag.AlignLeft)
+        self._stats_grid.addWidget(val, row, 1,
+                                   Qt.AlignmentFlag.AlignLeft)
+
+    def show_stats(self, summary: dict):
+        """Populate the stats grid from a worker `summary` dict.
+
+        Expected keys (all optional; missing keys are skipped):
+            n_tracks, n_locs, median_d, median_alpha,
+            motion_counts (dict), mobile_fraction, n_clusters,
+            dwell_tau_s, frames, px_um, fi_s
+        """
+        self._clear_stats()
+        if not summary:
+            return
+        r = 0
+
+        def _fmt_int(n):    return f"{n:,}" if n is not None else "—"
+        def _fmt_pct(f):    return f"{100 * f:.1f} %" if f is not None else "—"
+        def _fmt_um2(d):    return f"{d:.4f} µm²/s" if d is not None else "—"
+        def _fmt_alpha(a):  return f"{a:.3f}" if a is not None else "—"
+        def _fmt_secs(s):   return f"{s:.2f} s" if s is not None else "—"
+
+        # Counts ─────────────────────────────────────────────────────
+        self._add_stat_row(r, "Trajectories",
+                           _fmt_int(summary.get("n_tracks", 0))); r += 1
+        self._add_stat_row(r, "Localisations",
+                           _fmt_int(summary.get("n_locs", 0))); r += 1
+
+        # Diffusion ──────────────────────────────────────────────────
+        self._add_stat_row(r, "Median D",
+                           _fmt_um2(summary.get("median_d"))); r += 1
+        self._add_stat_row(r, "Median α",
+                           _fmt_alpha(summary.get("median_alpha"))); r += 1
+        mf = summary.get("mobile_fraction")
+        if mf is not None:
+            self._add_stat_row(r, "Mobile fraction (D > threshold)",
+                               _fmt_pct(mf)); r += 1
+
+        # Motion-class breakdown ─────────────────────────────────────
+        motion_counts = summary.get("motion_counts") or {}
+        if motion_counts:
+            total = sum(motion_counts.values()) or 1
+            # Standard order so the row is predictable
+            order = ["Immobile", "Confined", "Brownian", "Directed", "Unknown"]
+            colour_map = {
+                "Immobile": _THEME['DANGER'],
+                "Confined": _THEME['WARN'],
+                "Brownian": _THEME['ACC'],
+                "Directed": _THEME['SUCCESS'],
+                "Unknown":  _THEME['TXT_MUTED'],
+            }
+            for cls in order:
+                if cls in motion_counts:
+                    n = motion_counts[cls]
+                    self._add_stat_row(
+                        r, f"  {cls}",
+                        f"{n:,}  ({100 * n / total:.1f} %)",
+                        value_colour=colour_map.get(cls)); r += 1
+
+        # Secondary ──────────────────────────────────────────────────
+        nc = summary.get("n_clusters", 0)
+        if nc:
+            self._add_stat_row(r, "DBSCAN clusters",
+                               _fmt_int(nc)); r += 1
+        dwell = summary.get("dwell_tau_s")
+        if dwell is not None:
+            self._add_stat_row(r, "Dwell time  τ",
+                               _fmt_secs(dwell)); r += 1
+
+        # Imaging metadata footer ────────────────────────────────────
+        frames = summary.get("frames")
+        if frames:
+            self._add_stat_row(
+                r, "Source movie",
+                f"{frames:,} frames  |  "
+                f"px = {summary.get('px_um', 0):.3f} µm  |  "
+                f"fi = {summary.get('fi_s', 0):.3f} s",
+                value_colour=_THEME['TXT_MUTED']); r += 1
+
+        self._stats_container.show()
+
+    def show_results(self, headline: str, out_dir: str,
+                     files: list[str] | None = None):
+        """Populate the panel with a completed run's outputs."""
+        self._headline.setText(headline)
+        self._headline.setStyleSheet(
+            f"color: {_THEME['SUCCESS']}; font-size: 14px; font-weight: 600;")
+        self._headline.setAlignment(Qt.AlignmentFlag.AlignLeft)
+
+        self._out_dir = out_dir
+        if out_dir:
+            self._folder_label.setText(out_dir)
+            self._folder_row.show()
+
+        self._files.clear()
+        files = files or []
+        # Auto-discover saved outputs if the caller didn't pass them
+        if out_dir and os.path.isdir(out_dir) and not files:
+            for sub in ("data", "firefly_extras", "figures", ""):
+                d = os.path.join(out_dir, sub) if sub else out_dir
+                if not os.path.isdir(d):
+                    continue
+                for name in sorted(os.listdir(d)):
+                    full = os.path.join(d, name)
+                    if os.path.isfile(full):
+                        files.append(full)
+        for f in files:
+            item = QtWidgets.QListWidgetItem(
+                f"  {os.path.relpath(f, out_dir) if out_dir else f}")
+            item.setData(Qt.ItemDataRole.UserRole, f)
+            item.setToolTip(f)
+            self._files.addItem(item)
+        if files:
+            self._files.show()
+
+    def _on_open_folder(self):
+        if self._out_dir and os.path.isdir(self._out_dir):
+            _open_folder(self._out_dir)
+
+    def _on_file_dbl(self, item: QtWidgets.QListWidgetItem):
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if path and os.path.isfile(path):
+            _open_folder(os.path.dirname(path))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  COMPARE TAB — folder-drop list + group card
 # ══════════════════════════════════════════════════════════════════════════════
 class _FolderDropList(QtWidgets.QListWidget):
@@ -337,17 +651,29 @@ class MainWindow(QtWidgets.QMainWindow):
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
 
-        # Top-level horizontal split: sidebar | tabs
-        layout = QtWidgets.QHBoxLayout(central)
+        # Top-level vertical: [header bar] / [sidebar | tabs]
+        top = QtWidgets.QVBoxLayout(central)
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(0)
+
+        # ── Header banner ────────────────────────────────────────────────
+        top.addWidget(self._build_header_banner())
+
+        # ── Body: sidebar + tabs ─────────────────────────────────────────
+        body = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(body)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
+        top.addWidget(body, stretch=1)
 
         # ── Sidebar ───────────────────────────────────────────────────────
         # Fixed-width left panel; the scrollable parameter list lives
         # inside it so the Start/Stop button can stay pinned at the bottom
-        # regardless of how far the user has scrolled.
+        # regardless of how far the user has scrolled.  380 px is wide
+        # enough to fit a [QLineEdit + Browse] row at typical font sizes
+        # without the button clipping over the line edit's right edge.
         sidebar = QtWidgets.QFrame()
-        sidebar.setFixedWidth(340)
+        sidebar.setFixedWidth(380)
         sidebar.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
         sb_outer = QtWidgets.QVBoxLayout(sidebar)
         sb_outer.setContentsMargins(0, 0, 0, 0)
@@ -373,7 +699,10 @@ class MainWindow(QtWidgets.QMainWindow):
         btn_layout    = QtWidgets.QVBoxLayout(btn_container)
         btn_layout.setContentsMargins(12, 6, 12, 12)
         self.btn_run = QtWidgets.QPushButton("Start")
+        self.btn_run.setObjectName("primary")  # picks up accent-fill QSS rule
         self.btn_run.setMinimumHeight(36)
+        f = self.btn_run.font(); f.setBold(True); f.setPointSize(13)
+        self.btn_run.setFont(f)
         self.btn_run.clicked.connect(self._on_run_clicked)
         btn_layout.addWidget(self.btn_run)
         sb_outer.addWidget(btn_container)
@@ -381,29 +710,161 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(sidebar)
 
         # ── Tabs ──────────────────────────────────────────────────────────
+        # Tab order: Import → Analysis → Compare → Visualise
+        # Import consolidates input/output picking for both single-file
+        # and batch mode (replaces the old sidebar Input/Output section +
+        # the standalone Batch tab).  Analysis is purely status + result
+        # summary.  Compare and Visualise sit at the end.
         self.tabs = QtWidgets.QTabWidget()
-        self._build_run_tab()
-        self._build_batch_tab()
+        self._build_import_tab()
+        self._build_analysis_tab()
         self._build_compare_tab()
-        self._build_workspace_tab()
+        self._build_visualise_tab()
         layout.addWidget(self.tabs, stretch=1)
 
-        # Status bar
+        # ── Console dock (hidden by default) ──────────────────────────────
+        # One shared console for all tabs.  Stays hidden until the user
+        # clicks the Console button in the status bar.  Log lines accumulate
+        # in the widget even when the dock is hidden, so opening it shows
+        # the complete history.
+        self._build_console_dock()
+
+        # Status bar with a permanent "Console" toggle button on the right
+        self.btn_show_console = QtWidgets.QToolButton()
+        self.btn_show_console.setText("Console")
+        self.btn_show_console.setCheckable(True)
+        self.btn_show_console.setToolTip(
+            "Show/hide the debug console.  Captures every log line from "
+            "all stages — useful for diagnosing problems but normally not "
+            "needed; the progress bar tells you what's happening.")
+        self.btn_show_console.clicked.connect(self._toggle_console)
+        self.statusBar().addPermanentWidget(self.btn_show_console)
         self.statusBar().showMessage("Ready")
+
+    def _build_header_banner(self) -> QtWidgets.QWidget:
+        """Thin header strip:  FIREFLY                Fluorescence Inference & Reconstruction Engine | By Jacob Levers"""
+        bar = QtWidgets.QFrame()
+        bar.setObjectName("header_bar")
+        bar.setStyleSheet(
+            f"QFrame#header_bar {{ background-color: {_THEME['PANEL']}; "
+            f"border-bottom: 1px solid {_THEME['BORDER']}; }}"
+            # The right-side label is a transparent QLabel inside the
+            # styled frame; explicitly null out its border so it doesn't
+            # inherit the frame's border-bottom rule from the global QSS.
+            f"QFrame#header_bar QLabel {{ background: transparent; border: none; }}"
+        )
+        bar.setFixedHeight(46)
+        h = QtWidgets.QHBoxLayout(bar)
+        h.setContentsMargins(18, 0, 18, 0)
+        h.setSpacing(8)
+
+        # Left: FIREFLY logo
+        logo = QtWidgets.QLabel("FIREFLY")
+        logo.setStyleSheet(
+            f"color: {_THEME['ACC']}; font-weight: 800; "
+            f"font-size: 22px; letter-spacing: 2px;"
+        )
+        logo.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        h.addWidget(logo)
+
+        h.addStretch(1)
+
+        # Right: tagline + author on ONE line, joined with a pipe.  Using
+        # rich-text formatting on a single QLabel sidesteps the nested-
+        # container-border issue and looks tidier than two stacked labels.
+        right = QtWidgets.QLabel(
+            f"<span style='color:{_THEME['TXT']};font-weight:600;'>"
+            f"Fluorescence Inference &amp; Reconstruction Engine"
+            f"</span>"
+            f"<span style='color:{_THEME['TXT_MUTED']};'>"
+            f"&nbsp;&nbsp;|&nbsp;&nbsp;By Jacob Levers"
+            f"</span>"
+        )
+        right.setTextFormat(Qt.TextFormat.RichText)
+        right.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight)
+        right.setStyleSheet("font-size: 12px;")
+        h.addWidget(right)
+
+        return bar
+
+    def _build_console_dock(self):
+        """Create the dockable console.  Hidden by default — toggled via
+        the status-bar Console button.  Shared by all tabs, so log lines
+        from any analysis stage land in one place.
+        """
+        self._console_dock = QtWidgets.QDockWidget("Console", self)
+        self._console_dock.setObjectName("console_dock")
+        self._console_dock.setAllowedAreas(
+            Qt.DockWidgetArea.BottomDockWidgetArea
+            | Qt.DockWidgetArea.RightDockWidgetArea)
+
+        self.console_log = QtWidgets.QPlainTextEdit()
+        self.console_log.setReadOnly(True)
+        self.console_log.setMaximumBlockCount(20000)
+        mono = QtGui.QFont("Menlo, Consolas, monospace")
+        mono.setStyleHint(QtGui.QFont.StyleHint.Monospace)
+        mono.setPointSize(10)
+        self.console_log.setFont(mono)
+        self._console_dock.setWidget(self.console_log)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea,
+                           self._console_dock)
+        # Hidden by default; user has to click Console to open
+        self._console_dock.hide()
+        # Keep the toggle button in sync when the dock is closed via its
+        # own ✕ button
+        self._console_dock.visibilityChanged.connect(self._on_console_visibility)
+
+    def _toggle_console(self):
+        """Show / hide the console dock from the status-bar button."""
+        if self._console_dock.isVisible():
+            self._console_dock.hide()
+        else:
+            self._console_dock.show()
+
+    def _on_console_visibility(self, visible: bool):
+        """Keep the status-bar toggle button's checked state in sync."""
+        try:
+            self.btn_show_console.setChecked(visible)
+        except AttributeError:
+            pass
 
     # ── Tiny helpers for compact widget construction ──────────────────────
     @staticmethod
+    def _make_form_section(title: str):
+        """Return (CollapsibleSection, QFormLayout) for use in the sidebar.
+        The form layout is already wired into the section's content; the
+        caller just adds rows."""
+        sec = _CollapsibleSection(title)
+        form = QtWidgets.QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setHorizontalSpacing(8)
+        form.setVerticalSpacing(6)
+        sec.content_layout.addLayout(form)
+        return sec, form
+
+    @staticmethod
+    def _make_vbox_section(title: str):
+        """Return (CollapsibleSection, QVBoxLayout)."""
+        sec = _CollapsibleSection(title)
+        vb = QtWidgets.QVBoxLayout()
+        vb.setContentsMargins(0, 0, 0, 0)
+        vb.setSpacing(6)
+        sec.content_layout.addLayout(vb)
+        return sec, vb
+
+    @staticmethod
     def _spin_int(value: int, lo: int, hi: int, step: int = 1,
-                  tip: str = "") -> QtWidgets.QSpinBox:
-        s = QtWidgets.QSpinBox()
+                  tip: str = "") -> "QtWidgets.QSpinBox":
+        s = _QuietSpinBox()
         s.setRange(lo, hi); s.setSingleStep(step); s.setValue(value)
         if tip: s.setToolTip(tip)
         return s
 
     @staticmethod
     def _spin_dbl(value: float, lo: float, hi: float, step: float = 0.01,
-                  decimals: int = 3, tip: str = "") -> QtWidgets.QDoubleSpinBox:
-        s = QtWidgets.QDoubleSpinBox()
+                  decimals: int = 3, tip: str = "") -> "QtWidgets.QDoubleSpinBox":
+        s = _QuietDoubleSpinBox()
         s.setRange(lo, hi); s.setSingleStep(step); s.setDecimals(decimals)
         s.setValue(value)
         if tip: s.setToolTip(tip)
@@ -416,31 +877,16 @@ class MainWindow(QtWidgets.QMainWindow):
         f = title.font(); f.setBold(True); f.setPointSize(11); title.setFont(f)
         layout.addWidget(title)
 
-        # ── Input & Output ────────────────────────────────────────────────
-        grp = QtWidgets.QGroupBox("Input & output")
-        gl  = QtWidgets.QVBoxLayout(grp)
-        gl.addWidget(QtWidgets.QLabel("Input file"))
-        row = QtWidgets.QHBoxLayout()
-        self.e_file = QtWidgets.QLineEdit()
-        self.e_file.setPlaceholderText("Browse for a .czi / .tif file…")
-        b1 = QtWidgets.QPushButton("Browse"); b1.clicked.connect(self._on_browse_file)
-        row.addWidget(self.e_file); row.addWidget(b1)
-        gl.addLayout(row)
-        gl.addWidget(QtWidgets.QLabel("Output folder (optional)"))
-        row = QtWidgets.QHBoxLayout()
-        self.e_outdir = QtWidgets.QLineEdit()
-        self.e_outdir.setPlaceholderText("Defaults to input folder")
-        b2 = QtWidgets.QPushButton("Browse"); b2.clicked.connect(self._on_browse_outdir)
-        row.addWidget(self.e_outdir); row.addWidget(b2)
-        gl.addLayout(row)
-        layout.addWidget(grp)
+        # NOTE: Input/output pickers used to live here but moved to the
+        # Import tab in v2.1 — see `_build_import_tab`.  The QLineEdit
+        # widgets `self.e_file` and `self.e_outdir` are still owned by
+        # this MainWindow (created in the Import tab), so the rest of
+        # the worker code that reads them keeps working unchanged.
 
         # ── Imaging metadata ──────────────────────────────────────────────
         # File-embedded values are used by default; checkbox enables manual
         # override.  Matches the Tk app's behaviour.
-        grp = QtWidgets.QGroupBox("Imaging metadata")
-        gl  = QtWidgets.QFormLayout(grp)
-        gl.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        sec, gl = self._make_form_section("Imaging metadata")
 
         row = QtWidgets.QHBoxLayout()
         self.c_override_px = QtWidgets.QCheckBox("Override")
@@ -466,11 +912,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.s_channel = self._spin_int(0, 0, 8,
             tip="Channel index to load (CZI files only). Most single-channel data uses 0.")
         gl.addRow("Channel (CZI)", self.s_channel)
-        layout.addWidget(grp)
+        layout.addWidget(sec)
 
         # ── Preprocessing ─────────────────────────────────────────────────
-        grp = QtWidgets.QGroupBox("Preprocessing")
-        gl  = QtWidgets.QFormLayout(grp)
+        sec, gl = self._make_form_section("Preprocessing")
         gl.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
         self.c_bg_method = QtWidgets.QComboBox()
         self.c_bg_method.addItems(["Uniform Filter", "Rolling Ball"])
@@ -483,11 +928,10 @@ class MainWindow(QtWidgets.QMainWindow):
             tip="Radius (px) of the local-mean window for background subtraction.\n"
                 "Use ~3× spot diameter for diffraction-limited spots.")
         gl.addRow("Background radius (px)", self.s_bg_radius)
-        layout.addWidget(grp)
+        layout.addWidget(sec)
 
         # ── Detection ─────────────────────────────────────────────────────
-        grp = QtWidgets.QGroupBox("Detection")
-        gl  = QtWidgets.QFormLayout(grp)
+        sec, gl = self._make_form_section("Detection")
         gl.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
         self.s_diameter = self._spin_int(7, 3, 21, step=2,
             tip="Expected spot diameter in pixels. Must be ODD (the GUI enforces this).\n"
@@ -519,11 +963,10 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addWidget(self.c_auto_minmass); row.addWidget(self.s_minmass, 1)
         wmm = QtWidgets.QWidget(); wmm.setLayout(row)
         gl.addRow("Min mass", wmm)
-        layout.addWidget(grp)
+        layout.addWidget(sec)
 
         # ── Linking ───────────────────────────────────────────────────────
-        grp = QtWidgets.QGroupBox("Linking")
-        gl  = QtWidgets.QFormLayout(grp)
+        sec, gl = self._make_form_section("Linking")
         gl.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
         self.s_search_range = self._spin_int(5, 1, 30,
             tip="Maximum pixel distance a particle can move between consecutive\n"
@@ -542,11 +985,10 @@ class MainWindow(QtWidgets.QMainWindow):
             tip="0 = disabled. If set, drops tracks longer than this. Useful for\n"
                 "removing stuck/aggregated particles that masquerade as long tracks.")
         gl.addRow("Max track length (0 = off)", self.s_max_track_len)
-        layout.addWidget(grp)
+        layout.addWidget(sec)
 
         # ── Diffusion fit + motion classification ─────────────────────────
-        grp = QtWidgets.QGroupBox("Diffusion & motion classification")
-        gl  = QtWidgets.QFormLayout(grp)
+        sec, gl = self._make_form_section("Diffusion & motion classification")
         gl.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
         self.s_max_lagtime = self._spin_int(20, 5, 100,
             tip="Maximum lag-time (in frames) used in the MSD curve.")
@@ -590,11 +1032,10 @@ class MainWindow(QtWidgets.QMainWindow):
                               self.s_filter_d_max.setEnabled(checked)))
         gl.addRow("  D min (µm²/s)", self.s_filter_d_min)
         gl.addRow("  D max (µm²/s)", self.s_filter_d_max)
-        layout.addWidget(grp)
+        layout.addWidget(sec)
 
         # ── ROI ───────────────────────────────────────────────────────────
-        grp = QtWidgets.QGroupBox("ROI")
-        gl  = QtWidgets.QFormLayout(grp)
+        sec, gl = self._make_form_section("ROI")
         gl.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
         self.c_roi_mode = QtWidgets.QComboBox()
         self.c_roi_mode.addItems(["None", "Auto threshold", "Manual threshold"])
@@ -621,11 +1062,10 @@ class MainWindow(QtWidgets.QMainWindow):
             "Mean is appropriate when signal density is uniform; Sum\n"
             "emphasises bright sparse spots.")
         gl.addRow("Projection for ROI", self.c_roi_mask_mode)
-        layout.addWidget(grp)
+        layout.addWidget(sec)
 
         # ── Drift correction ──────────────────────────────────────────────
-        grp = QtWidgets.QGroupBox("Drift correction")
-        gl  = QtWidgets.QFormLayout(grp)
+        sec, gl = self._make_form_section("Drift correction")
         gl.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
         self.c_drift_correct = QtWidgets.QCheckBox("Apply RCC drift correction")
         self.c_drift_correct.setToolTip(
@@ -639,11 +1079,10 @@ class MainWindow(QtWidgets.QMainWindow):
             tip="Frames per RCC segment. Smaller = finer drift tracking but\n"
                 "noisier. 500 is a reasonable default for 4000+ frame movies.")
         gl.addRow("Segment size (frames)", self.s_drift_segment)
-        layout.addWidget(grp)
+        layout.addWidget(sec)
 
         # ── Clustering ────────────────────────────────────────────────────
-        grp = QtWidgets.QGroupBox("Clustering (DBSCAN)")
-        gl  = QtWidgets.QFormLayout(grp)
+        sec, gl = self._make_form_section("Clustering (DBSCAN)")
         gl.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
         self.s_cluster_eps_nm = self._spin_dbl(50.0, 5.0, 1000.0, 5.0, decimals=1,
             tip="DBSCAN neighbourhood radius (nm). Two localisations are in the\n"
@@ -653,11 +1092,10 @@ class MainWindow(QtWidgets.QMainWindow):
             tip="Minimum localisations to form a DBSCAN cluster. Lower = more\n"
                 "clusters detected but noisier; higher = stricter.")
         gl.addRow("min samples", self.s_cluster_min_samples)
-        layout.addWidget(grp)
+        layout.addWidget(sec)
 
         # ── Performance ───────────────────────────────────────────────────
-        grp = QtWidgets.QGroupBox(f"Performance  —  {N_CPUS} cores")
-        gl  = QtWidgets.QFormLayout(grp)
+        sec, gl = self._make_form_section(f"Performance  —  {N_CPUS} cores")
         gl.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
         self.c_backend = QtWidgets.QComboBox()
         self.c_backend.addItems(self._available_backends())
@@ -681,75 +1119,76 @@ class MainWindow(QtWidgets.QMainWindow):
                 "(esp. on GPU) but more RAM. 500 is balanced; tune up if your\n"
                 "stack and free RAM are large.")
         gl.addRow("Chunk size (frames)", self.s_chunk_size)
-        layout.addWidget(grp)
+        layout.addWidget(sec)
 
         layout.addStretch(1)
 
-    def _build_run_tab(self):
-        """Right pane: log viewer + progress bar + matplotlib canvas."""
+    def _build_import_tab(self):
+        """Import tab — single-source-of-truth for input/output config.
+
+        Mode toggle switches the visible sub-panel between:
+          • Single file — pick a .czi/.tif + an output folder
+          • Batch       — pick a folder of files, choose which to process,
+                           output goes to <folder>/batch_results/<stem>/
+
+        The Start button (sidebar) reads from this tab and dispatches to
+        the appropriate worker; after starting, the app auto-switches to
+        the Analysis tab so the user sees progress immediately.
+        """
         tab = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(tab)
-        v.setContentsMargins(8, 8, 8, 8)
+        v.setContentsMargins(16, 16, 16, 16)
+        v.setSpacing(12)
 
-        # Progress bar
-        self.progress_bar = QtWidgets.QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setTextVisible(True)
-        v.addWidget(self.progress_bar)
+        # ── Mode toggle ───────────────────────────────────────────────────
+        mode_row = QtWidgets.QHBoxLayout()
+        mode_row.addWidget(QtWidgets.QLabel("Mode"))
+        self.r_mode_single = QtWidgets.QRadioButton("Single file")
+        self.r_mode_batch  = QtWidgets.QRadioButton("Batch (folder)")
+        self.r_mode_single.setChecked(True)
+        self._mode_group = QtWidgets.QButtonGroup(self)
+        self._mode_group.addButton(self.r_mode_single, 0)
+        self._mode_group.addButton(self.r_mode_batch, 1)
+        self.r_mode_single.toggled.connect(self._on_import_mode_changed)
+        mode_row.addWidget(self.r_mode_single)
+        mode_row.addWidget(self.r_mode_batch)
+        mode_row.addStretch(1)
+        v.addLayout(mode_row)
 
-        # Vertical splitter: log on top, figure on bottom
-        splitter = QtWidgets.QSplitter(Qt.Orientation.Vertical)
+        # ── Single-file sub-panel ─────────────────────────────────────────
+        self._single_panel = QtWidgets.QGroupBox("Single file")
+        sg = QtWidgets.QFormLayout(self._single_panel)
+        sg.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
 
-        # Log viewer.  Cap the block count so the document doesn't grow
-        # unbounded — a 64-file batch can dump tens of thousands of lines
-        # and per-append cost climbs noticeably past ~5k blocks, which
-        # starves the Qt event loop and makes the log appear "frozen"
-        # while the subprocess is actually producing output in real time.
-        self.log_box = QtWidgets.QPlainTextEdit()
-        self.log_box.setReadOnly(True)
-        self.log_box.setMaximumBlockCount(5000)
-        mono = QtGui.QFont("Menlo, Consolas, monospace")
-        mono.setStyleHint(QtGui.QFont.StyleHint.Monospace)
-        mono.setPointSize(10)
-        self.log_box.setFont(mono)
-        splitter.addWidget(self.log_box)
+        row = QtWidgets.QHBoxLayout()
+        self.e_file = QtWidgets.QLineEdit()
+        self.e_file.setPlaceholderText("Browse for a .czi / .tif file…")
+        b1 = QtWidgets.QPushButton("Browse")
+        b1.clicked.connect(self._on_browse_file)
+        row.addWidget(self.e_file); row.addWidget(b1)
+        w_file = QtWidgets.QWidget(); w_file.setLayout(row)
+        sg.addRow("Input file", w_file)
 
-        # Matplotlib canvas wrapper
-        canvas_wrap = QtWidgets.QWidget()
-        cwv = QtWidgets.QVBoxLayout(canvas_wrap)
-        cwv.setContentsMargins(0, 0, 0, 0)
-        self.fig = Figure(figsize=(8, 5), dpi=100, facecolor="#222")
-        self.canvas = FigureCanvas(self.fig)
-        self.canvas_toolbar = NavToolbar(self.canvas, canvas_wrap)
-        cwv.addWidget(self.canvas_toolbar)
-        cwv.addWidget(self.canvas)
-        # Placeholder
-        ax = self.fig.add_subplot(111)
-        ax.set_facecolor("#111")
-        ax.text(0.5, 0.5, "Results figure will appear here after analysis",
-                ha="center", va="center", color="#888", fontsize=12,
-                transform=ax.transAxes)
-        ax.set_axis_off()
-        self.canvas.draw()
-        splitter.addWidget(canvas_wrap)
-        splitter.setSizes([300, 500])
-        v.addWidget(splitter, stretch=1)
+        row = QtWidgets.QHBoxLayout()
+        self.e_outdir = QtWidgets.QLineEdit()
+        self.e_outdir.setPlaceholderText("Defaults to input file's folder")
+        b2 = QtWidgets.QPushButton("Browse")
+        b2.clicked.connect(self._on_browse_outdir)
+        row.addWidget(self.e_outdir); row.addWidget(b2)
+        w_out = QtWidgets.QWidget(); w_out.setLayout(row)
+        sg.addRow("Output folder", w_out)
+        v.addWidget(self._single_panel)
 
-        self.tabs.addTab(tab, "Run Analysis")
+        # ── Batch sub-panel ───────────────────────────────────────────────
+        self._batch_panel = QtWidgets.QGroupBox("Batch")
+        bg = QtWidgets.QVBoxLayout(self._batch_panel)
+        bg.setSpacing(6)
 
-    def _build_batch_tab(self):
-        """Batch tab: pick a folder, choose which files to process, run all."""
-        tab = QtWidgets.QWidget()
-        v = QtWidgets.QVBoxLayout(tab)
-        v.setContentsMargins(8, 8, 8, 8)
-        v.setSpacing(6)
-
-        # Folder picker row
         row = QtWidgets.QHBoxLayout()
         row.addWidget(QtWidgets.QLabel("Input folder"))
         self.e_batch_folder = QtWidgets.QLineEdit()
-        self.e_batch_folder.setPlaceholderText("Pick a folder containing .czi / .tif files…")
+        self.e_batch_folder.setPlaceholderText(
+            "Pick a folder containing .czi / .tif files…")
         btn_pick = QtWidgets.QPushButton("Browse")
         btn_pick.clicked.connect(self._on_batch_pick_folder)
         btn_refresh = QtWidgets.QPushButton("↻ Rescan")
@@ -758,17 +1197,16 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addWidget(self.e_batch_folder, 1)
         row.addWidget(btn_pick)
         row.addWidget(btn_refresh)
-        v.addLayout(row)
+        bg.addLayout(row)
 
-        # File list with checkboxes
-        v.addWidget(QtWidgets.QLabel(
-            "Files to process  (uncheck individual files to skip them):"))
+        bg.addWidget(QtWidgets.QLabel(
+            "Files to process  (uncheck to skip):"))
         self.lst_batch_files = QtWidgets.QListWidget()
         self.lst_batch_files.setSelectionMode(
             QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
-        v.addWidget(self.lst_batch_files, stretch=1)
+        self.lst_batch_files.setMinimumHeight(220)
+        bg.addWidget(self.lst_batch_files, stretch=1)
 
-        # Select all / none / inverse
         sel_row = QtWidgets.QHBoxLayout()
         for label, fn in (("Select all",     self._on_batch_select_all),
                           ("Select none",    self._on_batch_select_none),
@@ -779,29 +1217,71 @@ class MainWindow(QtWidgets.QMainWindow):
         sel_row.addStretch(1)
         self.lbl_batch_summary = QtWidgets.QLabel("0 files / 0 selected")
         sel_row.addWidget(self.lbl_batch_summary)
-        v.addLayout(sel_row)
+        bg.addLayout(sel_row)
 
-        # Progress bar (overall batch %) + log + per-file figure preview
-        self.batch_progress = QtWidgets.QProgressBar()
-        self.batch_progress.setRange(0, 100); self.batch_progress.setValue(0)
-        self.batch_progress.setTextVisible(True)
-        self.batch_progress.setFormat("Idle")
-        v.addWidget(self.batch_progress)
+        # Where the batch outputs land
+        self.lbl_batch_output_path = QtWidgets.QLabel(
+            "Output → (pick an input folder first)")
+        self.lbl_batch_output_path.setStyleSheet(
+            f"color: {_THEME['TXT_MUTED']};")
+        bg.addWidget(self.lbl_batch_output_path)
 
-        self.batch_log_box = QtWidgets.QPlainTextEdit()
-        self.batch_log_box.setReadOnly(True)
-        # See note on log_box: cap block count for performance on long
-        # batch runs that produce many thousands of log lines.
-        self.batch_log_box.setMaximumBlockCount(5000)
-        mono = QtGui.QFont("Menlo, Consolas, monospace")
-        mono.setStyleHint(QtGui.QFont.StyleHint.Monospace)
-        mono.setPointSize(10)
-        self.batch_log_box.setFont(mono)
-        v.addWidget(self.batch_log_box, stretch=1)
+        v.addWidget(self._batch_panel, stretch=1)
 
-        self.tabs.addTab(tab, "Batch")
+        # Start visible state: single mode shown, batch hidden
+        self._batch_panel.hide()
 
-    # ── Batch-tab helpers ─────────────────────────────────────────────────
+        self.tabs.addTab(tab, "Import")
+
+    def _on_import_mode_changed(self, single_checked: bool):
+        self._single_panel.setVisible(single_checked)
+        self._batch_panel.setVisible(not single_checked)
+
+    def _build_analysis_tab(self):
+        """Analysis tab — pure status display.  Stage label, progress bar,
+        and a results panel that fills in after a run completes."""
+        tab = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(tab)
+        v.setContentsMargins(16, 16, 16, 16)
+        v.setSpacing(10)
+
+        self.run_stage_label = QtWidgets.QLabel("Idle")
+        self.run_stage_label.setStyleSheet(
+            f"color: {_THEME['TXT_MUTED']}; font-weight: 600; padding: 2px 0;")
+        v.addWidget(self.run_stage_label)
+
+        self.progress_bar = QtWidgets.QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFormat("Ready")
+        v.addWidget(self.progress_bar)
+
+        # Mirror widgets for batch runs.  Single set of widgets — one
+        # set of state per tab is excessive when Analysis is universal.
+        # Use the same stage label + progress bar for batch by aliasing.
+        self.batch_stage_label = self.run_stage_label
+        self.batch_progress    = self.progress_bar
+
+        # Per-file mini-progress for batch.  Shown only during a batch
+        # run (sits between the overall progress bar and the results
+        # panel).  Lets the user see "currently processing X" even when
+        # the overall % only ticks once per file.
+        self.batch_subprogress = QtWidgets.QProgressBar()
+        self.batch_subprogress.setRange(0, 100)
+        self.batch_subprogress.setValue(0)
+        self.batch_subprogress.setTextVisible(True)
+        self.batch_subprogress.setFormat("")
+        self.batch_subprogress.hide()
+        v.addWidget(self.batch_subprogress)
+
+        self.run_results = _ResultsPanel(
+            "Results will appear here after analysis.")
+        v.addWidget(self.run_results, stretch=1)
+
+        self.tabs.addTab(tab, "Analysis")
+
+    # ── Batch helpers (Import-tab batch sub-panel) ───────────────────────
     @staticmethod
     def _looks_like_input_file(name: str) -> bool:
         n = name.lower()
@@ -855,6 +1335,14 @@ class MainWindow(QtWidgets.QMainWindow):
         sel   = sum(1 for it in self._batch_iter_items()
                     if it.checkState() == Qt.CheckState.Checked)
         self.lbl_batch_summary.setText(f"{total} files / {sel} selected")
+        # Show the user where the per-file outputs will land
+        folder = self.e_batch_folder.text().strip()
+        if folder:
+            self.lbl_batch_output_path.setText(
+                f"Output → {os.path.join(folder, 'batch_results')}/<stem>/")
+        else:
+            self.lbl_batch_output_path.setText(
+                "Output → (pick an input folder first)")
 
     def _on_batch_select_all(self):
         for it in self._batch_iter_items():
@@ -979,44 +1467,22 @@ class MainWindow(QtWidgets.QMainWindow):
         actions.addWidget(self.btn_cmp_run)
         v.addLayout(actions)
 
-        # ── Progress bar + log + figure ───────────────────────────────────
+        # ── Stage label + progress bar + figure ───────────────────────────
+        self.cmp_stage_label = QtWidgets.QLabel("Idle")
+        self.cmp_stage_label.setStyleSheet(
+            f"color: {_THEME['TXT_MUTED']}; font-weight: 600; padding: 2px 0;")
+        v.addWidget(self.cmp_stage_label)
+
         self.cmp_progress = QtWidgets.QProgressBar()
         self.cmp_progress.setRange(0, 100); self.cmp_progress.setValue(0)
-        self.cmp_progress.setFormat("Idle")
+        self.cmp_progress.setFormat("Ready")
         v.addWidget(self.cmp_progress)
 
-        splitter = QtWidgets.QSplitter(Qt.Orientation.Vertical)
-
-        self.cmp_log_box = QtWidgets.QPlainTextEdit()
-        self.cmp_log_box.setReadOnly(True)
-        self.cmp_log_box.setMaximumBlockCount(5000)
-        mono = QtGui.QFont("Menlo, Consolas, monospace")
-        mono.setStyleHint(QtGui.QFont.StyleHint.Monospace)
-        mono.setPointSize(10)
-        self.cmp_log_box.setFont(mono)
-        splitter.addWidget(self.cmp_log_box)
-
-        # Result figure canvas (separate from the Run-Analysis one so the
-        # user can switch back-and-forth without losing either)
-        canvas_wrap = QtWidgets.QWidget()
-        cwv = QtWidgets.QVBoxLayout(canvas_wrap)
-        cwv.setContentsMargins(0, 0, 0, 0)
-        self.cmp_fig = Figure(figsize=(8, 5), dpi=100, facecolor="#222")
-        self.cmp_canvas = FigureCanvas(self.cmp_fig)
-        self.cmp_canvas_toolbar = NavToolbar(self.cmp_canvas, canvas_wrap)
-        cwv.addWidget(self.cmp_canvas_toolbar)
-        cwv.addWidget(self.cmp_canvas)
-        ax = self.cmp_fig.add_subplot(111)
-        ax.set_facecolor("#111")
-        ax.text(0.5, 0.5,
-                "Comparison figure will appear here after generation",
-                ha="center", va="center", color="#888", fontsize=12,
-                transform=ax.transAxes)
-        ax.set_axis_off()
-        self.cmp_canvas.draw()
-        splitter.addWidget(canvas_wrap)
-        splitter.setSizes([200, 400])
-        v.addWidget(splitter, stretch=2)
+        # Results panel (figure is saved to disk only — view it externally
+        # or in the Workspace tab if you want to overlay tracks).
+        self.cmp_results = _ResultsPanel(
+            "Comparison results will appear here after generation.")
+        v.addWidget(self.cmp_results, stretch=2)
 
         self.tabs.addTab(tab, "Compare")
 
@@ -1061,8 +1527,8 @@ class MainWindow(QtWidgets.QMainWindow):
     # ══════════════════════════════════════════════════════════════════════
     #  WORKSPACE TAB  (Napari)
     # ══════════════════════════════════════════════════════════════════════
-    def _build_workspace_tab(self):
-        """Build the Workspace tab — toolbar + lazy-loaded napari viewer.
+    def _build_visualise_tab(self):
+        """Build the Visualise tab — toolbar + lazy-loaded napari viewer.
 
         Napari is imported lazily on first activation so a missing dep
         doesn't block the rest of FIREFLY from launching.  If the import
@@ -1130,7 +1596,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         v.addWidget(self._ws_container, stretch=1)
 
-        self.tabs.addTab(tab, "Workspace")
+        self.tabs.addTab(tab, "Visualise")
 
         # Lazy-init when the tab is first switched to.
         self.tabs.currentChanged.connect(self._ws_maybe_init)
@@ -1141,7 +1607,7 @@ class MainWindow(QtWidgets.QMainWindow):
         does work."""
         if self._workspace_initialised:
             return
-        if self.tabs.tabText(idx) != "Workspace":
+        if self.tabs.tabText(idx) != "Visualise":
             return
         self._workspace_initialised = True   # mark even on failure — don't retry
         self._ws_init_viewer()
@@ -1347,7 +1813,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._workspace_initialised:
             # Force the lazy init now
             for i in range(self.tabs.count()):
-                if self.tabs.tabText(i) == "Workspace":
+                if self.tabs.tabText(i) == "Visualise":
                     self._workspace_initialised = True
                     self._ws_init_viewer()
                     break
@@ -1378,6 +1844,8 @@ class MainWindow(QtWidgets.QMainWindow):
             # ── Paths ─────────────────────────────────────────────────────
             ("analysis/file",            self.e_file,            "text"),
             ("analysis/outdir",          self.e_outdir,          "text"),
+            ("analysis/batch_folder",    self.e_batch_folder,    "text"),
+            ("analysis/mode_batch",      self.r_mode_batch,      "check", _bool_cast),
 
             # ── Imaging metadata ──────────────────────────────────────────
             ("analysis/override_px",     self.c_override_px,     "check", _bool_cast),
@@ -1480,6 +1948,22 @@ class MainWindow(QtWidgets.QMainWindow):
             on = self.c_filter_d_enabled.isChecked()
             self.s_filter_d_min.setEnabled(on)
             self.s_filter_d_max.setEnabled(on)
+        except Exception:
+            pass
+
+        # Import-tab mode visibility — show the right sub-panel based on
+        # the restored mode_batch flag.  Also re-scan the batch folder
+        # if one was previously selected so the file list re-populates.
+        try:
+            if self.r_mode_batch.isChecked():
+                self._single_panel.hide()
+                self._batch_panel.show()
+            else:
+                self._single_panel.show()
+                self._batch_panel.hide()
+            folder = self.e_batch_folder.text().strip()
+            if folder and os.path.isdir(folder):
+                self._batch_rescan(folder)
         except Exception:
             pass
 
@@ -1686,35 +2170,48 @@ class MainWindow(QtWidgets.QMainWindow):
             self.btn_run.setText("Stopping…")
             self.btn_run.setEnabled(False)
 
-            # Surface in the active log so the user knows their click registered
-            log_widget = (self.batch_log_box
-                          if getattr(self, "_is_batch_run", False)
-                          else self.log_box)
-            log_widget.appendPlainText(
+            # Surface in the shared console + status bar so the user
+            # knows their click registered (without forcing them to open
+            # the console panel).
+            self.console_log.appendPlainText(
                 "\n── Stop requested.  Waiting for the current stage to reach "
                 "a checkpoint (up to 5 s); will force-terminate if it doesn't.")
+            self.statusBar().showMessage("Stop requested — waiting for current stage…")
             return
 
-        # Dispatch by active tab.  The sidebar Start button (and the tab's
-        # own Generate button for Compare) all route here.
+        # Dispatch.  The Compare-tab's own Generate button overrides; the
+        # sidebar Start button uses the Import-tab mode (Single / Batch),
+        # OR if the active tab is Compare, runs the comparison.
         sender = self.sender()
         if sender is getattr(self, "btn_cmp_run", None):
             self._start_compare_run()
             return
         active_tab_label = self.tabs.tabText(self.tabs.currentIndex())
-        if active_tab_label.startswith("Batch"):
-            self._start_batch_run()
-        elif active_tab_label.startswith("Compare"):
+        if active_tab_label.startswith("Compare"):
             self._start_compare_run()
+        elif self.r_mode_batch.isChecked():
+            self._start_batch_run()
         else:
             self._start_single_run()
+
+    def _switch_to_tab(self, label: str):
+        """Switch the central tab widget to the tab whose visible text
+        starts with `label` (e.g. "Analysis" → finds "Analysis")."""
+        for i in range(self.tabs.count()):
+            if self.tabs.tabText(i).startswith(label):
+                self.tabs.setCurrentIndex(i)
+                return
 
     def _start_single_run(self):
         fpath = self.e_file.text().strip()
         if not fpath or not os.path.isfile(fpath):
             QtWidgets.QMessageBox.warning(
-                self, "No file", "Please pick an input file first.")
+                self, "No file",
+                "Pick an input file on the Import tab first.")
+            self._switch_to_tab("Import")
             return
+        # Auto-switch to the Analysis tab so the user sees progress
+        self._switch_to_tab("Analysis")
 
         params = self._build_params_for_file(
             fpath, self.e_outdir.text().strip() or None)
@@ -1726,9 +2223,13 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
 
         # Clear UI for new run
-        self.log_box.clear()
+        self.console_log.clear()
         self.progress_bar.setValue(0)
-        self._is_batch_run = False
+        self.progress_bar.setFormat("Starting…")
+        self.run_stage_label.setText("Starting…")
+        self.run_results.reset("Run in progress…")
+        self._is_batch_run   = False
+        self._is_compare_run = False
 
         # Spawn analysis SUBPROCESS (not thread).  Rationale: Qt holds a
         # Metal-backed surface for window compositing on macOS, and that
@@ -1749,13 +2250,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage("Running…")
 
     def _start_batch_run(self):
-        """Kick off batch analysis over the checked files in the Batch tab."""
+        """Kick off batch analysis over the checked files."""
         files = self._batch_checked_files()
         if not files:
             QtWidgets.QMessageBox.warning(
                 self, "No files",
-                "Pick a folder and check at least one file to process.")
+                "On the Import tab, switch to Batch mode and pick a "
+                "folder + at least one file.")
+            self._switch_to_tab("Import")
             return
+        self._switch_to_tab("Analysis")
 
         # Batch outputs go to <input_folder>/batch_results/<stem>/  — same
         # convention as the Tk app.  Build a params dict per file.
@@ -1772,11 +2276,18 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-        # Clear batch UI for new run
-        self.batch_log_box.clear()
+        # Clear batch UI for new run.  batch_progress and batch_stage_label
+        # are aliased to the Analysis-tab widgets in the new layout.
+        self.console_log.clear()
         self.batch_progress.setValue(0)
         self.batch_progress.setFormat("Starting…")
-        self._is_batch_run = True
+        self.batch_stage_label.setText("Starting…")
+        self.batch_subprogress.setValue(0)
+        self.batch_subprogress.setFormat("")
+        self.batch_subprogress.show()
+        self.run_results.reset("Batch in progress…")
+        self._is_batch_run   = True
+        self._is_compare_run = False
 
         self._msg_queue    = multiprocessing.Queue()
         self._cancel_event = multiprocessing.Event()
@@ -1842,8 +2353,10 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
 
         # Clear compare UI for new run
-        self.cmp_log_box.clear()
+        self.console_log.clear()
         self.cmp_progress.setValue(0)
+        self.cmp_stage_label.setText("Starting…")
+        self.cmp_results.reset("Comparison in progress…")
         self.cmp_progress.setFormat("Starting…")
         self._is_batch_run    = False
         self._is_compare_run  = True
@@ -1881,16 +2394,19 @@ class MainWindow(QtWidgets.QMainWindow):
         is_batch   = getattr(self, "_is_batch_run", False)
         is_compare = getattr(self, "_is_compare_run", False)
 
-        # Route log/progress to whichever tab is "owning" this run.
+        # All log lines now land in the shared Console dock — one place
+        # for everything.  The per-tab widgets are only the stage label
+        # and the progress bar.
+        log_widget = self.console_log
         if is_compare:
-            log_widget      = self.cmp_log_box
             progress_widget = self.cmp_progress
+            stage_label     = self.cmp_stage_label
         elif is_batch:
-            log_widget      = self.batch_log_box
             progress_widget = self.batch_progress
+            stage_label     = self.batch_stage_label
         else:
-            log_widget      = self.log_box
             progress_widget = self.progress_bar
+            stage_label     = self.run_stage_label
 
         # Buffer log lines and append them in a SINGLE call at end of tick.
         # appendPlainText reflows the document each call; 1000 separate
@@ -1939,7 +2455,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if last_progress is not None:
             pct, msg = last_progress
             progress_widget.setValue(pct)
-            progress_widget.setFormat(f"{msg}  ({pct}%)")
+            # Progress bar shows just the % (clean look).  Verbose stage
+            # info goes above it in the stage label.
+            progress_widget.setFormat(f"{pct}%")
+            stage_label.setText(msg)
             self.statusBar().showMessage(msg)
 
         # Stop-button escalation: if cancel_event was set N seconds ago
@@ -1993,10 +2512,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ── Subprocess result handlers ────────────────────────────────────────
     def _handle_done(self, payload: dict):
-        self._show_result_figure(payload.get("figure_path"))
-        self.statusBar().showMessage(
-            f"Analysis complete — output at {payload.get('out_dir')}")
-        # Optional: push the result into the Workspace tab's napari viewer
+        out_dir = payload.get("out_dir", "")
+        stem    = payload.get("stem", "")
+        summary = payload.get("summary") or {}
+        n_tracks = summary.get("n_tracks", payload.get("n_tracks", 0))
+        headline = f"{stem}  —  {n_tracks:,} trajectories" if stem else \
+                   f"Analysis complete — {n_tracks:,} trajectories"
+        self.run_results.show_results(headline, out_dir)
+        self.run_results.show_stats(summary)
+        self.run_stage_label.setText("Done")
+        self.progress_bar.setFormat("Complete")
+        self.statusBar().showMessage(f"Analysis complete — output at {out_dir}")
+        # Optional: push the result into the Visualise tab's napari viewer
         try:
             self._ws_auto_load_after_run(payload)
         except Exception:
@@ -2005,20 +2532,26 @@ class MainWindow(QtWidgets.QMainWindow):
     def _handle_file_done(self, payload: dict):
         """One file in a batch finished successfully — not the terminal msg."""
         i, total = payload.get("index", 0), payload.get("total", 0)
+        n_tracks = payload.get("n_tracks", 0)
+        stem     = payload.get("stem", "")
         self.statusBar().showMessage(
-            f"Batch: {i} / {total} files complete  ({payload.get('n_tracks', 0):,} tracks)")
-        # Overall batch progress: percent of completed files
+            f"Batch: {i} / {total} files complete  ({n_tracks:,} tracks)")
         if total:
             pct = int(100 * i / total)
             self.batch_progress.setValue(pct)
             self.batch_progress.setFormat(f"Batch  {i}/{total}  ({pct}%)")
+            self.batch_subprogress.setValue(pct)
+            self.batch_subprogress.setFormat(
+                f"Last: {stem}  ({n_tracks:,} tracks)")
 
     def _handle_file_error(self, payload: dict):
         """One file in a batch failed — log it, batch continues."""
         i, total = payload.get("index", 0), payload.get("total", 0)
         f = payload.get("file", "?")
-        self.batch_log_box.appendPlainText(
+        self.console_log.appendPlainText(
             f"\n  ⚠ [{i}/{total}] failed: {os.path.basename(f)}")
+        self.batch_stage_label.setText(
+            f"[{i}/{total}] failed: {os.path.basename(f)} — batch continues")
         self.statusBar().showMessage(f"Batch: file {i} failed (continuing)")
 
     def _handle_batch_done(self, payload: dict):
@@ -2029,32 +2562,47 @@ class MainWindow(QtWidgets.QMainWindow):
         self.batch_progress.setValue(100)
         self.batch_progress.setFormat(
             f"Batch complete  —  {n_ok}/{n_total} succeeded, {n_fail} failed")
+        self.batch_subprogress.hide()
         self.statusBar().showMessage(
             f"Batch complete — {n_ok}/{n_total} succeeded, {n_fail} failed")
+
+        # Populate the results panel with the batch summary
+        headline = (f"Batch complete — {n_ok}/{n_total} succeeded"
+                    + (f", {n_fail} failed" if n_fail else ""))
+        # Aggregate stats across successful files
+        results = payload.get("results") or []
+        total_tracks = sum(r.get("n_tracks", 0) for r in results
+                           if r.get("ok"))
+        total_locs   = sum(r.get("n_locs", 0)   for r in results
+                           if r.get("ok"))
+        agg_summary = {
+            "n_tracks": total_tracks,
+            "n_locs":   total_locs,
+            "motion_counts": {},
+        }
+        # Find the common output root (parent of every file's out_dir)
+        common_root = ""
+        ok_dirs = [r.get("out_dir") for r in results if r.get("ok") and r.get("out_dir")]
+        if ok_dirs:
+            try:
+                common_root = os.path.commonpath(ok_dirs)
+            except Exception:
+                common_root = os.path.dirname(ok_dirs[0])
+        self.run_results.show_results(headline, common_root,
+                                      files=None)
+        self.run_results.show_stats(agg_summary)
 
     def _handle_compare_done(self, payload: dict):
         """Compare terminal message — figure + CSVs + PDF have been saved."""
         self.cmp_progress.setValue(100)
-        self.cmp_progress.setFormat("Comparison complete")
-        out_dir = payload.get("output_dir", "")
+        self.cmp_progress.setFormat("Complete")
+        out_dir   = payload.get("output_dir", "")
+        n_groups  = payload.get("n_groups", 0)
+        headline = f"Comparison complete — {n_groups} group(s)"
+        self.cmp_results.show_results(headline, out_dir)
+        self.cmp_stage_label.setText("Done")
         self.statusBar().showMessage(
             f"Comparison complete — output at {out_dir}")
-        # Display the saved figure
-        fig_path = payload.get("figure_path", "")
-        if fig_path and os.path.isfile(fig_path):
-            try:
-                import numpy as _np
-                from PIL import Image as _PILImage
-                img = _np.asarray(_PILImage.open(fig_path).convert("RGB"))
-                self.cmp_fig.clear()
-                ax = self.cmp_fig.add_subplot(111)
-                ax.imshow(img, interpolation="lanczos")
-                ax.set_axis_off()
-                self.cmp_fig.tight_layout(pad=0)
-                self.cmp_canvas.draw()
-            except Exception as exc:
-                self.cmp_log_box.appendPlainText(
-                    f"  WARN: could not display comparison figure: {exc}")
 
     def _handle_stopped(self):
         self.statusBar().showMessage("Stopped by user")
@@ -2067,9 +2615,7 @@ class MainWindow(QtWidgets.QMainWindow):
             path = crash_reporter.write_crash_report(
                 RuntimeError, RuntimeError("Analysis subprocess raised"),
                 None, source="analysis subprocess", context=tb)
-            is_batch = getattr(self, "_is_batch_run", False)
-            log_widget = self.batch_log_box if is_batch else self.log_box
-            log_widget.appendPlainText(f"\nCrash report: {path}")
+            self.console_log.appendPlainText(f"\nCrash report: {path}")
             self._show_crash_dialog(path)
         except Exception:
             QtWidgets.QMessageBox.critical(
@@ -2101,24 +2647,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.btn_cmp_run.setEnabled(True)
         except AttributeError:
             pass
-
-    def _show_result_figure(self, figure_path: str):
-        """Display the saved combined-results image on the matplotlib canvas."""
-        if not figure_path or not os.path.isfile(figure_path):
-            return
         try:
-            import numpy as _np
-            from PIL import Image as _PILImage
-            img = _np.asarray(_PILImage.open(figure_path).convert("RGB"))
-            self.fig.clear()
-            ax = self.fig.add_subplot(111)
-            ax.imshow(img, interpolation="lanczos")
-            ax.set_axis_off()
-            self.fig.tight_layout(pad=0)
-            self.canvas.draw()
-        except Exception as exc:
-            self.log_box.appendPlainText(
-                f"  WARN: could not display figure: {exc}")
+            self.batch_subprogress.hide()
+        except AttributeError:
+            pass
 
     # ── Crash reporter integration ────────────────────────────────────────
     def _install_crash_hooks(self):
@@ -2128,7 +2660,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         def _log_provider(n: int = 120) -> str:
             try:
-                txt = self.log_box.toPlainText()
+                txt = self.console_log.toPlainText()
                 return "\n".join(txt.splitlines()[-n:])
             except Exception:
                 return ""
@@ -2214,6 +2746,468 @@ def _qt_message_handler(mode, context, message):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  THEME — GitHub-dark-style palette matching the legacy Tk app
+# ══════════════════════════════════════════════════════════════════════════════
+# Colour constants are duplicated as Python globals here AND injected into
+# the QSS template via .format() so they're a single source of truth for
+# both stylesheet and any programmatic widget colouring (matplotlib
+# canvas backgrounds, error messages, etc.).
+_THEME = {
+    "BG":          "#0d1117",   # main window background
+    "PANEL":       "#161b22",   # cards, group boxes, log boxes
+    "PANEL_ALT":   "#1c2128",   # alternating rows / subtle differentiation
+    "BORDER":      "#30363d",   # borders, separators
+    "BORDER_HI":   "#484f58",   # focused / hovered borders
+    "TXT":         "#e6edf3",   # primary text
+    "TXT_MUTED":   "#8b949e",   # secondary text (placeholder, labels-of-labels)
+    "ACC":         "#58a6ff",   # primary accent (blue)
+    "ACC_HOVER":   "#79c0ff",
+    "ACC_PRESSED": "#388bfd",
+    "ACC_FG":      "#0d1117",   # text on top of an accent fill
+    "DANGER":      "#f85149",
+    "SUCCESS":     "#56d364",
+    "WARN":        "#f78166",
+}
+
+_FIREFLY_QSS = """
+/* ── Base ────────────────────────────────────────────────────────────────── */
+QWidget {{
+    background-color: {BG};
+    color:            {TXT};
+    font-family:      -apple-system, "SF Pro Text", "Segoe UI", "Inter",
+                      "Helvetica Neue", Arial, sans-serif;
+    font-size:        12px;
+}}
+
+QMainWindow, QDialog {{
+    background-color: {BG};
+}}
+
+/* Sidebar frame gets a slightly different shade so it visually separates
+   from the central tab area. */
+QMainWindow > QWidget > QFrame[frameShape="6"] {{   /* StyledPanel */
+    background-color: {PANEL};
+    border-right:     1px solid {BORDER};
+}}
+
+/* ── Labels ──────────────────────────────────────────────────────────────── */
+QLabel {{
+    background:       transparent;
+    color:            {TXT};
+}}
+
+/* ── Group boxes ─────────────────────────────────────────────────────────── */
+QGroupBox {{
+    background-color: {PANEL};
+    border:           1px solid {BORDER};
+    border-radius:    6px;
+    margin-top:       12px;
+    padding:          8px 8px 6px 8px;
+}}
+
+QGroupBox::title {{
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    padding:           0 6px;
+    margin-left:       8px;
+    color:             {TXT_MUTED};
+    font-weight:       600;
+    font-size:         11px;
+    background-color:  {BG};
+}}
+
+/* ── Buttons ─────────────────────────────────────────────────────────────── */
+QPushButton {{
+    background-color: {PANEL_ALT};
+    color:            {TXT};
+    border:           1px solid {BORDER};
+    border-radius:    5px;
+    padding:          5px 12px;
+    min-height:       20px;
+}}
+
+QPushButton:hover {{
+    background-color: {PANEL};
+    border-color:     {BORDER_HI};
+}}
+
+QPushButton:pressed {{
+    background-color: {BG};
+    border-color:     {ACC};
+}}
+
+QPushButton:disabled {{
+    color:            {TXT_MUTED};
+    background-color: {PANEL};
+    border-color:     {BORDER};
+}}
+
+QPushButton:default,
+QPushButton#primary {{
+    background-color: {ACC};
+    color:            {ACC_FG};
+    border:           1px solid {ACC};
+    font-weight:      600;
+}}
+
+QPushButton:default:hover,
+QPushButton#primary:hover {{
+    background-color: {ACC_HOVER};
+    border-color:     {ACC_HOVER};
+}}
+
+QPushButton:default:pressed,
+QPushButton#primary:pressed {{
+    background-color: {ACC_PRESSED};
+    border-color:     {ACC_PRESSED};
+}}
+
+QToolButton {{
+    background:       transparent;
+    color:            {TXT_MUTED};
+    border:           1px solid transparent;
+    border-radius:    4px;
+    padding:          2px 6px;
+}}
+
+QToolButton:hover {{
+    color:            {DANGER};
+    background:       {PANEL_ALT};
+    border-color:     {BORDER};
+}}
+
+/* ── Line edits / spinboxes / combos ─────────────────────────────────────── */
+QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QPlainTextEdit, QTextEdit {{
+    background-color: {PANEL_ALT};
+    color:            {TXT};
+    border:           1px solid {BORDER};
+    border-radius:    4px;
+    padding:          3px 6px;
+    selection-background-color: {ACC};
+    selection-color:  {ACC_FG};
+}}
+
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus,
+QComboBox:focus, QPlainTextEdit:focus, QTextEdit:focus {{
+    border-color:     {ACC};
+}}
+
+QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled {{
+    background-color: {PANEL};
+    color:            {TXT_MUTED};
+}}
+
+/* Spinbox stepper buttons are removed entirely via NoButtons in the
+   _QuietSpinBox subclasses — these QSS rules collapse the cells so any
+   stray third-party spinbox (e.g. from napari's plugin UI) also reads
+   as a clean borderless number field. */
+QSpinBox::up-button, QDoubleSpinBox::up-button,
+QSpinBox::down-button, QDoubleSpinBox::down-button {{
+    background-color: transparent;
+    border:           none;
+    width:            0;
+    height:           0;
+}}
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow,
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{
+    image:  none;
+    width:  0;
+    height: 0;
+}}
+
+QComboBox::drop-down {{
+    border: none;
+    width:  18px;
+}}
+QComboBox::down-arrow {{
+    image: none;
+    width: 0; height: 0;
+    border-left:  4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top:    5px solid {TXT_MUTED};
+    margin-right: 6px;
+}}
+QComboBox QAbstractItemView {{
+    background-color: {PANEL};
+    color:            {TXT};
+    border:           1px solid {BORDER};
+    selection-background-color: {ACC};
+    selection-color:  {ACC_FG};
+    outline:          0;
+}}
+
+/* ── Tabs ────────────────────────────────────────────────────────────────── */
+QTabWidget::pane {{
+    background-color: {BG};
+    border:           1px solid {BORDER};
+    border-radius:    6px;
+    top:              -1px;
+}}
+
+QTabBar::tab {{
+    background-color: transparent;
+    color:            {TXT_MUTED};
+    border:           1px solid transparent;
+    padding:          6px 14px;
+    margin-right:     2px;
+    border-top-left-radius:  6px;
+    border-top-right-radius: 6px;
+}}
+
+QTabBar::tab:hover {{
+    color:            {TXT};
+    background-color: {PANEL};
+}}
+
+QTabBar::tab:selected {{
+    color:            {TXT};
+    background-color: {BG};
+    border:           1px solid {BORDER};
+    border-bottom:    1px solid {BG};   /* hide bottom border of selected tab */
+    font-weight:      600;
+}}
+
+/* ── Progress bar ────────────────────────────────────────────────────────── */
+QProgressBar {{
+    background-color: {PANEL_ALT};
+    border:           1px solid {BORDER};
+    border-radius:    5px;
+    text-align:       center;
+    color:            {TXT};
+    min-height:       18px;
+}}
+QProgressBar::chunk {{
+    background-color: {ACC};
+    border-radius:    4px;
+}}
+
+/* ── List widgets (folder lists, batch file list) ───────────────────────── */
+QListWidget {{
+    background-color: {PANEL_ALT};
+    color:            {TXT};
+    border:           1px solid {BORDER};
+    border-radius:    5px;
+    outline:          0;
+    alternate-background-color: {PANEL};
+}}
+
+QListWidget::item {{
+    padding:          4px 6px;
+    border-radius:    3px;
+}}
+
+QListWidget::item:hover {{
+    background-color: {PANEL};
+}}
+
+QListWidget::item:selected {{
+    background-color: {ACC};
+    color:            {ACC_FG};
+}}
+
+/* ── Checkboxes ─────────────────────────────────────────────────────────── */
+QCheckBox, QRadioButton {{
+    spacing:          6px;
+    background:       transparent;
+}}
+
+QCheckBox::indicator, QRadioButton::indicator {{
+    width:            14px;
+    height:           14px;
+    border:           1px solid {BORDER_HI};
+    background-color: {PANEL_ALT};
+    border-radius:    3px;
+}}
+
+QRadioButton::indicator {{
+    border-radius:    8px;
+}}
+
+QCheckBox::indicator:hover, QRadioButton::indicator:hover {{
+    border-color:     {ACC};
+}}
+
+QCheckBox::indicator:checked, QRadioButton::indicator:checked {{
+    background-color: {ACC};
+    border-color:     {ACC};
+    image:            none;
+}}
+
+/* ── Scrollbars ─────────────────────────────────────────────────────────── */
+QScrollBar:vertical {{
+    background:       transparent;
+    width:            10px;
+    margin:           0;
+}}
+QScrollBar::handle:vertical {{
+    background:       {BORDER};
+    min-height:       24px;
+    border-radius:    5px;
+}}
+QScrollBar::handle:vertical:hover {{
+    background:       {BORDER_HI};
+}}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+    background:       transparent; border: none; height: 0;
+}}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+    background:       transparent;
+}}
+
+QScrollBar:horizontal {{
+    background:       transparent;
+    height:           10px;
+    margin:           0;
+}}
+QScrollBar::handle:horizontal {{
+    background:       {BORDER};
+    min-width:        24px;
+    border-radius:    5px;
+}}
+QScrollBar::handle:horizontal:hover {{
+    background:       {BORDER_HI};
+}}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+    background:       transparent; border: none; width: 0;
+}}
+
+/* ── Splitter handle ────────────────────────────────────────────────────── */
+QSplitter::handle {{
+    background:       {BORDER};
+}}
+QSplitter::handle:hover {{
+    background:       {BORDER_HI};
+}}
+QSplitter::handle:horizontal {{ width: 1px; }}
+QSplitter::handle:vertical   {{ height: 1px; }}
+
+/* ── Status bar ─────────────────────────────────────────────────────────── */
+QStatusBar {{
+    background-color: {PANEL};
+    color:            {TXT_MUTED};
+    border-top:       1px solid {BORDER};
+}}
+
+/* ── ScrollArea (sidebar parameter list) ────────────────────────────────── */
+QScrollArea {{
+    background-color: {PANEL};
+    border:           none;
+}}
+
+/* ── Tooltips ───────────────────────────────────────────────────────────── */
+QToolTip {{
+    background-color: {PANEL};
+    color:            {TXT};
+    border:           1px solid {BORDER};
+    padding:          4px 6px;
+    border-radius:    4px;
+}}
+
+/* ── Collapsible section (accordion-style) ───────────────────────────────── */
+QToolButton#section_header {{
+    background-color:    {PANEL_ALT};
+    color:               {TXT};
+    border:              1px solid {BORDER};
+    border-top-left-radius:  5px;
+    border-top-right-radius: 5px;
+    padding:             7px 10px;
+    margin-top:          4px;
+    text-align:          left;
+    font-weight:         600;
+    font-size:           12px;
+}}
+QToolButton#section_header:hover {{
+    border-color:        {BORDER_HI};
+    background-color:    {PANEL};
+}}
+QToolButton#section_header:checked {{
+    border-bottom-left-radius:  0;
+    border-bottom-right-radius: 0;
+}}
+QFrame#section_content {{
+    background-color:    {PANEL};
+    border:              1px solid {BORDER};
+    border-top:          none;
+    border-bottom-left-radius:  5px;
+    border-bottom-right-radius: 5px;
+}}
+
+/* ── Results panel ──────────────────────────────────────────────────────── */
+QFrame#results_panel {{
+    background-color:    {PANEL};
+    border:              1px solid {BORDER};
+    border-radius:       6px;
+}}
+QFrame#results_panel QLabel {{ background: transparent; border: none; }}
+QListWidget#results_files {{
+    background-color:    {PANEL_ALT};
+    border:              1px solid {BORDER};
+    border-radius:       4px;
+}}
+
+/* ── Menus ──────────────────────────────────────────────────────────────── */
+QMenu {{
+    background-color: {PANEL};
+    color:            {TXT};
+    border:           1px solid {BORDER};
+    padding:          4px;
+}}
+QMenu::item {{
+    padding:          5px 18px;
+    border-radius:    3px;
+}}
+QMenu::item:selected {{
+    background-color: {ACC};
+    color:            {ACC_FG};
+}}
+""".format(**_THEME)
+
+
+def _apply_firefly_theme(app: QtWidgets.QApplication):
+    """Apply the FIREFLY dark theme: QPalette + comprehensive QSS.
+
+    Also nudge the platform style toward "Fusion" — macOS's native style
+    ignores most QSS properties (background colours, borders), so without
+    Fusion the stylesheet would only partially apply.  Fusion respects
+    everything in our QSS and renders identically on macOS / Windows /
+    Linux, which is what we want for a cohesive look.
+    """
+    # Fusion style — required on macOS for our QSS to actually take effect.
+    # Without this, the system style overrides background-color etc.
+    app.setStyle("Fusion")
+
+    # QPalette — mostly redundant alongside QSS but covers the few widgets
+    # that don't read QSS (some native dialogs, scroll bars on some
+    # platforms).  Keeps us looking consistent everywhere.
+    pal = QtGui.QPalette()
+    bg     = QtGui.QColor(_THEME["BG"])
+    panel  = QtGui.QColor(_THEME["PANEL"])
+    txt    = QtGui.QColor(_THEME["TXT"])
+    muted  = QtGui.QColor(_THEME["TXT_MUTED"])
+    acc    = QtGui.QColor(_THEME["ACC"])
+    border = QtGui.QColor(_THEME["BORDER"])
+    pal.setColor(QtGui.QPalette.ColorRole.Window,          bg)
+    pal.setColor(QtGui.QPalette.ColorRole.WindowText,      txt)
+    pal.setColor(QtGui.QPalette.ColorRole.Base,            panel)
+    pal.setColor(QtGui.QPalette.ColorRole.AlternateBase,   bg)
+    pal.setColor(QtGui.QPalette.ColorRole.ToolTipBase,     panel)
+    pal.setColor(QtGui.QPalette.ColorRole.ToolTipText,     txt)
+    pal.setColor(QtGui.QPalette.ColorRole.Text,            txt)
+    pal.setColor(QtGui.QPalette.ColorRole.PlaceholderText, muted)
+    pal.setColor(QtGui.QPalette.ColorRole.Button,          panel)
+    pal.setColor(QtGui.QPalette.ColorRole.ButtonText,      txt)
+    pal.setColor(QtGui.QPalette.ColorRole.Highlight,       acc)
+    pal.setColor(QtGui.QPalette.ColorRole.HighlightedText, QtGui.QColor(_THEME["ACC_FG"]))
+    pal.setColor(QtGui.QPalette.ColorRole.Link,            acc)
+    pal.setColor(QtGui.QPalette.ColorRole.Mid,             border)
+    pal.setColor(QtGui.QPalette.ColorRole.Dark,            bg)
+    pal.setColor(QtGui.QPalette.ColorRole.Shadow,          bg)
+    app.setPalette(pal)
+
+    app.setStyleSheet(_FIREFLY_QSS)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
@@ -2226,6 +3220,9 @@ def main():
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName("FIREFLY")
     app.setOrganizationName("jacoblevers")
+
+    # Apply the FIREFLY dark theme (Fusion style + QSS + QPalette).
+    _apply_firefly_theme(app)
 
     window = MainWindow()
     window.show()

@@ -63,13 +63,13 @@ macOS
 Install Python from https://www.python.org/downloads/ or via
 Homebrew (brew install python), then double-click:
 
-   Launch_sptPALM.app
+   Launch_FIREFLY.app
 
-(The launcher is still named Launch_sptPALM.app for backward
-compatibility — it just runs `python app_qt.py`.)
-
-On first launch the app detects missing libraries and installs them
-automatically. Takes 3-5 minutes. Subsequent launches are instant.
+On first launch a Terminal window opens showing pip installing the
+required libraries (PySide6, napari, PyTorch, scipy, etc.).  Takes
+3-8 minutes depending on network speed.  FIREFLY launches automatically
+when the install finishes.  Subsequent launches are instant — no
+Terminal window appears.
 
 Windows
 -------
@@ -78,10 +78,12 @@ IMPORTANT: Tick "Add Python to PATH" during installation.
 
 Then double-click:
 
-   Launch_sptPALM.bat
+   Launch_FIREFLY.bat
 
-On first launch the app detects missing libraries and installs them
-automatically. Takes 3-5 minutes. Subsequent launches are instant.
+On first launch a cmd window opens showing pip installing the
+required libraries (PySide6, napari, PyTorch, scipy, etc.).  Takes
+3-8 minutes depending on network speed.  FIREFLY launches automatically
+when the install finishes.  Subsequent launches are instant.
 
 
 ================================================================
