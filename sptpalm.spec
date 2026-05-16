@@ -74,6 +74,7 @@ try:
 except Exception:
     pass
 datas += [("sptpalm_analysis.py", ".")]
+datas += [("crash_reporter.py", ".")]
 # Bundle the app icon PNG so the Tk window/taskbar icon can be loaded
 # at runtime from sys._MEIPASS/assets/icon.png in frozen mode.
 if os.path.isfile(os.path.join(SPECPATH, "assets", "icon.png")):

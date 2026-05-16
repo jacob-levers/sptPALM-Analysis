@@ -241,6 +241,8 @@ if sys.platform == "darwin":
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
+import crash_reporter
+
 # Optional: drag-and-drop folders into the Compare tab via tkinterdnd2.
 # If the package is missing or fails to load (e.g. its bundled DLLs aren't
 # present), the app still works — drag-and-drop is just disabled.
@@ -972,6 +974,7 @@ class SPTPalmApp(_APP_BASE):
         self._load_settings()   # overwrite defaults with any saved preferences
         self._install_scroll_dispatcher()
         self._set_icon()
+        self._install_crash_hooks()
 
     # ── Global scroll dispatcher ──────────────────────────────────────────────
     #
@@ -1318,7 +1321,7 @@ class SPTPalmApp(_APP_BASE):
         # Grid layout so the button is always in column 0 and cannot be pushed off
         parent.columnconfigure(1, weight=1)
 
-        self._run_btn = ttk.Button(parent, text="▶  Run Analysis",
+        self._run_btn = ttk.Button(parent, text="Start",
                                    style="Run.TButton", command=self._on_run,
                                    width=16)
         self._run_btn.grid(row=0, column=0, padx=(18, 6), pady=14, sticky="w")
@@ -1332,7 +1335,7 @@ class SPTPalmApp(_APP_BASE):
         """Signal the worker to stop. Button stays in place, text changes."""
         self._stop_event.set()
         self._stop_requested_at = time.monotonic()
-        self._run_btn.configure(state="disabled", text="■  Stopping…",
+        self._run_btn.configure(state="disabled", text="Stopping…",
                                 style="Stop.TButton")
 
     def _toggle_params(self):
@@ -2316,6 +2319,78 @@ class SPTPalmApp(_APP_BASE):
         self._log_box.see("end")
         self._log_box.configure(state="disabled")
 
+    # ── Crash reporter integration ────────────────────────────────────────────
+    def _install_crash_hooks(self):
+        """Wire FIREFLY into the global crash reporter:
+        - Tk callback exceptions land in write_crash_report
+        - The reporter can pull our recent log lines and app state
+        - All crashes (main thread, threads, Tk callbacks, analysis worker)
+          surface a dialog with the report path.
+        """
+        def _log_provider(n=120):
+            try:
+                if not hasattr(self, "_log_box") or self._log_box is None:
+                    return ""
+                txt = self._log_box.get("1.0", "end-1c")
+                return "\n".join(txt.splitlines()[-n:])
+            except Exception:
+                return ""
+
+        def _state_provider():
+            s: dict = {}
+            try:
+                s["Current file"]   = self.v_file.get() if hasattr(self, "v_file") else "(none)"
+                s["Output folder"]  = self.v_outdir.get() if hasattr(self, "v_outdir") else "(default)"
+                s["Pixel size"]     = self.v_pixel_size.get() if hasattr(self, "v_pixel_size") else "?"
+                s["Frame interval"] = self.v_frame_interval.get() if hasattr(self, "v_frame_interval") else "?"
+                s["Detection diameter"] = self.v_diameter.get() if hasattr(self, "v_diameter") else "?"
+                s["Min mass"]       = self.v_minmass.get() if hasattr(self, "v_minmass") else "?"
+                s["Search range"]   = self.v_search_range.get() if hasattr(self, "v_search_range") else "?"
+                s["Min track len"]  = self.v_min_track_len.get() if hasattr(self, "v_min_track_len") else "?"
+                s["Drag-and-drop"]  = "available" if _HAS_DND else "disabled"
+                s["Running"]        = self._running
+                s["Stop requested"] = self._stop_event.is_set()
+            except Exception as e:
+                s["<state error>"] = repr(e)
+            return s
+
+        crash_reporter.set_log_provider(_log_provider)
+        crash_reporter.set_app_state_provider(_state_provider)
+
+        def _on_crash(path):
+            # Marshal back to the Tk thread before touching widgets
+            try:
+                self.after(0, lambda p=path: self._show_crash_dialog(p))
+            except Exception:
+                pass
+
+        crash_reporter.install_global_handlers(on_crash=_on_crash)
+
+        # Tk per-callback exception hook: covers `after()`, bound events, etc.
+        def _tk_excepthook(exc, val, tb):
+            path = crash_reporter.write_crash_report(
+                exc, val, tb, source="Tk callback")
+            self._show_crash_dialog(path)
+
+        self.report_callback_exception = _tk_excepthook
+
+    def _show_crash_dialog(self, path: str):
+        """Modal dialog with the crash-report path; offers to open the folder."""
+        try:
+            short = os.path.basename(path)
+            choice = messagebox.askyesno(
+                "FIREFLY — Unexpected error",
+                f"FIREFLY hit an unexpected error.\n\n"
+                f"A detailed crash report has been saved:\n\n"
+                f"    {short}\n\n"
+                f"Location:\n    {os.path.dirname(path)}\n\n"
+                f"Open the report folder now?",
+                parent=self)
+            if choice:
+                _open_folder(os.path.dirname(path))
+        except Exception:
+            pass
+
     def _show_results(self, data: dict):
         self._clear_right()
 
@@ -2525,15 +2600,20 @@ class SPTPalmApp(_APP_BASE):
                  font=FM(9), wraplength=680, justify="left",
                  anchor="w").pack(anchor="w", padx=20, pady=(0, 4))
 
-        data_dir2 = os.path.join(out_dir, "data")
+        data_dir2   = os.path.join(out_dir, "data")
+        extras_dir2 = os.path.join(out_dir, "firefly_extras")
 
         _section_label(p3, "Files")
         file_info = [
-            (f"{stem}_diffusion_summary.csv", "Per-trajectory D, α, motion",  data_dir2),
-            (f"{stem}_trajectories.csv",      "Full trajectory table",         data_dir2),
-            (f"{stem}_localisations.csv",     "Raw localisations",             data_dir2),
-            (f"{stem}_ensemble_msd.csv",      "Ensemble MSD curve",            data_dir2),
-            (f"{stem}_cluster_stats.csv",     "DBSCAN cluster statistics",     data_dir2),
+            (f"{stem}_locPALMTracer.csv",            "Localisations (PALM-Tracer format)", data_dir2),
+            (f"{stem}_trcPALMTracer.csv",            "Trajectories (PALM-Tracer format)",  data_dir2),
+            (f"{stem}_trcPALMTracer-AllROI-D.csv",   "Per-track D / MSD(0) / MSE",         data_dir2),
+            (f"{stem}_trcPALMTracer-AllROI-MSD.csv", "Per-track MSD curves",               data_dir2),
+            (f"{stem}_diffusion_summary.csv",        "Per-trajectory D, α, motion",        extras_dir2),
+            (f"{stem}_trajectories.csv",             "Full trajectory table (FIREFLY)",    extras_dir2),
+            (f"{stem}_localisations.csv",            "Raw localisations (FIREFLY)",        extras_dir2),
+            (f"{stem}_ensemble_msd.csv",             "Ensemble MSD curve",                 extras_dir2),
+            (f"{stem}_cluster_stats.csv",            "DBSCAN cluster statistics",          extras_dir2),
         ]
         if roi_path and os.path.exists(roi_path):
             file_info.append((os.path.basename(roi_path), "ROI mask preview", data_dir2))
@@ -2801,33 +2881,12 @@ class SPTPalmApp(_APP_BASE):
                     parent=win, title=f"Add folder to {label_var.get()}")
                 if f and f not in lb.get(0, "end"):
                     lb.insert("end", f)
-            def _add_many():
-                par = filedialog.askdirectory(
-                    parent=win,
-                    title="Select parent folder (will add all valid subfolders)")
-                if not par: return
-                added = 0
-                for name in sorted(os.listdir(par)):
-                    sub = os.path.join(par, name)
-                    if not os.path.isdir(sub): continue
-                    if (os.path.isdir(os.path.join(sub, "data")) or any(
-                            f.endswith("_diffusion_summary.csv")
-                            for f in os.listdir(sub)
-                            if os.path.isfile(os.path.join(sub, f)))):
-                        if sub not in lb.get(0, "end"):
-                            lb.insert("end", sub); added += 1
-                if added == 0:
-                    messagebox.showinfo(
-                        "Add subfolders",
-                        "No analysis folders detected as direct children "
-                        "of that path.", parent=win)
             def _remove_items():
                 for i in reversed(lb.curselection()):
                     lb.delete(i)
             def _clear():
                 lb.delete(0, "end")
             ttk.Button(btns, text="+ Add",       command=_add,        width=8 ).pack(side="left", padx=(0, 4))
-            ttk.Button(btns, text="+ Add many",  command=_add_many,   width=10).pack(side="left", padx=(0, 4))
             ttk.Button(btns, text="− Remove",    command=_remove_items, width=9 ).pack(side="left", padx=(0, 4))
             ttk.Button(btns, text="Clear",       command=_clear,      width=7 ).pack(side="left")
 
@@ -2923,7 +2982,7 @@ class SPTPalmApp(_APP_BASE):
         # ── Generate button ───────────────────────────────────────────────────
         gen_row = tk.Frame(body, bg=BG)
         gen_row.pack(fill="x", pady=(10, 6))
-        gen_btn = ttk.Button(gen_row, text="▶  Generate Comparison",
+        gen_btn = ttk.Button(gen_row, text="Generate Comparison",
                              style="Run.TButton",
                              command=lambda: _on_generate())
         gen_btn.pack(side="left")
@@ -3123,7 +3182,7 @@ class SPTPalmApp(_APP_BASE):
         self._running = True
         self._analysis_start = time.monotonic()
         self._stop_event.clear()
-        self._run_btn.configure(text="■  Stop", command=self._on_stop,
+        self._run_btn.configure(text="Stop", command=self._on_stop,
                                 style="Stop.TButton")
         self._batch_btn.configure(state="disabled")
         self._show_progress_panel()
@@ -3202,11 +3261,13 @@ class SPTPalmApp(_APP_BASE):
                 _check_stop()
                 fpath = os.path.join(folder, fname)
                 stem  = os.path.splitext(fname)[0]
-                out_dir  = os.path.join(folder, "batch_results", stem)
-                fig_dir  = os.path.join(out_dir, "figures")
-                data_dir = os.path.join(out_dir, "data")
-                os.makedirs(fig_dir,  exist_ok=True)
-                os.makedirs(data_dir, exist_ok=True)
+                out_dir    = os.path.join(folder, "batch_results", stem)
+                fig_dir    = os.path.join(out_dir, "figures")
+                data_dir   = os.path.join(out_dir, "data")            # PALM-Tracer
+                extras_dir = os.path.join(out_dir, "firefly_extras")  # FIREFLY only
+                os.makedirs(fig_dir,    exist_ok=True)
+                os.makedirs(data_dir,   exist_ok=True)
+                os.makedirs(extras_dir, exist_ok=True)
 
                 pct_base = int(i / n * 90)
                 _emit_progress(f"[{i+1}/{n}]  {fname}", pct_base)
@@ -3251,7 +3312,7 @@ class SPTPalmApp(_APP_BASE):
                         locs, drift_df = correct_drift(
                             locs, n_seg_frames=self.v_drift_segment.get())
                         drift_df.to_csv(
-                            os.path.join(data_dir, f"{stem}_drift.csv"), index=False)
+                            os.path.join(extras_dir, f"{stem}_drift.csv"), index=False)
 
                     max_tl = self.v_max_track_len.get()
                     tracks = link_trajectories(
@@ -3301,26 +3362,38 @@ class SPTPalmApp(_APP_BASE):
                         diff_df = diff_df.merge(
                             b_mss_df[["particle", "mss_slope"]], on="particle", how="left")
 
-                    # Save CSVs
+                    # Save CSVs — FIREFLY-native go to firefly_extras/
                     for df, suf in [(locs, "localisations"),
                                     (tracks, "trajectories"),
                                     (diff_df, "diffusion_summary")]:
-                        df.to_csv(os.path.join(data_dir, f"{stem}_{suf}.csv"), index=False)
+                        df.to_csv(os.path.join(extras_dir, f"{stem}_{suf}.csv"), index=False)
 
                     if len(b_cluster_stats_df):
                         b_cluster_stats_df.to_csv(
-                            os.path.join(data_dir, f"{stem}_cluster_stats.csv"), index=False)
+                            os.path.join(extras_dir, f"{stem}_cluster_stats.csv"), index=False)
+
+                    # PALM-Tracer-compatible CSVs (for cross-tool compatibility)
+                    try:
+                        from sptpalm_analysis import save_palmtracer_csvs as _save_pt
+                        _h = stack.shape[1] if stack.ndim >= 3 else 0
+                        _w = stack.shape[2] if stack.ndim >= 3 else 0
+                        _save_pt(data_dir, stem, locs, tracks, diff_df, imsd_df,
+                                 pixel_size_um=float(px), frame_interval_s=float(fi),
+                                 width=_w, height=_h,
+                                 n_frames=int(n_frames) if "n_frames" in dir() else int(len(stack)))
+                    except Exception as _e:
+                        _emit_log(f"  WARN: PALM-Tracer CSV export failed: {_e}")
 
                     # Ensemble MSD CSV (needed by the Compare feature)
                     (emsd_df.to_frame("msd_um2")
                             .reset_index(names="lag_frame")
-                            .to_csv(os.path.join(data_dir, f"{stem}_ensemble_msd.csv"),
+                            .to_csv(os.path.join(extras_dir, f"{stem}_ensemble_msd.csv"),
                                     index=False))
 
                     # Extra outputs for the Compare tab (params, JDD, dwell, turning)
                     import json as _b_json
                     import pandas as _pd
-                    with open(os.path.join(data_dir, f"{stem}_params.json"), "w") as _bpf:
+                    with open(os.path.join(extras_dir, f"{stem}_params.json"), "w") as _bpf:
                         _b_json.dump({
                             "stem": stem,
                             "pixel_size_um":     float(px),
@@ -3336,17 +3409,17 @@ class SPTPalmApp(_APP_BASE):
                             "n_frames":          int(n_frames) if "n_frames" in dir() else int(len(tracks)),
                         }, _bpf, indent=2)
                     if jdd:
-                        with open(os.path.join(data_dir, f"{stem}_jdd.json"), "w") as _bjf:
+                        with open(os.path.join(extras_dir, f"{stem}_jdd.json"), "w") as _bjf:
                             _b_json.dump(_to_jsonable(jdd), _bjf, indent=2)
                     if b_dwell_df is not None and len(b_dwell_df):
                         b_dwell_df.to_csv(
-                            os.path.join(data_dir, f"{stem}_dwell_times.csv"), index=False)
+                            os.path.join(extras_dir, f"{stem}_dwell_times.csv"), index=False)
                     if b_ta is not None and len(b_ta):
                         _pd.DataFrame({"turning_angle_deg": b_ta}).to_csv(
-                            os.path.join(data_dir, f"{stem}_turning_angles.csv"), index=False)
+                            os.path.join(extras_dir, f"{stem}_turning_angles.csv"), index=False)
                     if b_mf is not None and len(b_mf):
                         b_mf.to_csv(
-                            os.path.join(data_dir, f"{stem}_mobile_fraction.csv"), index=False)
+                            os.path.join(extras_dir, f"{stem}_mobile_fraction.csv"), index=False)
 
                     fig_data = make_figure(proj_sample, tracks, imsd_df, emsd_df, diff_df,
                                           px, fi, roi_mask=roi_mask,
@@ -3503,7 +3576,7 @@ class SPTPalmApp(_APP_BASE):
         self._running = True
         self._analysis_start = time.monotonic()
         self._stop_event.clear()
-        self._run_btn.configure(text="■  Stop", command=self._on_stop,
+        self._run_btn.configure(text="Stop", command=self._on_stop,
                                 style="Stop.TButton")
         self._show_progress_panel()
         self._status_var.set("Analysis running…")
@@ -3699,10 +3772,12 @@ class SPTPalmApp(_APP_BASE):
             out_dir = (self.v_outdir.get().strip()
                        or os.path.dirname(os.path.abspath(fpath)))
             os.makedirs(out_dir, exist_ok=True)
-            fig_dir  = os.path.join(out_dir, "figures")
-            data_dir = os.path.join(out_dir, "data")
-            os.makedirs(fig_dir,  exist_ok=True)
-            os.makedirs(data_dir, exist_ok=True)
+            fig_dir    = os.path.join(out_dir, "figures")
+            data_dir   = os.path.join(out_dir, "data")            # PALM-Tracer
+            extras_dir = os.path.join(out_dir, "firefly_extras")  # FIREFLY only
+            os.makedirs(fig_dir,    exist_ok=True)
+            os.makedirs(data_dir,   exist_ok=True)
+            os.makedirs(extras_dir, exist_ok=True)
 
             # Independent overrides
             px_arg = self.v_pixel_size.get()     if self.v_override_px.get() else None
@@ -3907,7 +3982,7 @@ class SPTPalmApp(_APP_BASE):
                     locs, n_seg_frames=self.v_drift_segment.get())
                 # Save drift trajectory alongside other outputs
                 drift_df.to_csv(
-                    os.path.join(data_dir, f"{stem}_drift.csv"), index=False)
+                    os.path.join(extras_dir, f"{stem}_drift.csv"), index=False)
                 # Preview: drift trajectory plot
                 try:
                     t_arr = drift_df["frame"].values * fi
@@ -4128,30 +4203,41 @@ class SPTPalmApp(_APP_BASE):
                     if _do_pdf:
                         _pimg.save(os.path.join(_pdir, f"{stem}_panel_{_ltr}.pdf"), "PDF", resolution=150)
 
-            # Save CSVs
+            # ── PALM-Tracer-format CSVs (the lab-standard outputs) ───────────
+            try:
+                from sptpalm_analysis import save_palmtracer_csvs as _save_pt
+                _h, _w = (stack.shape[1], stack.shape[2]) if stack.ndim >= 3 else (0, 0)
+                _save_pt(data_dir, stem, locs, tracks, diff_df, imsd_df,
+                         pixel_size_um=float(px), frame_interval_s=float(fi),
+                         width=_w, height=_h, n_frames=int(n_frames))
+                _emit_log("  Saved (data/): PALM-Tracer CSVs (loc / trc / D / MSD)")
+            except Exception as _e:
+                _emit_log(f"  WARN: PALM-Tracer CSV export failed: {_e}")
+
+            # ── FIREFLY-only outputs (for re-analysis & Compare tab) ────────
             locs.to_csv(
-                os.path.join(data_dir, f"{stem}_localisations.csv"), index=False)
-            _emit_log(f"  Saved: localisations.csv  ({len(locs):,} rows)")
+                os.path.join(extras_dir, f"{stem}_localisations.csv"), index=False)
+            _emit_log(f"  Saved (firefly_extras/): localisations.csv  ({len(locs):,} rows)")
             tracks.to_csv(
-                os.path.join(data_dir, f"{stem}_trajectories.csv"), index=False)
-            _emit_log(f"  Saved: trajectories.csv  ({len(tracks):,} rows)")
+                os.path.join(extras_dir, f"{stem}_trajectories.csv"), index=False)
+            _emit_log(f"  Saved (firefly_extras/): trajectories.csv  ({len(tracks):,} rows)")
             diff_df.to_csv(
-                os.path.join(data_dir, f"{stem}_diffusion_summary.csv"), index=False)
-            _emit_log(f"  Saved: diffusion_summary.csv  ({diff_df.shape[0]:,} tracks)")
+                os.path.join(extras_dir, f"{stem}_diffusion_summary.csv"), index=False)
+            _emit_log(f"  Saved (firefly_extras/): diffusion_summary.csv  ({diff_df.shape[0]:,} tracks)")
             (emsd_df.to_frame("msd_um2")
                     .reset_index(names="lag_frame")
-                    .to_csv(os.path.join(data_dir, f"{stem}_ensemble_msd.csv"),
+                    .to_csv(os.path.join(extras_dir, f"{stem}_ensemble_msd.csv"),
                             index=False))
             if len(cluster_stats_df):
                 cluster_stats_df.to_csv(
-                    os.path.join(data_dir, f"{stem}_cluster_stats.csv"), index=False)
+                    os.path.join(extras_dir, f"{stem}_cluster_stats.csv"), index=False)
 
             # ── Extra outputs for the Compare tab ─────────────────────────────
             # These let the Compare feature reload everything from disk without
             # re-running the analysis pipeline.
             import json as _json
             import pandas as _pd
-            params_path = os.path.join(data_dir, f"{stem}_params.json")
+            params_path = os.path.join(extras_dir, f"{stem}_params.json")
             with open(params_path, "w") as _pf:
                 _json.dump({
                     "stem": stem,
@@ -4168,18 +4254,18 @@ class SPTPalmApp(_APP_BASE):
                     "n_frames":          int(n_frames),
                 }, _pf, indent=2)
             if jdd:
-                jdd_path = os.path.join(data_dir, f"{stem}_jdd.json")
+                jdd_path = os.path.join(extras_dir, f"{stem}_jdd.json")
                 with open(jdd_path, "w") as _jf:
                     _json.dump(_to_jsonable(jdd), _jf, indent=2)
             if dwell_df is not None and len(dwell_df):
                 dwell_df.to_csv(
-                    os.path.join(data_dir, f"{stem}_dwell_times.csv"), index=False)
+                    os.path.join(extras_dir, f"{stem}_dwell_times.csv"), index=False)
             if turning_angles is not None and len(turning_angles):
-                _pd.DataFrame({"turning_angle_rad": turning_angles}).to_csv(
-                    os.path.join(data_dir, f"{stem}_turning_angles.csv"), index=False)
+                _pd.DataFrame({"turning_angle_deg": turning_angles}).to_csv(
+                    os.path.join(extras_dir, f"{stem}_turning_angles.csv"), index=False)
             if mobile_frac_df is not None and len(mobile_frac_df):
                 mobile_frac_df.to_csv(
-                    os.path.join(data_dir, f"{stem}_mobile_fraction.csv"), index=False)
+                    os.path.join(extras_dir, f"{stem}_mobile_fraction.csv"), index=False)
 
             _emit_log(f"  Output folder: {out_dir}")
             _emit_progress("Complete!", 100)
@@ -4247,7 +4333,7 @@ class SPTPalmApp(_APP_BASE):
     def _reset_run_btn(self):
         """Restore button to Run mode after analysis finishes or is stopped."""
         self._run_btn.configure(state="normal",
-                                text="▶  Run Analysis",
+                                text="Start",
                                 style="Run.TButton",
                                 command=self._on_run)
         self._batch_btn.configure(state="normal")
@@ -4286,10 +4372,27 @@ class SPTPalmApp(_APP_BASE):
         self._reset_run_btn()
         self._status_var.set("Error — see details below")
         self._expand_panel()
-        messagebox.showerror(
-            "Analysis Error",
-            f"An error occurred during analysis:\n\n"
-            + tb.strip()[-600:])
+
+        # Write a full crash report so we have everything the user needs
+        # to send to the developer.  The worker thread sent us a formatted
+        # traceback string; synthesise a fake exc_info to feed the reporter.
+        try:
+            report_path = crash_reporter.write_crash_report(
+                RuntimeError, RuntimeError("Analysis worker raised"),
+                None,
+                source="analysis worker",
+                context=tb)
+        except Exception:
+            report_path = None
+
+        if report_path:
+            self._append_log(f"\n  Crash report: {report_path}")
+            self._show_crash_dialog(report_path)
+        else:
+            messagebox.showerror(
+                "Analysis Error",
+                f"An error occurred during analysis:\n\n"
+                + tb.strip()[-600:])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -4307,6 +4410,10 @@ def _open_folder(path: str) -> None:
 
 
 def main():
+    # Install crash handlers BEFORE building the app so an early failure
+    # (e.g. Tk init, font load, icon load) still produces a useful report.
+    crash_reporter.install_global_handlers()
+
     app = SPTPalmApp()
 
     # CI smoke-test marker: write a file once Tk is fully initialised so the
