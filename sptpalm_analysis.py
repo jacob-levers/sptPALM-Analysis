@@ -630,14 +630,17 @@ def _load_single_tif(path, stop_event=None):
         px_um, fi_s = _parse_ome_metadata(tif)
         n_pages = len(tif.pages)
         if stop_event is not None and n_pages > 500:
-            # Large file: load page-by-page so stop can interrupt mid-load
+            # Large file: load page-by-page so stop can interrupt mid-load.
+            # Check stop_event every 100 frames so cancel feels responsive
+            # (a 100-frame chunk is ~50 ms for 512×512 float32 on SSDs);
+            # log progress at every 500 to keep the log uncluttered.
             frames = []
             for i, page in enumerate(tif.pages):
                 frames.append(page.asarray().astype(np.float32))
+                if i % 100 == 0 and i > 0 and stop_event.is_set():
+                    raise _Cancelled()
                 if i % 500 == 0 and i > 0:
                     print(f"  Loading: {i}/{n_pages} frames...", flush=True)
-                    if stop_event.is_set():
-                        raise _Cancelled()
             stack = np.stack(frames)
         else:
             stack = tif.asarray().astype(np.float32)
@@ -675,7 +678,32 @@ def load_tif(path, stop_event=None):
             px_um_out = px
             fi_s_out  = fi
 
+    # Concatenate sister files into one continuous time series.  This
+    # creates a new array equal in size to the sum of all loaded files;
+    # peak memory during the call is roughly 2× the combined stack size
+    # (old + new exist simultaneously).  On memory-constrained machines
+    # this triggers swap and can take minutes — show a clear progress
+    # message so the user knows the GUI hasn't frozen.
+    n_total = sum(s.shape[0] for s in stacks)
+    total_gb = n_total * stacks[0].shape[1] * stacks[0].shape[2] * 4 / 1e9
+    print(f"  Concatenating {len(stacks)} files → {n_total:,} frames "
+          f"(~{total_gb:.1f} GB).  May take a minute on tight RAM.", flush=True)
+    try:
+        import psutil as _psutil
+        free_gb = _psutil.virtual_memory().available / 1e9
+        if free_gb < 2 * total_gb:
+            print(f"  WARNING: only {free_gb:.1f} GB free for a "
+                  f"{2*total_gb:.1f} GB peak — system may swap heavily.",
+                  flush=True)
+    except Exception:
+        pass
+
     combined = np.concatenate(stacks, axis=0)
+    # Free the per-file stacks now that they're copied into `combined`.
+    # Without this, the old list of per-file arrays stays alive until the
+    # function returns, doubling peak memory unnecessarily.
+    stacks.clear()
+    import gc as _gc; _gc.collect()
     print(f"  Combined shape: {combined.shape}  (T x Y x X)", flush=True)
     if px_um_out is not None: print(f"  Pixel size  : {px_um_out} µm  (from file metadata)")
     if fi_s_out is not None:  print(f"  Frame interval: {fi_s_out} s  (from file metadata)")
@@ -1223,8 +1251,19 @@ def _fast_preprocess_and_localise(stack, diameter=7, minmass=None, percentile=64
                                 bg_method=bg_method, workers=workers)
 
     if minmass is None:
-        minmass = float(np.percentile(stack_pp[min(5, len(stack_pp) - 1)], 99) * 0.4)
-        print(f"  Auto minmass: {minmass:.4f}")
+        # Auto-detect minmass.  The "mass" trackpy returns is *integrated*
+        # intensity over the spot (≈π(d/2)² ≈ d²/π px ≈ d²/4 effective px,
+        # depending on PSF shape).  The old formula used `peak × 0.4` which
+        # is the *per-pixel* threshold — that under-shoots the integrated
+        # threshold by ~10× and produces 100k+ false-positive "spots" on
+        # PALM-density data.  Corrected to account for the spot's pixel
+        # support: `peak × diameter² / 8` (0.5 × effective area).
+        # This is still a heuristic and may need manual tuning; users with
+        # known data should set minmass explicitly via the GUI spinbox.
+        _peak = float(np.percentile(stack_pp[min(5, len(stack_pp) - 1)], 99))
+        minmass = float(_peak * (diameter ** 2) / 8.0)
+        print(f"  Auto minmass: {minmass:.4f}  "
+              f"(from 99th-pct peak {_peak:.4f} × d²/8)")
 
     mean_proj = stack_pp.mean(axis=0).astype(np.float32)
     mn, mx    = mean_proj.min(), mean_proj.max()
@@ -1366,8 +1405,18 @@ def preprocess_and_localise_stream(stack, diameter=7, minmass=None, percentile=6
                              [_exe.submit(fn, f, bg_radius) for f in stack[:first_end]]])
 
     if minmass is None:
-        minmass = float(np.percentile(first_pp[min(5, first_end - 1)], 99) * 0.4)
-        print(f"  Auto minmass: {minmass:.4f}")
+        # Auto-detect minmass.  trackpy's "mass" is *integrated* intensity
+        # over a (diameter × diameter) spot patch, not a single-pixel value.
+        # The old formula `peak × 0.4` was a per-pixel threshold and under-
+        # shoots integrated mass by ~10×, producing 100k+ false-positive
+        # spots on dense PALM data.  Corrected to `peak × d²/8` — accounts
+        # for the spot's pixel support area at the standard 50% acceptance.
+        # Still a heuristic; users with known data should set minmass
+        # explicitly via the GUI spinbox.
+        _peak = float(np.percentile(first_pp[min(5, first_end - 1)], 99))
+        minmass = float(_peak * (diameter ** 2) / 8.0)
+        print(f"  Auto minmass: {minmass:.4f}  "
+              f"(from 99th-pct peak {_peak:.4f} × d²/8)")
     else:
         print(f"  Minmass   : {minmass:.4f}")
 
@@ -1640,32 +1689,55 @@ class TorchBackend(LocaliserBackend):
     @classmethod
     def _device_sanity_check(cls, dev: str) -> bool:
         """Run the exact ops used in the hot path on `dev` to confirm full
-        kernel coverage.  Some PyTorch builds advertise MPS or CUDA support
-        but lack kernels for specific ops — better to discover that here
-        with a 100-µs test than mid-pipeline on a 16 000-frame stack.
+        kernel coverage AND correctness.  Some PyTorch builds advertise MPS
+        or CUDA support but either lack kernels for specific ops, or have
+        kernels that silently return garbage (no Python exception raised).
+        We test both.
 
-        The Gaussian fit uses `torch.linalg.solve` (lstsq is NOT supported
-        on MPS in current PyTorch builds — see `_gaussian_lstsq_refine`),
-        so that's what we test along with the conv2d / avg_pool2d / einsum
-        ops that drive the bandpass and detection stages.
+        Metal native errors fire on C-level stderr — Python try/except
+        can't catch those.  On MPS we run the probe inside an OS-level
+        stderr redirect so a broken Metal context produces a clean
+        "sanity check failed" message instead of flooding the terminal.
         """
+        # OS-level stderr redirect (catches C / Metal native prints too).
+        # Only used for MPS probing where we expect this class of noise.
+        import contextlib as _cl
+
+        @_cl.contextmanager
+        def _quiet_native_stderr():
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            saved   = os.dup(2)
+            try:
+                os.dup2(devnull, 2)
+                yield
+            finally:
+                os.dup2(saved, 2)
+                os.close(devnull)
+                os.close(saved)
+
+        ctx = _quiet_native_stderr() if dev == "mps" else _cl.nullcontext()
         try:
-            import torch
-            import torch.nn.functional as F
-            t = torch.device(dev)
-            # 4×4 linear solve (exercises the same kernel as the Gaussian fit)
-            A = torch.eye(4, device=t, dtype=torch.float32).unsqueeze(0)
-            v = torch.ones(4, device=t, dtype=torch.float32).view(1, 4, 1)
-            _ = torch.linalg.solve(A, v)
-            # avg_pool2d (bandpass background) and max_pool2d (local maxima)
-            x = torch.zeros(1, 1, 8, 8, device=t, dtype=torch.float32)
-            _ = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
-            _ = F.max_pool2d(x, kernel_size=3, stride=1, padding=1)
-            # einsum (used in normal-equations assembly)
-            _ = torch.einsum('ni,ij,ik->njk',
-                             torch.ones(2, 4, device=t),
-                             torch.ones(4, 4, device=t),
-                             torch.ones(4, 4, device=t))
+            with ctx:
+                import torch
+                import torch.nn.functional as F
+                t = torch.device(dev)
+                # 4×4 linear solve (same kernel as the Gaussian fit).  Use
+                # an identity matrix and verify the result matches the
+                # input — broken MPS can return garbage with no exception.
+                A = torch.eye(4, device=t, dtype=torch.float32).unsqueeze(0)
+                v = torch.ones(4, device=t, dtype=torch.float32).view(1, 4, 1)
+                sol = torch.linalg.solve(A, v)
+                if not torch.allclose(sol, v, rtol=1e-2, atol=1e-3):
+                    return False
+                # avg_pool2d (bandpass) and max_pool2d (local maxima)
+                x = torch.zeros(1, 1, 8, 8, device=t, dtype=torch.float32)
+                _ = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
+                _ = F.max_pool2d(x, kernel_size=3, stride=1, padding=1)
+                # einsum (used in normal-equations assembly)
+                _ = torch.einsum('ni,ij,ik->njk',
+                                 torch.ones(2, 4, device=t),
+                                 torch.ones(4, 4, device=t),
+                                 torch.ones(4, 4, device=t))
             return True
         except Exception as exc:
             print(f"  Device sanity check failed on {dev}: "
@@ -1938,14 +2010,36 @@ class TorchBackend(LocaliserBackend):
 
             # ── 6. Sub-pixel refinement ─────────────────────────────────────
             # Primary path: analytical 2D-Gaussian fit on log-intensities,
-            #   one batched matmul for N spots.  Matches trackpy's iterative
-            #   Gaussian refinement to within ≈10 nm in typical data and
-            #   tightens trajectory recovery vs centroid-of-mass alone.
+            #   one batched solve per sub-batch.  Matches trackpy's iterative
+            #   refinement to within ≈10 nm and tightens trajectory recovery
+            #   vs centroid-of-mass alone.
             # Fallback path: centroid of mass — used only for the small set
-            #   of spots whose Gaussian fit was rejected (degenerate p ≥ 0,
-            #   or offset outside the patch radius).
-            dy_g, dx_g, ok = self._gaussian_lstsq_refine(
-                patches, dy_grid, dx_grid, _M)
+            #   of spots whose Gaussian fit was rejected.
+            #
+            # Sub-batching: when N is large (low-minmass / noisy data can
+            # easily produce 10s of thousands of "spots" per chunk), feeding
+            # all of them into `torch.linalg.solve` in a single call has
+            # been observed to misbehave on MPS — typically subsequent
+            # chunks then return 0 maxima as the MPS allocator state stays
+            # degraded.  Splitting the fit into ≤5000-spot sub-batches
+            # avoids that edge case while keeping batched-LSQ efficient.
+            MAX_FIT_BATCH = 5_000
+            N_spots = patches.shape[0]
+            if N_spots > MAX_FIT_BATCH:
+                dy_g_parts, dx_g_parts, ok_parts = [], [], []
+                for _start in range(0, N_spots, MAX_FIT_BATCH):
+                    _end  = min(_start + MAX_FIT_BATCH, N_spots)
+                    _dyg, _dxg, _okg = self._gaussian_lstsq_refine(
+                        patches[_start:_end], dy_grid, dx_grid, _M)
+                    dy_g_parts.append(_dyg)
+                    dx_g_parts.append(_dxg)
+                    ok_parts.append(_okg)
+                dy_g = torch.cat(dy_g_parts)
+                dx_g = torch.cat(dx_g_parts)
+                ok   = torch.cat(ok_parts)
+            else:
+                dy_g, dx_g, ok = self._gaussian_lstsq_refine(
+                    patches, dy_grid, dx_grid, _M)
 
             patch_sum = patches.sum(dim=(1, 2)).clamp(min=1e-6)
             dy_cm = (patches * dy_grid[None]).sum(dim=(1, 2)) / patch_sum
@@ -1968,22 +2062,53 @@ class TorchBackend(LocaliserBackend):
 
             # Free chunk allocations promptly.  PyTorch's reference-counting
             # releases the Python handles, but on MPS the underlying device
-            # memory isn't always returned to the system pool right away —
-            # explicitly clearing the cache between chunks prevents the
-            # progressive slowdown we observed on Apple Silicon when chunks
-            # were tightly packed.  No-op on CPU; cheap on CUDA.
+            # memory isn't actually returned until queued command buffers
+            # complete.  Sequence here:
+            #   1. del Python handles
+            #   2. synchronize: wait for the device's command queue to drain
+            #   3. empty_cache: release the pool back to the system
+            # Without the synchronize, mps.empty_cache() returns immediately
+            # and the memory stays committed — which on a 16 GB unified
+            # M-series machine can starve downstream stages (matplotlib
+            # rendering, Qt repaint) of GPU memory and produce confusing
+            # OOM errors that look unrelated to the localisation step.
             del x, bg, signal, maxp, is_max, coords, patches
             if dev_str == "mps":
                 try:
+                    if hasattr(torch.mps, "synchronize"):
+                        torch.mps.synchronize()
                     if hasattr(torch.mps, "empty_cache"):
                         torch.mps.empty_cache()
                 except Exception:
                     pass
             elif dev_str.startswith("cuda"):
                 try:
+                    torch.cuda.synchronize()
                     torch.cuda.empty_cache()
                 except Exception:
                     pass
+
+        # Drop the cached on-device tensors (design matrix, index grids) and
+        # force a full GPU drain before returning.  Otherwise the next
+        # CPU-only stage (linking) inherits a degraded MPS context — its
+        # finalizers run when Python GC kicks in during link_trajectories
+        # and produce "command buffer exited with error" OOM messages that
+        # have nothing to do with the actual cause.
+        del dy_grid, dx_grid, _M, _M_pinv
+        if dev_str == "mps":
+            try:
+                if hasattr(torch.mps, "synchronize"):
+                    torch.mps.synchronize()
+                if hasattr(torch.mps, "empty_cache"):
+                    torch.mps.empty_cache()
+            except Exception:
+                pass
+        elif dev_str.startswith("cuda"):
+            try:
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
 
         if not all_locs:
             print("  Found 0 localisations")
@@ -2026,16 +2151,57 @@ def list_available_backends() -> list[str]:
 
 
 def _resolve_backend(name: str | None):
-    """Look up a backend by name; resolve 'auto' to the first available entry.
+    """Look up a backend by name; resolve 'auto' to the FASTEST available
+    backend that's actually healthy on this machine.
+
+    Auto-selection logic:
+      1. Prefer TorchBackend if a GPU device (MPS / CUDA) passes the sanity
+         check — that's the only configuration where torch beats trackpy.
+      2. Otherwise pick TrackpyBackend.  Torch-on-CPU is comparable to
+         trackpy in speed but less battle-tested, so trackpy wins ties.
+
+    This keeps users on M-series Macs out of the MPS-OOM trap when their
+    Metal context is degraded (e.g. after an aborted prior process): the
+    sanity check fails, select_device() returns "cpu", and auto picks
+    trackpy.  After a reboot when MPS works again, auto picks torch
+    automatically — the user never has to touch the dropdown.
 
     Accepts torch-device pins (`torch-mps`, `torch-cuda`, `torch-cpu`) that
     pre-set the device on the returned instance — used for benchmarking
     and to let users force a specific device path.
     """
     if name in (None, "", "auto"):
+        # Smart-auto deliberately does NOT auto-probe MPS.
+        #
+        # On healthy Apple-Silicon Macs MPS would be the fastest option,
+        # but on some combinations (M4 + macOS 26 + PyTorch 2.12 in
+        # particular) just probing MPS triggers Metal command-buffer OOM
+        # errors that flood stderr and can kill the process.  We can't
+        # detect "MPS is broken on this machine" reliably from Python —
+        # the errors are at C++ / Metal level — so we play it safe: auto
+        # only auto-picks CUDA (no Apple-specific reliability issue), and
+        # users who want MPS pick `torch-mps` explicitly from the
+        # dropdown.  Once they pick it once it's persisted across runs.
+        if TorchBackend.is_available():
+            try:
+                import torch as _torch
+                if _torch.cuda.is_available():
+                    inst = TorchBackend()
+                    inst._forced_device = "cuda"
+                    return inst
+            except Exception:
+                pass
+        # Fallback: first non-torch backend (trackpy in practice)
         for cls in _BACKEND_REGISTRY:
+            if cls is TorchBackend:
+                continue
             if cls.is_available():
                 return cls()
+        # Last resort: torch on CPU, if even trackpy is missing
+        if TorchBackend.is_available():
+            inst = TorchBackend()
+            inst._forced_device = "cpu"
+            return inst
         raise RuntimeError(
             "No localiser backend available — install trackpy or torch.")
 
@@ -2225,6 +2391,24 @@ def compute_msd_and_fit(tracks, pixel_size, frame_interval,
     print(f"  Tracks to process : {n_tracks:,}")
     print(f"  Workers           : {workers} / {N_CPUS} CPU cores")
     t0 = time.perf_counter()
+
+    # Defensive: if linking produced zero trajectories (e.g. localiser
+    # returned no spots, or every spot is an isolated singleton), return
+    # empty results instead of crashing pandas with "Empty data passed
+    # with indices specified".  The caller still sees the empty result
+    # and can produce a sensible "no tracks found" log message.
+    if n_tracks == 0:
+        print("  No trajectories — skipping MSD/fit (returning empty result).")
+        imsd_empty = pd.DataFrame(
+            np.full((max_lagtime, 0), np.nan, dtype=float),
+            index=np.arange(1, max_lagtime + 1))
+        emsd_empty = pd.Series(
+            np.full(max_lagtime, np.nan, dtype=float),
+            index=np.arange(1, max_lagtime + 1))
+        diff_empty = pd.DataFrame(columns=[
+            "particle", "D", "alpha", "motion", "MSD0", "MSE",
+            "mean_radial_displacement_um", "radius_of_gyration_um"])
+        return imsd_empty, emsd_empty, diff_empty
 
     with ThreadPoolExecutor(max_workers=workers) as _exe:
         _futs = [_exe.submit(
@@ -2990,7 +3174,7 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
                 transform=ax.transAxes, fontsize=8, color=TXT, va="top")
     else:
         ax.text(0.5, 0.5, "Cluster analysis\nnot computed",
-                transform=ax.transAxes, ha="center", va="center", color=MUTED, fontsize=10)
+                transform=ax.transAxes, ha="center", va="center", color=TXT, fontsize=10)
     sax(ax, "L", "Cluster Map  (DBSCAN)")
 
     # M — Dwell Time Distribution
@@ -3010,7 +3194,7 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
         ax.grid(True, ls=":", alpha=0.3)
     else:
         ax.text(0.5, 0.5, "Insufficient data\n(need confined/immobile tracks)",
-                transform=ax.transAxes, ha="center", va="center", color=MUTED, fontsize=10)
+                transform=ax.transAxes, ha="center", va="center", color=TXT, fontsize=10)
     sax(ax, "M", "Dwell Time Distribution")
 
     # N — MSS Slope Distribution
@@ -3033,7 +3217,7 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
         ax.grid(True, ls=":", alpha=0.3)
     else:
         ax.text(0.5, 0.5, "MSS not computed\n(tracks too short)",
-                transform=ax.transAxes, ha="center", va="center", color=MUTED, fontsize=10)
+                transform=ax.transAxes, ha="center", va="center", color=TXT, fontsize=10)
     sax(ax, "N", "Moment Scaling Spectrum  (MSS slope)")
 
     # O — Radial Distribution of turning angles (polar)
@@ -3246,8 +3430,11 @@ def main():
 
     if args.minmass is None:
         sample = stack_pp[min(5, n_frames-1)]
-        args.minmass = float(np.percentile(sample, 99) * 0.4)
-        print(f"  Auto minmass: {args.minmass:.4f}")
+        _peak = float(np.percentile(sample, 99))
+        # See _fast_preprocess_and_localise for the rationale on the d²/8 factor.
+        args.minmass = float(_peak * (args.diameter ** 2) / 8.0)
+        print(f"  Auto minmass: {args.minmass:.4f}  "
+              f"(from 99th-pct peak {_peak:.4f} × d²/8)")
 
     # 2b — ROI mask (optional)
     roi_mask = None

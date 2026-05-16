@@ -8,6 +8,14 @@ Run with:  python app_tk.py
 import os
 import sys
 
+# ── MPS allocator tuning (must be set BEFORE torch import anywhere) ───────────
+# See app_qt.py for the rationale.  In short: on M-series + macOS 26 the MPS
+# allocator can leak committed memory across ops even with synchronize() +
+# empty_cache().  These two env vars disable the high-watermark reservation
+# and enable CPU fallback for unimplemented kernels.
+os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  FIRST-TIME SETUP BOOTSTRAP
 #  Runs before any non-stdlib import.  If required packages are missing it
@@ -2341,21 +2349,21 @@ class SPTPalmApp(_APP_BASE):
         self._log_box.configure(state="disabled")
 
     def _available_backends(self) -> list[str]:
-        """Return the localiser-backend names selectable in the GUI dropdown.
+        """Return the static list of selectable backends.
 
-        Always begins with 'auto', then appends each backend that's actually
-        importable on this machine.  Imports happen lazily so app startup
-        isn't gated on the analysis module loading numpy + scipy first.
+        IMPORTANT: we deliberately do NOT probe torch / list_devices here.
+        On some macOS + PyTorch + Apple-Silicon combinations (M4 + macOS 26
+        + PyTorch 2.12 in particular), just importing torch and calling
+        `torch.backends.mps.is_available()` is enough to flood stderr with
+        Metal command-buffer errors and, in the worst case, kill the
+        process before the GUI is up.
+
+        Probing happens lazily at analysis time inside the worker, where
+        we have a clean failure path (the crash reporter) for unsupported
+        selections.
         """
-        names = ["auto"]
-        try:
-            from sptpalm_analysis import list_available_backends
-            for n in list_available_backends():
-                if n not in names:
-                    names.append(n)
-        except Exception:
-            names.append("trackpy")  # safe fallback
-        return names
+        return ["auto", "trackpy", "torch",
+                "torch-mps", "torch-cuda", "torch-cpu"]
 
     # ── Crash reporter integration ────────────────────────────────────────────
     def _install_crash_hooks(self):

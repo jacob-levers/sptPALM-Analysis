@@ -20,3 +20,10 @@ scikit-learn
 threadpoolctl      # dynamically expand BLAS pool during localisation
 tkinterdnd2        # drag-and-drop folders into the Compare tab
 torch>=2.3,<3      # GPU localiser backend (MPS on Apple Silicon, CUDA on NVIDIA, CPU fallback)
+
+# ── Qt UI stack (workstream B) ────────────────────────────────────────────────
+PySide6>=6.6,<7    # Qt6 bindings — replaces tkinter in v2.0
+# napari pinned for B2 (Workspace tab — frame scrubbing + track overlay).
+# Pinning the minor version keeps embedded-viewer breakage from upstream API
+# churn from sneaking into a FIREFLY release.  Upgrade is a deliberate event.
+napari[pyside6]>=0.4.19,<0.5  # B2: embedded viewer in Workspace tab
