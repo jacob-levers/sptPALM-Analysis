@@ -1,42 +1,67 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-PyInstaller spec for sptPALM Analysis Pipeline.
+PyInstaller spec for FIREFLY (PySide6 + napari frontend, v2.0).
 
 Build (from the project root):
   macOS:   pyinstaller sptpalm.spec
   Windows: pyinstaller sptpalm.spec
 
 Outputs:
-  macOS:   dist/sptPALM.app   (then wrap in DMG via CI)
-  Windows: dist/sptPALM/      (zip via CI)
+  macOS:   dist/FIREFLY.app  (then wrap in a DMG via CI)
+  Windows: dist/FIREFLY.exe  (onefile)
 """
 
 from PyInstaller.utils.hooks import collect_submodules, collect_data_files
-import glob
 import os
 import sys
 
-# ── Hidden imports ─────────────────────────────────────────────────────────────
+# ── Hidden imports ───────────────────────────────────────────────────────────
 hidden = []
-# numpy 2.x renamed numpy.core → numpy._core; some submodules (e.g.
-# numpy._core._exceptions) are loaded lazily and missed by static analysis.
-# collect_submodules ensures every numpy submodule is included.
+
+# Scientific Python — collect every submodule because lazy imports under
+# numpy._core / pandas._libs / scipy.* are missed by static analysis.
 hidden += collect_submodules("numpy")
 hidden += collect_submodules("pandas")
 hidden += collect_submodules("trackpy")
 hidden += collect_submodules("scipy")
 hidden += collect_submodules("skimage")
+hidden += collect_submodules("sklearn")
 hidden += collect_submodules("matplotlib")
 hidden += collect_submodules("joblib")
 hidden += collect_submodules("aicspylibczi")
 hidden += collect_submodules("imagecodecs")
+
+# Qt / PySide6 — the Qt6 stack.  collect_submodules pulls in plugin loaders.
+hidden += collect_submodules("PySide6")
+hidden += collect_submodules("shiboken6")
+
+# Napari + its plugin discovery + the vispy backend.  napari is loaded
+# lazily by the Workspace tab; if any of these are missed at freeze time
+# the tab quietly degrades to the "not installed" placeholder, which is
+# acceptable — but we'd rather have it work.
+hidden += collect_submodules("napari")
+hidden += collect_submodules("vispy")
+hidden += collect_submodules("magicgui")
+hidden += collect_submodules("npe2")
+hidden += collect_submodules("qtpy")
+hidden += collect_submodules("pydantic")
+hidden += collect_submodules("superqt")
+
+# PyTorch — GPU localiser backend.  Only collect if the dep is installed;
+# otherwise we'd inflate the bundle with non-existent stubs.
+try:
+    import torch  # noqa: F401
+    hidden += collect_submodules("torch")
+except ImportError:
+    pass
+
 hidden += [
     "czifile", "aicspylibczi", "imagecodecs",
     "tifffile",
-    "matplotlib.backends.backend_tkagg",
-    "matplotlib.backends._backend_tk",
+    "matplotlib.backends.backend_qtagg",
+    "matplotlib.backends.backend_qt5agg",
+    "matplotlib.backends.backend_agg",
     "PIL._tkinter_finder", "PIL.Image", "PIL.ImageTk",
-    # PIL image format plugins (loaded lazily — missed by static analysis)
     "PIL.ImageFile",
     "PIL.PngImagePlugin",
     "PIL.JpegImagePlugin",
@@ -50,14 +75,17 @@ hidden += [
     "pandas._libs.tslibs.timestamps",
     "multiprocessing.pool",
     "multiprocessing.managers",
-    # concurrent.futures — used for ThreadPoolExecutor in analysis pipeline
     "concurrent.futures",
     "concurrent.futures.thread",
     "psutil",
-    "threadpoolctl",   # used by sptpalm_analysis to expand BLAS during localise
-    "tkinterdnd2",     # drag-and-drop folders into the Compare tab
-    "tkinterdnd2.TkinterDnD",
-    # encoding tables sometimes missed in frozen builds
+    "threadpoolctl",
+    # FIREFLY's own helper modules — explicitly named so the spawned
+    # subprocess can find them even if static analysis misses the
+    # firefly_worker.run_analysis cross-module reference.
+    "firefly_worker",
+    "crash_reporter",
+    "sptpalm_analysis",
+    # Encoding tables sometimes missed in frozen builds
     "encodings.utf_8",
     "encodings.ascii",
     "encodings.latin_1",
@@ -68,128 +96,47 @@ datas = []
 datas += collect_data_files("skimage")
 datas += collect_data_files("matplotlib")
 datas += collect_data_files("aicspylibczi")
-datas += collect_data_files("PIL")           # Pillow data (ICC profiles etc.)
+datas += collect_data_files("PIL")
+
+# Napari ships configuration JSON + theme files + plugin manifests as
+# package-data.  Collect them so the embedded viewer starts correctly.
 try:
-    datas += collect_data_files("tkinterdnd2")  # platform DnD libraries
+    datas += collect_data_files("napari")
+    datas += collect_data_files("vispy")
+    datas += collect_data_files("magicgui")
+    datas += collect_data_files("npe2")
 except Exception:
     pass
+
 datas += [("sptpalm_analysis.py", ".")]
-datas += [("crash_reporter.py", ".")]
-# Bundle the app icon PNG so the Tk window/taskbar icon can be loaded
+datas += [("firefly_worker.py",   ".")]
+datas += [("crash_reporter.py",   ".")]
+
+# Bundle the app icon PNG so the Qt window/dock icon can be loaded
 # at runtime from sys._MEIPASS/assets/icon.png in frozen mode.
 if os.path.isfile(os.path.join(SPECPATH, "assets", "icon.png")):
     datas += [(os.path.join(SPECPATH, "assets", "icon.png"), "assets")]
 
-# ── Tcl/Tk data (Windows only) ─────────────────────────────────────────────────
-# PyInstaller's pyi_rthkinter runtime hook looks for _tcl_data / _tk_data
-# inside sys._MEIPASS.  On Windows these are NOT auto-collected; bundle them
-# here so the hook always finds them regardless of Python install layout.
-#
-# Uses _tkinter.TCL_VERSION / TK_VERSION (C constants — no Tk window needed)
-# to build exact paths, with a broad glob fallback.
-if sys.platform == "win32":
-    _tcl_src = None
-    _tk_src  = None
-
-    # Method 1: _tkinter constants → exact versioned directory (most reliable)
-    try:
-        import _tkinter as _tki
-        _tcl_ver = _tki.TCL_VERSION   # e.g. "8.6"
-        _tk_ver  = _tki.TK_VERSION    # e.g. "8.6"
-        print(f"[spec] _tkinter reports TCL={_tcl_ver}  TK={_tk_ver}")
-        for _base in (sys.prefix, os.path.join(sys.prefix, "tcl")):
-            _c = os.path.join(_base, f"tcl{_tcl_ver}")
-            if os.path.isdir(_c):
-                _tcl_src = _c
-                break
-            _c = os.path.join(_base, "tcl", f"tcl{_tcl_ver}")
-            if os.path.isdir(_c):
-                _tcl_src = _c
-                break
-        for _base in (sys.prefix, os.path.join(sys.prefix, "tcl")):
-            _c = os.path.join(_base, f"tk{_tk_ver}")
-            if os.path.isdir(_c):
-                _tk_src = _c
-                break
-            _c = os.path.join(_base, "tcl", f"tk{_tk_ver}")
-            if os.path.isdir(_c):
-                _tk_src = _c
-                break
-    except Exception as _e:
-        print(f"[spec] _tkinter version query failed: {_e}")
-
-    # Method 2: broad glob across common install layouts
-    if not (_tcl_src and os.path.isdir(_tcl_src)):
-        for _search_root in (os.path.join(sys.prefix, "tcl"), sys.prefix):
-            for _pat in ("tcl8*", "tcl9*"):
-                _hits = sorted(
-                    d for d in glob.glob(os.path.join(_search_root, _pat))
-                    if os.path.isdir(d)
-                )
-                if _hits:
-                    _tcl_src = _hits[-1]
-                    break
-            if _tcl_src:
-                break
-
-    if not (_tk_src and os.path.isdir(_tk_src)):
-        for _search_root in (os.path.join(sys.prefix, "tcl"), sys.prefix):
-            for _pat in ("tk8*", "tk9*"):
-                _hits = sorted(
-                    d for d in glob.glob(os.path.join(_search_root, _pat))
-                    if os.path.isdir(d)
-                )
-                if _hits:
-                    _tk_src = _hits[-1]
-                    break
-            if _tk_src:
-                break
-
-    # Method 3: check TCL_LIBRARY / TK_LIBRARY environment variables
-    if not (_tcl_src and os.path.isdir(_tcl_src)):
-        _env = os.environ.get("TCL_LIBRARY", "")
-        if _env and os.path.isdir(_env):
-            _tcl_src = _env
-    if not (_tk_src and os.path.isdir(_tk_src)):
-        _env = os.environ.get("TK_LIBRARY", "")
-        if _env and os.path.isdir(_env):
-            _tk_src = _env
-
-    if _tcl_src and os.path.isdir(_tcl_src):
-        datas.append((_tcl_src, "_tcl_data"))
-        print(f"[spec] Bundling Tcl data : {_tcl_src}")
-    else:
-        print("[spec] WARNING: Could not locate Tcl data — CI fallback step must provide it")
-
-    if _tk_src and os.path.isdir(_tk_src):
-        datas.append((_tk_src, "_tk_data"))
-        print(f"[spec] Bundling Tk  data : {_tk_src}")
-    else:
-        print("[spec] WARNING: Could not locate Tk data — CI fallback step must provide it")
-
 # ── Analysis ──────────────────────────────────────────────────────────────────
 a = Analysis(
-    ["app_tk.py"],
+    ["app_qt.py"],
     pathex=["."],
     binaries=[],
     datas=datas,
     hiddenimports=hidden,
-    hookspath=["hooks"],
+    hookspath=[],
     hooksconfig={},
-    runtime_hooks=["hooks/rthook_tcl_tk.py"],
+    runtime_hooks=[],
     excludes=["streamlit", "tornado", "altair", "bokeh", "IPython",
-              "notebook", "jupyter"],
+              "notebook", "jupyter",
+              # Tkinter no longer used after v2.0 — exclude to keep
+              # the bundle from carrying the Tcl/Tk runtime
+              "tkinter", "_tkinter", "tkinterdnd2"],
     noarchive=False,
 )
 
 pyz = PYZ(a.pure, a.zipped_data)
 
-# ── Windows: ONEFILE mode (single self-contained .exe) ────────────────────────
-# Extracting a zip on the user's Windows machine is fundamentally unreliable —
-# Windows Explorer's built-in extractor silently drops files (long paths,
-# special chars), and Defender quarantines .tcl scripts.  Onefile sidesteps
-# this entirely: the bundle is a single .exe that extracts itself to %TEMP%
-# at runtime where no user/AV can accidentally damage it.
 _ICON_WIN = os.path.join(SPECPATH, "assets", "icon.ico") if (
     'SPECPATH' in dir() and os.path.isfile(
         os.path.join(SPECPATH, "assets", "icon.ico"))) else None
@@ -197,6 +144,7 @@ _ICON_MAC = os.path.join(SPECPATH, "assets", "icon.icns") if (
     'SPECPATH' in dir() and os.path.isfile(
         os.path.join(SPECPATH, "assets", "icon.icns"))) else None
 
+# ── Windows: ONEFILE mode (single self-contained .exe) ───────────────────────
 if sys.platform == "win32":
     exe = EXE(
         pyz,
@@ -210,7 +158,7 @@ if sys.platform == "win32":
         bootloader_ignore_signals=False,
         strip=False,
         upx=False,
-        runtime_tmpdir=None,           # default %TEMP%\_MEIxxxxx
+        runtime_tmpdir=None,
         console=False,
         disable_windowed_traceback=False,
         argv_emulation=False,
@@ -220,7 +168,7 @@ if sys.platform == "win32":
         icon=_ICON_WIN,
     )
 else:
-    # macOS/Linux: ONEDIR mode (then wrap in .app/.dmg on macOS)
+    # macOS / Linux: ONEDIR mode (wrapped in .app/.dmg on macOS)
     exe = EXE(
         pyz,
         a.scripts,
@@ -257,10 +205,14 @@ else:
             info_plist={
                 "CFBundleName": "FIREFLY",
                 "CFBundleDisplayName": "FIREFLY — Fluorescence Inference & Reconstruction Engine",
-                "CFBundleVersion": "1.0.0",
-                "CFBundleShortVersionString": "1.0.0",
+                "CFBundleVersion": "2.0.0",
+                "CFBundleShortVersionString": "2.0.0",
                 "NSHighResolutionCapable": True,
                 "LSMinimumSystemVersion": "11.0",
                 "NSAppleEventsUsageDescription": "Required for analysis.",
+                # napari's vispy backend uses Metal — disable the App Sandbox
+                # so the GPU access works without prompting.  The app
+                # doesn't need network or filesystem entitlements beyond
+                # what macOS grants normally.
             },
         )

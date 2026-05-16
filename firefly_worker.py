@@ -33,7 +33,7 @@ import traceback
 
 
 # ── MPS allocator tuning — must be set BEFORE torch import anywhere ──────────
-# See app_qt.py / app_tk.py for the rationale.  Setting here too is cheap
+# See app_qt.py for the rationale.  Setting here too is cheap
 # insurance in case the parent's setting somehow didn't reach the child.
 os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
@@ -369,6 +369,108 @@ def run_analysis(params: dict, msg_queue, cancel_event):
         # Linker produced 0 trajectories — not a crash.  Treat as "done"
         # with the partial payload so the UI resets cleanly.
         msg_queue.put(("done", nt.args[0]))
+    except BaseException as exc:
+        if type(exc).__name__ in ("_Cancelled", "_Stopped"):
+            msg_queue.put(("log", "\n── Stopped by user ──"))
+            msg_queue.put(("stopped", None))
+        else:
+            msg_queue.put(("error", traceback.format_exc()))
+    finally:
+        try: sys.stdout.flush()
+        except Exception: pass
+        try: sys.stderr.flush()
+        except Exception: pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ENTRY POINT — COMPARE  (N-group comparison run in a subprocess)
+# ══════════════════════════════════════════════════════════════════════════════
+def run_comparison(comparison_params: dict, msg_queue, cancel_event):
+    """Run sptpalm_analysis.compare_groups in a subprocess.
+
+    Same rationale for the subprocess as run_analysis: keep matplotlib +
+    pandas + scipy import cost out of the Qt main process, and (on
+    Apple Silicon) keep Metal contention with Qt to a minimum.
+
+    Messages emitted
+    ----------------
+      log/progress  — same conventions as single-file mode
+      compare_done(payload)
+                    — terminal success message.  payload keys:
+                        figure_path : str — saved .png
+                        output_dir  : str — folder containing all outputs
+                        summary_csv : str — per-replicate scalars
+                        stats_csv   : str — pairwise tests
+                        pdf_report  : str — combined PDF (if requested)
+      stopped       — cooperative cancel fired
+      error(tb)     — unrecoverable exception
+    """
+    sys.stdout = QueueLogStream(msg_queue)
+    sys.stderr = QueueLogStream(msg_queue)
+
+    def _log(msg: str):  msg_queue.put(("log", msg))
+    def _prog(pct, msg): msg_queue.put(("progress", (int(pct), str(msg))))
+
+    try:
+        _log("── Compare worker subprocess started ──")
+        _prog(0, "Importing comparison pipeline…")
+
+        from sptpalm_analysis import compare_groups, _Cancelled
+
+        p = comparison_params
+
+        # compare_groups expects panels as a set; the Qt side ships a list
+        # (JSON-friendly).  Normalise here.
+        panels = set(p.get("panels") or []) or None
+
+        # Wire progress callback → queue.  compare_groups invokes this
+        # periodically during folder loading; we map to percent.
+        def _progress_cb(done: int, total: int, msg: str):
+            if cancel_event.is_set():
+                raise _Cancelled()
+            pct = int(100 * done / total) if total else 0
+            _prog(pct, msg)
+
+        out_dir   = p.get("output_dir")
+        out_stem  = p.get("output_stem", "comparison")
+        theme     = p.get("theme", "Dark")
+        pdf_report = bool(p.get("pdf_report", True))
+        mob_d     = float(p.get("mobile_d_threshold", 0.05))
+
+        _log(f"  Output dir : {out_dir}")
+        _log(f"  Output stem: {out_stem}")
+        _log(f"  Theme      : {theme}")
+        _log(f"  Groups     : {len(p.get('groups', []))}")
+        for g in p.get("groups", []):
+            _log(f"    {g.get('label', '?'):<20s}"
+                 f"({len(g.get('folders', []))} folders)")
+
+        fig, summary_df, stats = compare_groups(
+            groups=p["groups"],
+            output_dir=out_dir,
+            output_stem=out_stem,
+            panels=panels,
+            theme=theme,
+            pdf_report=pdf_report,
+            mobile_d_threshold=mob_d,
+            progress_cb=_progress_cb)
+
+        # Compose result paths.  compare_groups saves these by convention:
+        figure_path = os.path.join(out_dir, f"{out_stem}.png")
+        summary_csv = os.path.join(out_dir, f"{out_stem}_summary.csv")
+        stats_csv   = os.path.join(out_dir, f"{out_stem}_stats.csv")
+        pdf_path    = os.path.join(out_dir, f"{out_stem}_report.pdf")
+
+        _prog(100, "Comparison complete")
+        msg_queue.put(("compare_done", {
+            "output_dir":  out_dir,
+            "figure_path": figure_path if os.path.isfile(figure_path) else "",
+            "summary_csv": summary_csv if os.path.isfile(summary_csv) else "",
+            "stats_csv":   stats_csv   if os.path.isfile(stats_csv)   else "",
+            "pdf_report":  pdf_path    if os.path.isfile(pdf_path)    else "",
+            "n_groups":    len(p.get("groups", [])),
+        }))
+
     except BaseException as exc:
         if type(exc).__name__ in ("_Cancelled", "_Stopped"):
             msg_queue.put(("log", "\n── Stopped by user ──"))

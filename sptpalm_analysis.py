@@ -3,7 +3,7 @@ import multiprocessing
 import sys
 import os
 
-__version__ = "1.0.78"
+__version__ = "2.0.0"
 
 # Fix macOS multiprocessing crashes — must be set before any other imports
 if sys.platform == "darwin":
@@ -1594,7 +1594,7 @@ class TrackpyBackend(LocaliserBackend):
         # ── True multi-core via multiprocessing.Pool ──────────────────────
         # Each worker is a separate Python process with its own GIL — N workers
         # genuinely use N CPU cores.  Spawn context is required for Windows +
-        # macOS frozen apps; PyInstaller's freeze_support (called in app_tk.py
+        # macOS frozen apps; PyInstaller's freeze_support (called in app_qt.py
         # main) makes spawn workers reuse the parent's _MEIPASS extraction, so
         # workers start in seconds rather than minutes.  Falls back to a
         # BLAS-pool serial path if Pool creation fails for any reason.

@@ -82,12 +82,12 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
-          pip install "pyinstaller==6.11.1"   # pinned for reproducible Tcl/Tk bundling behaviour
+          pip install "pyinstaller==6.11.1"   # pinned for reproducible bundling behaviour
 
       - name: Build exe (onefile)
-        # Spec produces a single self-contained FIREFLY.exe.  Tcl/Tk and all
-        # binaries are bundled INSIDE the exe and extracted to %TEMP% at
-        # runtime — no chance of user extraction dropping files.
+        # Spec produces a single self-contained FIREFLY.exe.  All binaries
+        # (Qt, napari, torch, scientific Python) bundled inside; extracted
+        # to %TEMP% at runtime — no chance of user extraction dropping files.
         run: pyinstaller sptpalm.spec --noconfirm --clean
 
       - name: Verify exe exists and is reasonable size

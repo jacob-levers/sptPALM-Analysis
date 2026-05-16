@@ -91,8 +91,8 @@ def _package_versions() -> dict[str, str]:
     """Best-effort import + read of __version__ for relevant scientific deps."""
     names = ["numpy", "scipy", "pandas", "trackpy", "matplotlib",
              "skimage", "sklearn", "PIL", "tifffile", "aicspylibczi",
-             "imagecodecs", "joblib", "psutil", "torch", "tkinter",
-             "tkinterdnd2"]
+             "imagecodecs", "joblib", "psutil", "torch",
+             "PySide6", "napari", "vispy", "magicgui"]
     out: dict[str, str] = {}
     for n in names:
         try:

@@ -66,7 +66,7 @@ Homebrew (brew install python), then double-click:
    Launch_sptPALM.app
 
 (The launcher is still named Launch_sptPALM.app for backward
-compatibility — it just runs `python app_tk.py`.)
+compatibility — it just runs `python app_qt.py`.)
 
 On first launch the app detects missing libraries and installs them
 automatically. Takes 3-5 minutes. Subsequent launches are instant.
@@ -493,11 +493,9 @@ Compare panels show "no data" placeholders
    folders won't have them; re-run the analysis to regenerate.
 
 Compare drag-and-drop does nothing
-   Drag-and-drop relies on the optional tkinterdnd2 package.  If it
-   failed to load on your system, the subheader text in the Compare
-   tab will not include the "Tip: drag folders directly onto a
-   group's list" hint and the + Add / + Add many buttons remain the
-   only way to populate a group.
+   Drag-and-drop uses Qt's native QMimeData handler in FIREFLY 2.0+.
+   If it fails (rare), the + Add buttons on each group card remain
+   the only way to populate a group.
 
 
 ================================================================
@@ -517,7 +515,7 @@ Localisation precision after Thompson, Larson & Webb (2002).
 DBSCAN from Ester et al. (1996).
 Statistical tests via scipy.stats (Welch's t-test, Mann-Whitney U,
 one-way ANOVA, Kruskal-Wallis, Shapiro-Wilk).
-Drag-and-drop via tkinterdnd2.
+GUI built on PySide6 (Qt6).  Embedded image viewer via napari + vispy.
 Developed with AI assistance (Anthropic Claude).
 
 
