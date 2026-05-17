@@ -106,6 +106,113 @@ _run_compare_in_subprocess  = firefly_worker.run_comparison
 # need to inspect or modify the worker, see firefly_worker.py.
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  MODE TILE — big segmented-control button with icon + title + subtitle
+# ══════════════════════════════════════════════════════════════════════════════
+class _ModeTile(QtWidgets.QFrame):
+    """A big card-shaped clickable tile.  Acts like a checkable button:
+    clicking toggles its state and emits `toggled(bool)`.  Used by the
+    Import-tab Single-file / Batch mode toggle.
+
+    QPushButton can't render rich-text (HTML in setText shows literally),
+    so a custom QFrame with child QLabels is the cleanest way to get a
+    button with multi-line bold-title + muted-subtitle styling.
+    """
+    toggled = QtCore.Signal(bool)
+
+    def __init__(self, title: str, subtitle: str,
+                 icon_char: str = "", parent=None):
+        super().__init__(parent)
+        self.setObjectName("mode_tile")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setProperty("checked", False)
+        self._checked = False
+
+        v = QtWidgets.QVBoxLayout(self)
+        v.setContentsMargins(16, 14, 16, 14)
+        v.setSpacing(2)
+
+        title_text = f"{icon_char}  {title}" if icon_char else title
+        self._title_lbl = QtWidgets.QLabel(title_text)
+        self._title_lbl.setObjectName("mode_tile_title")
+        self._title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(self._title_lbl)
+
+        self._sub_lbl = QtWidgets.QLabel(subtitle)
+        self._sub_lbl.setObjectName("mode_tile_subtitle")
+        self._sub_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._sub_lbl.setWordWrap(True)
+        v.addWidget(self._sub_lbl)
+
+        self.setMinimumHeight(82)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
+                           QtWidgets.QSizePolicy.Policy.Fixed)
+
+    def isChecked(self) -> bool:
+        return self._checked
+
+    def setChecked(self, checked: bool):
+        if self._checked == bool(checked):
+            return
+        self._checked = bool(checked)
+        self.setProperty("checked", self._checked)
+        # Re-evaluate QSS so the :checked-state border kicks in
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.toggled.emit(self._checked)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and not self._checked:
+            self.setChecked(True)
+        super().mousePressEvent(e)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ACTION TILE — landing-page clickable card (not checkable, emits clicked)
+# ══════════════════════════════════════════════════════════════════════════════
+class _ActionTile(QtWidgets.QFrame):
+    """Large clickable card for the landing page.  Title + multi-line
+    description + optional icon glyph.  Emits `clicked` when the user
+    clicks anywhere on the tile."""
+    clicked = QtCore.Signal()
+
+    def __init__(self, title: str, description: str, icon_char: str = "",
+                 parent=None):
+        super().__init__(parent)
+        self.setObjectName("action_tile")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
+                           QtWidgets.QSizePolicy.Policy.Expanding)
+        self.setMinimumHeight(150)
+
+        v = QtWidgets.QVBoxLayout(self)
+        v.setContentsMargins(20, 20, 20, 20)
+        v.setSpacing(8)
+
+        if icon_char:
+            ico = QtWidgets.QLabel(icon_char)
+            ico.setObjectName("action_tile_icon")
+            ico.setAlignment(Qt.AlignmentFlag.AlignLeft)
+            v.addWidget(ico)
+
+        ttl = QtWidgets.QLabel(title)
+        ttl.setObjectName("action_tile_title")
+        ttl.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        v.addWidget(ttl)
+
+        desc = QtWidgets.QLabel(description)
+        desc.setObjectName("action_tile_desc")
+        desc.setWordWrap(True)
+        desc.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        v.addWidget(desc)
+        v.addStretch(1)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(e)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  SPINBOX SUBCLASSES — no up/down buttons, no scroll-wheel value changes
 # ══════════════════════════════════════════════════════════════════════════════
 # Two issues with Qt's default spinboxes that surfaced during user testing:
@@ -139,6 +246,24 @@ class _QuietDoubleSpinBox(QtWidgets.QDoubleSpinBox):
         e.ignore()
 
 
+class _QuietComboBox(QtWidgets.QComboBox):
+    """QComboBox that doesn't change its selection on mouse wheel.
+
+    Same rationale as the spinbox subclasses: when the sidebar's scroll
+    area gets a wheel event over a combo, the combo would silently
+    change its value before the parent ever sees the wheel.  Override
+    wheelEvent to ignore so the wheel bubbles up to the QScrollArea
+    instead.  To deliberately change the value, click the dropdown.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Without StrongFocus the combo can also change via arrow keys
+        # only after a mouse click anyway — fine for our usage.
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+    def wheelEvent(self, e):
+        e.ignore()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  COLLAPSIBLE SECTION — reusable accordion-style header + content panel
 # ══════════════════════════════════════════════════════════════════════════════
@@ -155,7 +280,13 @@ class _CollapsibleSection(QtWidgets.QWidget):
     """
     def __init__(self, title: str, parent=None):
         super().__init__(parent)
-        self._title = title
+        # Escape any literal ampersands once at construction.  QToolButton
+        # (like every other Qt button-like widget) treats `&` in its text
+        # as a keyboard-shortcut marker — "Diffusion & motion classification"
+        # would render as "Diffusion _motion classification" (m underlined,
+        # Alt+M activates the button).  Doubling the ampersand is the
+        # documented way to display a literal `&`.
+        self._title = title.replace("&", "&&")
 
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -163,7 +294,7 @@ class _CollapsibleSection(QtWidgets.QWidget):
 
         self._header = QtWidgets.QToolButton()
         self._header.setObjectName("section_header")
-        self._header.setText(f"▼   {title}")
+        self._header.setText(f"▼   {self._title}")
         self._header.setCheckable(True)
         self._header.setChecked(True)
         self._header.setSizePolicy(
@@ -195,6 +326,252 @@ class _CollapsibleSection(QtWidgets.QWidget):
 # ══════════════════════════════════════════════════════════════════════════════
 #  RESULTS PANEL — shown after a run completes (replaces the figure canvas)
 # ══════════════════════════════════════════════════════════════════════════════
+class _MassHistogram(QtWidgets.QWidget):
+    """Lightweight live histogram of localisation mass values.
+
+    Renders with QPainter — no matplotlib dependency in the GUI process.
+    Bars accumulate across chunks; clear via `reset()`.  Designed to
+    show during a run so the user can sanity-check minmass on the fly.
+    """
+    BIN_COUNT = 40
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(110)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
+                           QtWidgets.QSizePolicy.Policy.Preferred)
+        self._counts = None          # np.ndarray | None
+        self._edges  = None          # np.ndarray | None
+        self._total  = 0
+        self._minmass = None         # float | None (vertical guide line)
+        # Throttle repaints — accumulate updates and only repaint at most
+        # ~6 Hz to keep the GUI responsive when chunks land in rapid fire.
+        self._dirty = False
+        self._repaint_timer = QTimer(self)
+        self._repaint_timer.setInterval(160)
+        self._repaint_timer.setSingleShot(False)
+        self._repaint_timer.timeout.connect(self._maybe_repaint)
+        self._repaint_timer.start()
+
+    def reset(self):
+        self._counts = None
+        self._edges  = None
+        self._total  = 0
+        self._dirty  = True
+
+    def set_minmass(self, value):
+        try:
+            self._minmass = float(value) if value is not None else None
+        except (TypeError, ValueError):
+            self._minmass = None
+        self._dirty = True
+
+    def add_chunk(self, mass_values) -> None:
+        """Accept an iterable of mass values and merge into the histogram."""
+        try:
+            import numpy as _np
+            arr = _np.asarray(list(mass_values), dtype=_np.float32)
+            arr = arr[_np.isfinite(arr)]
+            if arr.size == 0:
+                return
+            if self._counts is None:
+                # First chunk seeds the bin edges.  Range from 0 to 99th-pct
+                # of the data, expanded slightly for headroom.
+                hi = float(_np.percentile(arr, 99.0)) * 1.3 + 1e-6
+                self._edges = _np.linspace(0.0, hi, self.BIN_COUNT + 1)
+                self._counts = _np.zeros(self.BIN_COUNT, dtype=_np.int64)
+            new_counts, _ = _np.histogram(arr, bins=self._edges)
+            self._counts += new_counts
+            self._total += int(arr.size)
+            self._dirty = True
+        except Exception:
+            pass
+
+    def _maybe_repaint(self):
+        if self._dirty:
+            self._dirty = False
+            self.update()
+
+    def paintEvent(self, _evt):
+        import math
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
+        r = self.rect()
+        # Background
+        p.fillRect(r, QtGui.QColor(_THEME['PANEL']))
+        # Border
+        pen = QtGui.QPen(QtGui.QColor(_THEME['BORDER']), 1)
+        p.setPen(pen)
+        p.drawRect(r.adjusted(0, 0, -1, -1))
+
+        # Padding
+        pad_l, pad_t, pad_r, pad_b = 8, 22, 8, 16
+        plot = r.adjusted(pad_l, pad_t, -pad_r, -pad_b)
+
+        # Title
+        p.setPen(QtGui.QColor(_THEME['TXT_MUTED']))
+        f = p.font(); f.setPointSize(10); p.setFont(f)
+        if self._counts is None or self._counts.sum() == 0:
+            p.drawText(r, Qt.AlignmentFlag.AlignCenter,
+                       "Localisation mass distribution will appear here\n"
+                       "as chunks finish.")
+            return
+        title = f"Localisation mass  ·  n = {self._total:,}"
+        p.drawText(QtCore.QRect(r.left() + pad_l, r.top() + 4,
+                                r.width() - pad_l - pad_r, 18),
+                   Qt.AlignmentFlag.AlignLeft, title)
+
+        # Bars
+        n_bins = len(self._counts)
+        max_h  = float(self._counts.max()) or 1.0
+        bar_w  = plot.width() / n_bins
+        bar_pen = QtGui.QPen(QtGui.QColor(_THEME['ACC']))
+        bar_pen.setWidth(0)
+        p.setPen(bar_pen)
+        p.setBrush(QtGui.QBrush(QtGui.QColor(_THEME['ACC'])))
+        for i, c in enumerate(self._counts):
+            h = (c / max_h) * plot.height()
+            x = plot.left() + i * bar_w
+            y = plot.bottom() - h
+            p.drawRect(QtCore.QRectF(x + 0.5, y, max(1.0, bar_w - 1.0), h))
+
+        # X-axis ticks (just min + max edges)
+        p.setPen(QtGui.QColor(_THEME['TXT_MUTED']))
+        f = p.font(); f.setPointSize(8); p.setFont(f)
+        p.drawText(plot.left(),       r.bottom() - 2,
+                   f"{self._edges[0]:.2f}")
+        p.drawText(plot.right() - 60, r.bottom() - 2,
+                   f"{self._edges[-1]:.2f}  mass")
+
+        # Min-mass guide line
+        if self._minmass is not None and self._edges is not None:
+            lo, hi = float(self._edges[0]), float(self._edges[-1])
+            if hi > lo and lo <= self._minmass <= hi * 1.2:
+                frac = (self._minmass - lo) / (hi - lo)
+                x = plot.left() + min(1.0, max(0.0, frac)) * plot.width()
+                pen = QtGui.QPen(QtGui.QColor(_THEME['WARN']))
+                pen.setStyle(Qt.PenStyle.DashLine)
+                pen.setWidth(1)
+                p.setPen(pen)
+                p.drawLine(QtCore.QPointF(x, plot.top()),
+                           QtCore.QPointF(x, plot.bottom()))
+                p.setPen(QtGui.QColor(_THEME['WARN']))
+                p.drawText(QtCore.QPointF(x + 3, plot.top() + 10),
+                           f"min={self._minmass:g}")
+        p.end()
+
+
+class _TrackInspector(QtWidgets.QFrame):
+    """Right-side panel for the Visualise tab.  Displays per-particle stats
+    for whichever track the user clicked on in the embedded napari viewer."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("track_inspector")
+        self.setMinimumWidth(280)
+        v = QtWidgets.QVBoxLayout(self)
+        v.setContentsMargins(12, 12, 12, 12)
+        v.setSpacing(8)
+
+        title = QtWidgets.QLabel("Track inspector")
+        title.setStyleSheet(
+            f"color: {_THEME['TXT']}; font-size: 14px; font-weight: 700;")
+        v.addWidget(title)
+
+        self._hint = QtWidgets.QLabel(
+            "Click a track in the viewer to inspect it.")
+        self._hint.setWordWrap(True)
+        self._hint.setStyleSheet(
+            f"color: {_THEME['TXT_MUTED']}; font-size: 12px;")
+        v.addWidget(self._hint)
+
+        # Stats grid
+        self._grid = QtWidgets.QGridLayout()
+        self._grid.setColumnStretch(0, 0)
+        self._grid.setColumnStretch(1, 1)
+        self._grid.setHorizontalSpacing(12)
+        self._grid.setVerticalSpacing(4)
+        grid_w = QtWidgets.QWidget()
+        grid_w.setLayout(self._grid)
+        self._grid_w = grid_w
+        v.addWidget(grid_w)
+        grid_w.hide()
+
+        v.addStretch(1)
+
+    def clear(self):
+        self._hint.show()
+        self._grid_w.hide()
+        # Wipe the grid
+        while self._grid.count():
+            it = self._grid.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.deleteLater()
+
+    def show_track(self, *, particle_id: int,
+                   length: int | None = None,
+                   d: float | None = None,
+                   alpha: float | None = None,
+                   motion: str | None = None,
+                   mean_mass: float | None = None,
+                   start_frame: int | None = None,
+                   end_frame: int | None = None,
+                   net_displacement_um: float | None = None,
+                   total_path_um: float | None = None,
+                   straightness: float | None = None):
+        # Clear and re-populate
+        while self._grid.count():
+            it = self._grid.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.deleteLater()
+
+        def _row(r, label, value, *, color=None):
+            lbl = QtWidgets.QLabel(label)
+            lbl.setStyleSheet(
+                f"color: {_THEME['TXT_MUTED']}; font-size: 12px;")
+            val = QtWidgets.QLabel(value)
+            val.setStyleSheet(
+                f"color: {color or _THEME['TXT']}; font-size: 13px; "
+                "font-weight: 600;")
+            val.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse)
+            self._grid.addWidget(lbl, r, 0, Qt.AlignmentFlag.AlignLeft)
+            self._grid.addWidget(val, r, 1, Qt.AlignmentFlag.AlignLeft)
+
+        motion_colour = {
+            "Immobile": _THEME['DANGER'], "Confined": _THEME['WARN'],
+            "Brownian": _THEME['ACC'],   "Directed": _THEME['SUCCESS'],
+        }
+        r = 0
+        _row(r, "Particle ID", f"#{particle_id}"); r += 1
+        if length is not None:
+            _row(r, "Track length", f"{length} frames"); r += 1
+        if start_frame is not None and end_frame is not None:
+            _row(r, "Frame span", f"{start_frame} → {end_frame}"); r += 1
+        if motion:
+            _row(r, "Motion class", motion,
+                 color=motion_colour.get(motion)); r += 1
+        if d is not None:
+            _row(r, "Diffusion D",  f"{d:.4f}  µm²/s"); r += 1
+        if alpha is not None:
+            _row(r, "α (anomalous)", f"{alpha:.3f}"); r += 1
+        if net_displacement_um is not None:
+            _row(r, "Net displacement",
+                 f"{net_displacement_um*1000:.0f} nm"); r += 1
+        if total_path_um is not None:
+            _row(r, "Total path",
+                 f"{total_path_um*1000:.0f} nm"); r += 1
+        if straightness is not None:
+            _row(r, "Straightness", f"{straightness:.3f}"); r += 1
+        if mean_mass is not None:
+            _row(r, "Mean mass", f"{mean_mass:.1f}"); r += 1
+
+        self._hint.hide()
+        self._grid_w.show()
+
+
 class _ResultsPanel(QtWidgets.QFrame):
     """Compact "results" panel shown below the progress bar on each tab.
 
@@ -373,6 +750,65 @@ class _ResultsPanel(QtWidgets.QFrame):
                 f"fi = {summary.get('fi_s', 0):.3f} s",
                 value_colour=_THEME['TXT_MUTED']); r += 1
 
+        # ── Quality control ──────────────────────────────────────────
+        qc = summary.get("qc") or {}
+        if qc:
+            # Section header
+            hdr = QtWidgets.QLabel("Quality control")
+            hdr.setStyleSheet(
+                f"color: {_THEME['TXT']}; font-size: 12px; "
+                "font-weight: 700; padding-top: 8px;")
+            self._stats_grid.addWidget(hdr, r, 0, 1, 2,
+                                       Qt.AlignmentFlag.AlignLeft); r += 1
+
+            lr = qc.get("link_ratio")
+            if lr is not None:
+                col = (_THEME['DANGER'] if lr < 0.10
+                       else _THEME['WARN'] if lr < 0.25
+                       else _THEME['SUCCESS'])
+                self._add_stat_row(r, "Localisations linked",
+                                   _fmt_pct(lr),
+                                   value_colour=col); r += 1
+            avg_pf = qc.get("avg_locs_per_frame")
+            if avg_pf is not None:
+                col = (_THEME['WARN'] if avg_pf > 800
+                       else _THEME['TXT'])
+                self._add_stat_row(r, "Locs / frame (avg)",
+                                   f"{avg_pf:,.1f}",
+                                   value_colour=col); r += 1
+            ml = qc.get("median_track_length")
+            if ml is not None:
+                col = (_THEME['WARN'] if ml < 6 else _THEME['TXT'])
+                self._add_stat_row(r, "Median track length",
+                                   f"{ml:.1f}  frames",
+                                   value_colour=col); r += 1
+            gf = qc.get("gap_fraction")
+            if gf is not None:
+                self._add_stat_row(r, "Tracks with gaps",
+                                   _fmt_pct(gf)); r += 1
+            sf = qc.get("stuck_fraction")
+            if sf is not None:
+                col = (_THEME['WARN'] if sf > 0.30 else _THEME['TXT'])
+                self._add_stat_row(r, "Stuck tracks  (D < 1e-3)",
+                                   _fmt_pct(sf),
+                                   value_colour=col); r += 1
+
+            # Flag list — each flag is a colour-coded one-liner
+            flags = qc.get("flags") or []
+            if flags:
+                for f in flags:
+                    level = f.get("level", "info")
+                    icon  = "⚠" if level == "warn" else "ℹ"
+                    col   = (_THEME['WARN'] if level == "warn"
+                             else _THEME['TXT_MUTED'])
+                    msg = QtWidgets.QLabel(f"  {icon}  {f.get('msg', '')}")
+                    msg.setStyleSheet(
+                        f"color: {col}; font-size: 12px;")
+                    msg.setWordWrap(True)
+                    self._stats_grid.addWidget(
+                        msg, r, 0, 1, 2,
+                        Qt.AlignmentFlag.AlignLeft); r += 1
+
         self._stats_container.show()
 
     def show_results(self, headline: str, out_dir: str,
@@ -417,6 +853,933 @@ class _ResultsPanel(QtWidgets.QFrame):
         path = item.data(Qt.ItemDataRole.UserRole)
         if path and os.path.isfile(path):
             _open_folder(os.path.dirname(path))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ROI DIALOG — embedded napari viewer for drawing per-file polygon ROIs
+# ══════════════════════════════════════════════════════════════════════════════
+class _RoiDialog(QtWidgets.QDialog):
+    """Modal ROI editor.  Loads the mean projection of an input file into
+    an embedded napari viewer with a Shapes layer in polygon mode.  User
+    draws one or more polygons; clicking Save returns the vertices.
+
+    Vertices are stored as (y, x) coordinate pairs in pixels of the
+    original (Y, X) frame — directly consumable by
+    skimage.draw.polygon2mask.
+    """
+
+    def __init__(self, file_path: str,
+                 current_polygons: list | None = None,
+                 parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"ROI — {os.path.basename(file_path)}")
+        self.resize(1000, 760)
+        self._file_path = file_path
+        self._result_polygons: list[list[tuple[float, float]]] = []
+        self._viewer = None
+        self._shapes_layer = None
+
+        v = QtWidgets.QVBoxLayout(self)
+        v.setContentsMargins(12, 12, 12, 12)
+        v.setSpacing(8)
+
+        # ── Instructions ────────────────────────────────────────────────
+        hint = QtWidgets.QLabel(
+            "Use the <b>polygon</b> tool in the layer controls (top-left) "
+            "to draw a region of interest.  Click points to add vertices, "
+            "then press <b>Esc</b> or right-click to finish the polygon.  "
+            "You can draw multiple polygons — they'll be combined into one "
+            "ROI mask.  Save when done; Cancel discards changes."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {_THEME['TXT_MUTED']}; padding: 4px 0;")
+        v.addWidget(hint)
+
+        # ── Status line ─────────────────────────────────────────────────
+        self._status = QtWidgets.QLabel("Loading preview…")
+        self._status.setStyleSheet(f"color: {_THEME['TXT_MUTED']};")
+        v.addWidget(self._status)
+
+        # ── Embedded napari viewer (placeholder until lazy-init) ────────
+        self._viewer_container = QtWidgets.QWidget()
+        self._viewer_layout = QtWidgets.QVBoxLayout(self._viewer_container)
+        self._viewer_layout.setContentsMargins(0, 0, 0, 0)
+        v.addWidget(self._viewer_container, stretch=1)
+
+        # ── Buttons ─────────────────────────────────────────────────────
+        btn_row = QtWidgets.QHBoxLayout()
+        self._b_clear = QtWidgets.QPushButton("Clear ROI")
+        self._b_clear.setToolTip("Remove all polygons (file will fall back to "
+                                  "the global ROI mode in settings).")
+        self._b_clear.clicked.connect(self._on_clear)
+        btn_row.addWidget(self._b_clear)
+        btn_row.addStretch(1)
+        b_cancel = QtWidgets.QPushButton("Cancel")
+        b_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(b_cancel)
+        b_save = QtWidgets.QPushButton("Save ROI")
+        b_save.setObjectName("primary")
+        b_save.clicked.connect(self._on_save)
+        btn_row.addWidget(b_save)
+        v.addLayout(btn_row)
+
+        # Defer the heavy lifting (napari init + file load) so the dialog
+        # appears immediately with the "Loading preview…" status.
+        QtCore.QTimer.singleShot(50, lambda: self._init_viewer(current_polygons))
+
+    @staticmethod
+    def _quick_preview(file_path: str, max_frames: int = 30):
+        """Read just enough of `file_path` to render a representative
+        background image for ROI drawing.  Returns a 2D float32 array
+        of shape (Y, X), or raises.
+
+        This DELIBERATELY does not use `load_file` — that loads the full
+        stack (and for multi-file TIF series, concatenates them), which
+        on a tight-RAM machine can take minutes and trigger swap.  For
+        the ROI editor we only need a clear preview, not the full data,
+        so we read just the first `max_frames` pages of the first file
+        directly via tifffile / aicspylibczi.
+        """
+        import os as _os
+        import numpy as _np
+        ext = _os.path.splitext(file_path)[1].lower()
+
+        if ext in (".tif", ".tiff"):
+            import tifffile
+            with tifffile.TiffFile(file_path) as tif:
+                n_pages = len(tif.pages)
+                n = min(max_frames, n_pages)
+                # Sample evenly across the (single) file so blinks /
+                # bleaches don't dominate the preview
+                if n_pages > n:
+                    idx = _np.linspace(0, n_pages - 1, n, dtype=int)
+                else:
+                    idx = _np.arange(n_pages)
+                frames = []
+                for i in idx:
+                    frames.append(tif.pages[int(i)].asarray()
+                                  .astype(_np.float32))
+                return _np.mean(_np.stack(frames), axis=0)
+
+        if ext == ".czi":
+            from aicspylibczi import CziFile
+            czi = CziFile(file_path)
+            # Read first frame.  CZI reads can return shape (1, 1, 1, Y, X)
+            # or similar depending on dim order — squeeze to (Y, X).
+            try:
+                img, _ = czi.read_image(T=0)
+            except Exception:
+                # Some CZIs have different dim names; fall back to
+                # reading the whole thing if T isn't a valid dim
+                img = czi.read_mosaic(C=0, scale_factor=1)
+            arr = _np.squeeze(_np.asarray(img))
+            # If we accidentally got >2D (multichannel etc.) take a mean
+            while arr.ndim > 2:
+                arr = arr.mean(axis=0)
+            return arr.astype(_np.float32)
+
+        raise ValueError(f"Unsupported file extension: {ext}")
+
+    @staticmethod
+    def _quick_preview_stack(file_path: str, max_frames: int = 30):
+        """Like `_quick_preview` but returns a 3D (T, Y, X) stack instead of
+        the mean.  Used by the embedded ROI viewer so the user can scrub
+        through real frames and live-preview detections."""
+        import os as _os
+        import numpy as _np
+        ext = _os.path.splitext(file_path)[1].lower()
+
+        if ext in (".tif", ".tiff"):
+            import tifffile
+            with tifffile.TiffFile(file_path) as tif:
+                n_pages = len(tif.pages)
+                n = min(max_frames, n_pages)
+                if n_pages > n:
+                    idx = _np.linspace(0, n_pages - 1, n, dtype=int)
+                else:
+                    idx = _np.arange(n_pages)
+                frames = [tif.pages[int(i)].asarray().astype(_np.float32)
+                          for i in idx]
+                return _np.stack(frames), [int(i) for i in idx]
+
+        if ext == ".czi":
+            from aicspylibczi import CziFile
+            czi = CziFile(file_path)
+            frames = []
+            indices = []
+            for t in range(max_frames):
+                try:
+                    img, _ = czi.read_image(T=t)
+                except Exception:
+                    break
+                arr = _np.squeeze(_np.asarray(img))
+                while arr.ndim > 2:
+                    arr = arr.mean(axis=0)
+                frames.append(arr.astype(_np.float32))
+                indices.append(t)
+            if not frames:
+                raise ValueError("No frames could be read from CZI")
+            return _np.stack(frames), indices
+
+        raise ValueError(f"Unsupported file extension: {ext}")
+
+    def _init_viewer(self, current_polygons):
+        try:
+            import napari
+        except Exception as exc:
+            self._status.setText(
+                f"napari isn't installed: {exc}.\n"
+                f"Run `pip install \"napari[pyside6]>=0.4.19\"` and restart.")
+            return
+
+        try:
+            self._viewer = napari.Viewer(show=False)
+            qt_window = self._viewer.window._qt_window
+            self._viewer_layout.addWidget(qt_window)
+        except Exception as exc:
+            self._status.setText(f"Couldn't embed napari viewer: {exc}")
+            return
+
+        # Load just enough to render an ROI background.  No full-stack load,
+        # no concat — see _quick_preview's docstring.  Synchronous on the
+        # dialog's event loop but the read is tiny (~30 frames).
+        try:
+            import numpy as _np
+            mean_img = self._quick_preview(self._file_path, max_frames=30)
+            self._viewer.add_image(mean_img, name="ROI background",
+                                    colormap="gray")
+            # Shapes layer for the polygon
+            initial_shapes = [_np.asarray(poly)
+                              for poly in (current_polygons or [])]
+            self._shapes_layer = self._viewer.add_shapes(
+                data=initial_shapes if initial_shapes else None,
+                shape_type="polygon",
+                edge_color="#58a6ff",
+                face_color="rgba(88,166,255,0.18)",
+                edge_width=2,
+                name="ROI",
+            )
+            # Switch to polygon-add mode so the user can start drawing
+            try:
+                self._shapes_layer.mode = "add_polygon"
+            except Exception:
+                pass
+            self._status.setText(
+                f"{mean_img.shape[1]} × {mean_img.shape[0]} px preview "
+                f"(quick load).  Draw polygon(s) on the ROI layer; "
+                "right-click or Esc to close each polygon.")
+        except Exception as exc:
+            import traceback as _tb
+            self._status.setText(
+                f"Couldn't load file preview: {exc}\n\n"
+                f"{_tb.format_exc()}")
+
+    def _polygons_from_layer(self) -> list[list[tuple[float, float]]]:
+        """Pull current polygon vertices out of the Shapes layer.
+        Each entry is a list of (y, x) tuples."""
+        polys: list[list[tuple[float, float]]] = []
+        if self._shapes_layer is None:
+            return polys
+        try:
+            for shape_data, shape_type in zip(self._shapes_layer.data,
+                                              self._shapes_layer.shape_type):
+                if shape_type not in ("polygon", "rectangle", "ellipse"):
+                    continue
+                if shape_type == "polygon":
+                    polys.append([(float(y), float(x))
+                                  for y, x in shape_data])
+                else:
+                    # Rectangles / ellipses are stored as 4-vertex bounding
+                    # boxes; treat as polygons (rectangle is exact, ellipse
+                    # is approximated by its bounding box for now).
+                    polys.append([(float(y), float(x))
+                                  for y, x in shape_data])
+        except Exception:
+            pass
+        return polys
+
+    def _on_save(self):
+        self._result_polygons = self._polygons_from_layer()
+        self.accept()
+
+    def _on_clear(self):
+        self._result_polygons = []
+        self.accept()
+
+    def result_polygons(self) -> list[list[tuple[float, float]]]:
+        return self._result_polygons
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  EMBEDDED ROI VIEWER — same idea as _RoiDialog but lives in the Import tab
+# ══════════════════════════════════════════════════════════════════════════════
+class _RoiViewer(QtWidgets.QWidget):
+    """Inline ROI editor for the Import tab.
+
+    Same drawing model as the modal `_RoiDialog` (embedded napari + Shapes
+    layer with polygon tool), but lives inside the tab and supports
+    switching between files via `set_file`.  Polygons are auto-emitted as
+    they change so the host MainWindow can save them per file without
+    requiring an explicit Save button.
+    """
+
+    polygons_changed = QtCore.Signal(str, list)  # (file_path, polygons)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._current_file: str = ""
+        self._viewer = None
+        self._shapes_layer = None
+        self._image_layer  = None
+        self._points_layer = None
+        self._stack = None             # cached 3-D preview stack (raw)
+        self._stack_filtered = None    # cached bandpass-filtered version (lazy)
+        self._stack_preprocessed = None  # cached pipeline-preprocessed stack
+        self._pp_signature = None      # (bg_method, bg_radius) of cached stack
+        self._last_mass = None         # mass array from the most-recent locate
+        self._roi_mask_layer = None    # auto/manual-threshold overlay layer
+        self._roi_mask_params = {"mode": "None", "auto_method": "li",
+                                 "threshold": 0.08, "mask_mode": "mean"}
+        self._lazy_init_pending = True
+        self._detect_enabled = False
+        self._detect_params  = {"diameter": 7, "minmass": 1.0,
+                                "bg_method": "uniform_filter",
+                                "bg_radius": 50}
+        self._dims_connected = False
+        self._detect_debounce = QTimer(self)
+        self._detect_debounce.setSingleShot(True)
+        self._detect_debounce.setInterval(250)
+        self._detect_debounce.timeout.connect(self._run_detection)
+
+        v = QtWidgets.QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(6)
+
+        header = QtWidgets.QHBoxLayout()
+        self._title = QtWidgets.QLabel("Preview viewer")
+        self._title.setStyleSheet(
+            f"color: {_THEME['TXT']}; font-weight: 600; font-size: 13px;")
+        header.addWidget(self._title)
+        self._status = QtWidgets.QLabel("Pick a file to start")
+        self._status.setStyleSheet(f"color: {_THEME['TXT_MUTED']};")
+        header.addWidget(self._status, 1)
+        # Turbo-colormap legend bar (low mass → high mass).
+        legend_w = QtWidgets.QWidget()
+        legend_w.setToolTip(
+            "Detections are coloured by integrated mass on a log scale using "
+            "the 'turbo' colormap, auto-stretched per frame.  Dim spots "
+            "(likely noise) sit at the blue / purple end; bright spots "
+            "(likely real PSFs) sit at the red end.  Raise minmass and the "
+            "blue end disappears first.")
+        lh = QtWidgets.QHBoxLayout(legend_w)
+        lh.setContentsMargins(8, 0, 0, 0)
+        lh.setSpacing(4)
+        lbl_lo = QtWidgets.QLabel("dim")
+        lbl_lo.setStyleSheet(f"color: {_THEME['TXT_MUTED']}; font-size: 10px;")
+        lh.addWidget(lbl_lo)
+        bar = QtWidgets.QFrame()
+        bar.setFixedSize(120, 10)
+        # Turbo colormap stops (approximate, perceptually-uniform)
+        bar.setStyleSheet(
+            "QFrame { border: 1px solid #2d3138; border-radius: 2px; "
+            "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, "
+            "stop:0 #30123b, stop:0.15 #4661e0, stop:0.30 #1ce5d5, "
+            "stop:0.50 #6cfd62, stop:0.70 #fdbb2d, stop:0.85 #f06b1d, "
+            "stop:1 #7a0402); }")
+        lh.addWidget(bar)
+        lbl_hi = QtWidgets.QLabel("bright")
+        lbl_hi.setStyleSheet(f"color: {_THEME['TXT_MUTED']}; font-size: 10px;")
+        lh.addWidget(lbl_hi)
+        header.addWidget(legend_w)
+        # Bandpass-filtered view toggle — shows what trackpy actually sees
+        # after its preprocessing step, which makes real PSFs pop and flat
+        # background noise drop away.  Useful for picking a good minmass.
+        self._cb_filtered = QtWidgets.QCheckBox("Filtered view")
+        self._cb_filtered.setToolTip(
+            "Show the bandpass-filtered image (what trackpy sees) instead of\n"
+            "the raw frame.  Real PSFs come up bright on a flat dark background;\n"
+            "noise stays small.  Detection runs against this same filtering\n"
+            "internally, so what you see is closer to what the detector decides.")
+        self._cb_filtered.toggled.connect(self._on_filtered_toggled)
+        header.addWidget(self._cb_filtered)
+        self._b_clear = QtWidgets.QPushButton("Clear polygons")
+        self._b_clear.setToolTip(
+            "Remove every polygon drawn on the current file's ROI.")
+        self._b_clear.clicked.connect(self._on_clear)
+        header.addWidget(self._b_clear)
+        v.addLayout(header)
+
+        self._viewer_container = QtWidgets.QFrame()
+        self._viewer_container.setObjectName("results_panel")
+        self._viewer_container.setMinimumHeight(320)
+        self._viewer_layout = QtWidgets.QVBoxLayout(self._viewer_container)
+        self._viewer_layout.setContentsMargins(0, 0, 0, 0)
+        # Placeholder until napari is loaded (lazy)
+        self._placeholder = QtWidgets.QLabel(
+            "Pick a file above and the ROI viewer will load here."
+        )
+        self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._placeholder.setStyleSheet(
+            f"color: {_THEME['TXT_MUTED']}; padding: 40px;")
+        self._viewer_layout.addWidget(self._placeholder)
+        v.addWidget(self._viewer_container, stretch=1)
+
+    # ── Lazy napari init ─────────────────────────────────────────────────
+    def _ensure_viewer(self) -> bool:
+        if self._viewer is not None:
+            return True
+        try:
+            import napari
+        except Exception as exc:
+            self._status.setText(
+                f"napari not available: {exc} — install it to use the preview viewer.")
+            return False
+        try:
+            self._viewer = napari.Viewer(show=False)
+            qt_window = self._viewer.window._qt_window
+            self._viewer_layout.removeWidget(self._placeholder)
+            self._placeholder.hide()
+            self._viewer_layout.addWidget(qt_window)
+            # Re-run detection when the user scrubs frames (idempotent)
+            if not self._dims_connected:
+                try:
+                    self._viewer.dims.events.current_step.connect(
+                        self._on_dims_changed)
+                    self._dims_connected = True
+                except Exception:
+                    pass
+            return True
+        except Exception as exc:
+            self._status.setText(f"Couldn't embed napari viewer: {exc}")
+            return False
+
+    # ── Public API ───────────────────────────────────────────────────────
+    def set_file(self, file_path: str,
+                 current_polygons: list | None = None):
+        """Switch the viewer to `file_path` and load its preview.
+
+        Auto-emits the current polygons as `polygons_changed` whenever
+        the user adds / edits / removes a shape, so the host MainWindow
+        can persist the change without an explicit Save button.
+        """
+        # If we have an active file with edits, flush them before switching.
+        self._flush_current_polygons_if_changed()
+
+        self._current_file = file_path or ""
+
+        if not file_path:
+            self._title.setText("Preview viewer")
+            self._status.setText("Pick a file to start")
+            return
+        if not os.path.isfile(file_path):
+            self._status.setText(f"File not found: {file_path}")
+            return
+
+        if not self._ensure_viewer():
+            return
+
+        # Clear out any old layers from a previous file
+        try:
+            self._viewer.layers.clear()
+        except Exception:
+            pass
+        self._image_layer = None
+        self._shapes_layer = None
+        self._points_layer = None
+        self._stack = None
+        self._stack_filtered = None
+        self._stack_preprocessed = None
+        self._pp_signature = None
+        self._last_mass = None
+        self._roi_mask_layer = None
+        # Reset the toggle silently so it doesn't fight the new image
+        try:
+            self._cb_filtered.blockSignals(True)
+            self._cb_filtered.setChecked(False)
+            self._cb_filtered.blockSignals(False)
+        except AttributeError:
+            pass
+
+        self._title.setText(f"Preview — {os.path.basename(file_path)}")
+        self._status.setText("Loading preview…")
+
+        try:
+            import numpy as _np
+            stack, _idx = _RoiDialog._quick_preview_stack(file_path, max_frames=30)
+            self._stack = stack
+            # Percentile-based contrast so a few hot pixels don't blow out the
+            # display.  Sample a single mid-stack frame for speed.
+            sample = stack[stack.shape[0] // 2]
+            lo, hi = _np.percentile(sample, [1.0, 99.5])
+            if hi <= lo:
+                hi = lo + 1.0
+            self._image_layer = self._viewer.add_image(
+                stack, name="ROI background", colormap="gray",
+                contrast_limits=(float(lo), float(hi)))
+            initial_shapes = [_np.asarray(poly)
+                              for poly in (current_polygons or [])]
+            self._shapes_layer = self._viewer.add_shapes(
+                data=initial_shapes if initial_shapes else None,
+                shape_type="polygon",
+                edge_color="#58a6ff",
+                face_color="rgba(88,166,255,0.18)",
+                edge_width=2,
+                name="ROI",
+            )
+            try:
+                self._shapes_layer.mode = "add_polygon"
+            except Exception:
+                pass
+            # Auto-save: emit whenever the shapes layer changes
+            try:
+                self._shapes_layer.events.data.connect(self._on_shapes_changed)
+            except Exception:
+                pass
+            self._status.setText(
+                f"{stack.shape[0]}-frame preview, "
+                f"{stack.shape[2]} × {stack.shape[1]} px — "
+                "draw polygon(s); right-click or Esc to close each one.")
+            # Re-arm detection preview if the host has it enabled.
+            if self._detect_enabled:
+                self._detect_debounce.start()
+            # Re-draw the auto / manual-threshold mask overlay if the
+            # host previously set its parameters.
+            self._refresh_roi_mask_overlay()
+        except Exception as exc:
+            import traceback as _tb
+            self._status.setText(
+                f"Couldn't load preview: {exc}\n{_tb.format_exc()}")
+
+    def current_file(self) -> str:
+        return self._current_file
+
+    def current_polygons(self) -> list:
+        polys = []
+        if self._shapes_layer is None:
+            return polys
+        try:
+            for shape_data, shape_type in zip(self._shapes_layer.data,
+                                              self._shapes_layer.shape_type):
+                if shape_type in ("polygon", "rectangle", "ellipse"):
+                    polys.append([(float(y), float(x))
+                                  for y, x in shape_data])
+        except Exception:
+            pass
+        return polys
+
+    # ── Internal ─────────────────────────────────────────────────────────
+    def _flush_current_polygons_if_changed(self):
+        """Emit a final polygons_changed for the outgoing file, in case
+        the user drew something but never triggered the data-changed event."""
+        if self._current_file and self._shapes_layer is not None:
+            try:
+                self.polygons_changed.emit(
+                    self._current_file, self.current_polygons())
+            except Exception:
+                pass
+
+    def _on_shapes_changed(self, _event=None):
+        if self._current_file:
+            try:
+                self.polygons_changed.emit(
+                    self._current_file, self.current_polygons())
+            except Exception:
+                pass
+
+    def _on_clear(self):
+        if self._shapes_layer is None:
+            return
+        try:
+            self._shapes_layer.data = []
+        except Exception:
+            pass
+        if self._current_file:
+            self.polygons_changed.emit(self._current_file, [])
+
+    # ── Detection preview ────────────────────────────────────────────────
+    def enable_detection_preview(self, enabled: bool):
+        """Toggle a `tp.locate` overlay on the current frame."""
+        self._detect_enabled = bool(enabled)
+        if not self._detect_enabled:
+            self._remove_points_layer()
+            return
+        if self._stack is None:
+            return
+        self._detect_debounce.start()
+
+    def set_detection_params(self, *, diameter: int, minmass: float,
+                             bg_method: str = "uniform_filter",
+                             bg_radius: int = 50):
+        """Update the diameter / minmass / preprocessing used by the
+        live overlay.  Matching the pipeline's preprocessing is what makes
+        the mass scale here agree with what the run will actually see."""
+        new_sig = (str(bg_method), int(bg_radius))
+        if self._pp_signature is not None and new_sig != self._pp_signature:
+            # Background settings changed → invalidate cached preprocessed stack
+            self._stack_preprocessed = None
+        self._detect_params = {"diameter": int(diameter),
+                               "minmass":  float(minmass),
+                               "bg_method": str(bg_method),
+                               "bg_radius": int(bg_radius)}
+        if self._detect_enabled and self._stack is not None:
+            self._detect_debounce.start()
+
+    def _on_dims_changed(self, _evt=None):
+        if self._detect_enabled and self._stack is not None:
+            self._detect_debounce.start()
+
+    def _current_frame_idx(self) -> int:
+        if self._viewer is None or self._stack is None:
+            return 0
+        try:
+            return int(self._viewer.dims.current_step[0])
+        except Exception:
+            return 0
+
+    def _run_detection(self):
+        if not self._detect_enabled or self._stack is None or self._viewer is None:
+            return
+        idx = max(0, min(self._current_frame_idx(), self._stack.shape[0] - 1))
+        # Locate on the PREPROCESSED frame so the mass scale here matches
+        # what the pipeline produces during the real run.  The bandpass view
+        # toggle is a display aid only and doesn't affect numbers.
+        pp = self._ensure_preprocessed_stack()
+        if pp is None:
+            self._status.setText("Preprocessing failed — falling back to raw frame.")
+            frame = self._stack[idx]
+        else:
+            frame = pp[idx]
+        diameter = self._detect_params["diameter"]
+        if diameter % 2 == 0:
+            diameter += 1
+        minmass = self._detect_params["minmass"]
+        try:
+            import trackpy as tp
+            df = tp.locate(frame, diameter=diameter, minmass=minmass)
+        except Exception as exc:
+            self._status.setText(f"Detection preview failed: {exc}")
+            return
+        import numpy as _np
+        if len(df):
+            pts  = df[["y", "x"]].to_numpy()
+            mass = df["mass"].to_numpy() if "mass" in df.columns else None
+        else:
+            pts  = _np.zeros((0, 2), dtype=float)
+            mass = None
+        self._last_mass = mass
+        self._update_points_layer(pts, diameter, mass)
+        # Mass-distribution summary helps the user pick a useful minmass.
+        if mass is not None and len(mass):
+            m_lo, m_med, m_hi = (float(_np.min(mass)),
+                                 float(_np.median(mass)),
+                                 float(_np.max(mass)))
+            mass_summary = f"mass {m_lo:.0f} / med {m_med:.0f} / {m_hi:.0f}"
+        else:
+            mass_summary = "no spots"
+        self._status.setText(
+            f"Frame {idx + 1}/{self._stack.shape[0]} — "
+            f"{len(df)} spots (d={diameter}, minmass={minmass:g}) — {mass_summary}")
+
+    def _mass_to_rgba(self, mass):
+        """Return (N, 4) RGBA in 0..1 using turbo on log(mass) — high
+        contrast on a grey background at both ends of the scale."""
+        import numpy as _np
+        try:
+            import matplotlib.cm as _cm
+            import matplotlib.colors as _mc
+            m = _np.asarray(mass, dtype=float)
+            # log scale keeps dim spots distinguishable from bright ones
+            logm = _np.log10(_np.clip(m, 1e-3, None))
+            if logm.size == 0:
+                return _np.zeros((0, 4))
+            vmin = float(_np.min(logm))
+            vmax = float(_np.max(logm))
+            if vmax <= vmin + 1e-9:
+                vmax = vmin + 1.0
+            norm = _mc.Normalize(vmin=vmin, vmax=vmax)
+            try:
+                cmap = _cm.get_cmap("turbo")
+            except Exception:
+                cmap = _cm.viridis
+            rgba = cmap(norm(logm))
+            return _np.asarray(rgba, dtype=float)
+        except Exception:
+            n = len(mass) if mass is not None else 0
+            return _np.tile([0.0, 1.0, 1.0, 1.0], (n, 1))
+
+    def _update_points_layer(self, pts, diameter: int, mass=None):
+        import numpy as _np
+        size = max(4, int(diameter) + 6)
+        # Build per-point colour array (turbo on log mass) for visibility.
+        if mass is not None and len(mass) > 0:
+            colours = self._mass_to_rgba(mass)
+        else:
+            colours = _np.tile([0.0, 1.0, 1.0, 1.0],
+                               (len(pts), 1)) if len(pts) else None
+        if self._points_layer is None:
+            kwargs = dict(
+                size=size,
+                face_color="transparent",
+                symbol="o",
+                name="Detections",
+                opacity=1.0,
+            )
+            try:
+                self._points_layer = self._viewer.add_points(
+                    pts,
+                    border_color=(colours if colours is not None else "#00ffff"),
+                    border_width=0.30,
+                    **kwargs)
+            except TypeError:
+                # napari < 0.5 — edge_* names
+                self._points_layer = self._viewer.add_points(
+                    pts,
+                    edge_color=(colours if colours is not None else "#00ffff"),
+                    edge_width=0.30,
+                    **kwargs)
+            except Exception as exc:
+                self._status.setText(f"Points layer failed: {exc}")
+                self._points_layer = None
+                return
+            try:
+                if self._shapes_layer is not None:
+                    self._viewer.layers.selection.active = self._shapes_layer
+            except Exception:
+                pass
+        else:
+            try:
+                self._points_layer.data = pts
+                self._points_layer.size = size
+                if colours is not None and len(colours):
+                    try:
+                        self._points_layer.border_color = colours
+                    except Exception:
+                        try: self._points_layer.edge_color = colours
+                        except Exception: pass
+            except Exception:
+                pass
+
+    # ── Bandpass-filtered view ───────────────────────────────────────────
+    def _on_filtered_toggled(self, checked: bool):
+        if self._viewer is None or self._image_layer is None or self._stack is None:
+            return
+        if checked:
+            if self._stack_filtered is None:
+                self._stack_filtered = self._compute_filtered_stack(self._stack)
+            target = self._stack_filtered
+        else:
+            target = self._stack
+        try:
+            self._image_layer.data = target
+            import numpy as _np
+            sample = target[target.shape[0] // 2]
+            lo, hi = _np.percentile(sample, [1.0, 99.5])
+            if hi <= lo:
+                hi = lo + 1.0
+            self._image_layer.contrast_limits = (float(lo), float(hi))
+        except Exception as exc:
+            self._status.setText(f"Couldn't swap image: {exc}")
+
+    def _ensure_preprocessed_stack(self):
+        """Lazily build a pipeline-equivalent preprocessed stack so that
+        `tp.locate` here sees the same intensities as the real run.  Mirrors
+        sptpalm_analysis._preprocess_fast / _preprocess_rolling: background
+        subtract → clip ≥0 → gaussian sigma=1 → per-frame normalise to [0,1].
+        """
+        if self._stack is None:
+            return None
+        bg_method = self._detect_params.get("bg_method", "uniform_filter")
+        bg_radius = int(self._detect_params.get("bg_radius", 50)) or 50
+        sig = (str(bg_method), bg_radius)
+        if self._stack_preprocessed is not None and self._pp_signature == sig:
+            return self._stack_preprocessed
+        try:
+            import numpy as _np
+            from scipy.ndimage import uniform_filter, gaussian_filter
+        except Exception:
+            return None
+        rolling_fn = None
+        if bg_method == "rolling_ball":
+            try:
+                from skimage.restoration import rolling_ball as rolling_fn
+            except Exception:
+                rolling_fn = None  # fall back to uniform filter silently
+
+        size = int(bg_radius * 2 + 1)
+        out = _np.empty(self._stack.shape, dtype=_np.float32)
+        for i in range(self._stack.shape[0]):
+            f = self._stack[i].astype(_np.float32, copy=False)
+            if rolling_fn is not None:
+                try:
+                    bg = rolling_fn(f, radius=bg_radius)
+                except Exception:
+                    bg = uniform_filter(f, size=size)
+            else:
+                bg = uniform_filter(f, size=size)
+            corrected = _np.clip(f - bg, 0, None)
+            smoothed  = gaussian_filter(corrected, sigma=1.0)
+            mn = float(smoothed.min()); mx = float(smoothed.max())
+            if mx > mn:
+                smoothed = (smoothed - mn) / (mx - mn)
+            out[i] = smoothed
+        self._stack_preprocessed = out
+        self._pp_signature = sig
+        return self._stack_preprocessed
+
+    # ── Auto / manual-threshold ROI overlay ──────────────────────────────
+    def set_roi_mask_params(self, *, mode: str, auto_method: str,
+                            threshold: float, mask_mode: str):
+        """Update + redraw the auto/manual-threshold ROI overlay layer.
+        `mode` is "None", "Auto threshold", "Manual threshold" or
+        "Manual polygon"; the overlay is drawn for the first two."""
+        self._roi_mask_params = {"mode": str(mode),
+                                 "auto_method": str(auto_method).lower(),
+                                 "threshold": float(threshold),
+                                 "mask_mode": str(mask_mode).lower()}
+        self._refresh_roi_mask_overlay()
+
+    def _refresh_roi_mask_overlay(self):
+        if self._viewer is None or self._stack is None:
+            return
+        mode = self._roi_mask_params.get("mode", "None")
+        if mode not in ("Auto threshold", "Manual threshold"):
+            self._remove_roi_mask_layer()
+            return
+        try:
+            import numpy as _np
+            from scipy.ndimage import gaussian_filter
+            from skimage.morphology import binary_closing, disk
+        except Exception:
+            return
+        # Build projection (mean or sum) and renormalise to [0,1]
+        proj = (self._stack.sum(axis=0)
+                if self._roi_mask_params["mask_mode"] == "sum"
+                else self._stack.mean(axis=0)).astype(_np.float32)
+        smoothed = gaussian_filter(proj, sigma=5.0)
+        mn, mx = float(smoothed.min()), float(smoothed.max())
+        if mx > mn:
+            smoothed = (smoothed - mn) / (mx - mn)
+        # Pick threshold
+        if mode == "Manual threshold":
+            t = float(self._roi_mask_params["threshold"])
+        else:
+            t = self._auto_threshold(smoothed,
+                                     self._roi_mask_params["auto_method"])
+            if t is None:
+                t = float(self._roi_mask_params["threshold"])
+        try:
+            mask = binary_closing(smoothed > t, disk(5))
+        except Exception:
+            mask = smoothed > t
+        self._draw_roi_mask_layer(mask, t)
+
+    @staticmethod
+    def _auto_threshold(image_norm, method: str):
+        try:
+            from skimage.filters import (threshold_otsu, threshold_li,
+                                         threshold_triangle)
+        except Exception:
+            return None
+        method = (method or "li").lower()
+        try:
+            if method == "otsu":     return float(threshold_otsu(image_norm))
+            if method == "li":       return float(threshold_li(image_norm))
+            if method == "triangle": return float(threshold_triangle(image_norm))
+            if method == "mean":     return float(image_norm.mean())
+        except Exception:
+            pass
+        return None
+
+    def _draw_roi_mask_layer(self, mask, threshold: float):
+        import numpy as _np
+        # Convert bool mask to (Y, X) uint8 so we can colour it via a
+        # custom colormap with transparency at 0.
+        layer_data = mask.astype(_np.uint8)
+        if self._roi_mask_layer is None:
+            try:
+                # Render through a 2-stop colormap: 0 = transparent,
+                # 1 = bright lime so the mask is unmistakable on grey.
+                from napari.utils.colormaps import Colormap as _NCmap
+                cmap = _NCmap([[0, 0, 0, 0], [0.20, 1.00, 0.30, 1.0]],
+                              name="firefly_roi_mask")
+                self._roi_mask_layer = self._viewer.add_image(
+                    layer_data, name="ROI mask", colormap=cmap,
+                    contrast_limits=(0, 1), opacity=0.35,
+                    blending="translucent")
+            except Exception:
+                try:
+                    self._roi_mask_layer = self._viewer.add_image(
+                        layer_data, name="ROI mask", colormap="green",
+                        contrast_limits=(0, 1), opacity=0.35,
+                        blending="translucent")
+                except Exception as exc:
+                    self._status.setText(f"ROI mask layer failed: {exc}")
+                    return
+            # Re-select shapes layer so polygon drawing keeps working
+            try:
+                if self._shapes_layer is not None:
+                    self._viewer.layers.selection.active = self._shapes_layer
+            except Exception:
+                pass
+        else:
+            try:
+                self._roi_mask_layer.data = layer_data
+            except Exception:
+                pass
+        # Refresh status with the threshold the user can see and tune
+        try:
+            n_in = int(_np.sum(mask))
+            total = int(mask.size)
+            pct = 100.0 * n_in / total if total else 0.0
+            self._roi_mask_layer.metadata = {"threshold": threshold,
+                                             "fraction": pct}
+        except Exception:
+            pass
+
+    def _remove_roi_mask_layer(self):
+        if self._roi_mask_layer is not None and self._viewer is not None:
+            try:
+                self._viewer.layers.remove(self._roi_mask_layer)
+            except Exception:
+                pass
+        self._roi_mask_layer = None
+
+    def _compute_filtered_stack(self, stack):
+        """Bandpass-filter every frame using trackpy.bandpass (matches what
+        tp.locate does internally), so the viewer shows what the detector
+        actually sees."""
+        import numpy as _np
+        diameter = int(self._detect_params.get("diameter", 7)) or 7
+        if diameter % 2 == 0:
+            diameter += 1
+        try:
+            import trackpy as tp
+            out = _np.empty_like(stack)
+            for i in range(stack.shape[0]):
+                out[i] = tp.bandpass(stack[i], lshort=1, llong=diameter)
+            return out
+        except Exception:
+            # Fall back to a difference-of-gaussians if trackpy.bandpass is
+            # missing or fails — same idea, slightly different kernel.
+            try:
+                from scipy.ndimage import gaussian_filter
+                out = _np.empty_like(stack, dtype=_np.float32)
+                short = 1.0
+                long  = max(1.5, diameter / 2.0)
+                for i in range(stack.shape[0]):
+                    f = stack[i].astype(_np.float32)
+                    out[i] = gaussian_filter(f, short) - gaussian_filter(f, long)
+                return out
+            except Exception:
+                return stack
+
+    def _remove_points_layer(self):
+        if self._points_layer is not None and self._viewer is not None:
+            try:
+                self._viewer.layers.remove(self._points_layer)
+            except Exception:
+                pass
+        self._points_layer = None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -641,17 +2004,65 @@ class MainWindow(QtWidgets.QMainWindow):
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(33)   # ms
         self._poll_timer.timeout.connect(self._on_poll_queue)
+
+        # Elapsed-time tracker for the Analysis tab.  1 Hz tick that
+        # updates the "Elapsed: 00:32" label while a run is active.
+        self._run_start_time: float | None = None
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.setInterval(1000)
+        self._elapsed_timer.timeout.connect(self._on_elapsed_tick)
+
+        # Per-file polygon ROIs.  Keyed by absolute file path; each value
+        # is a list of polygons, each polygon a list of (y, x) vertex
+        # tuples in pixel coords.  Persisted to QSettings as JSON.
+        self._roi_polygons: dict[str, list] = {}
+
         self._build_ui()
         self._install_crash_hooks()
         self._load_icon()
+        self._load_roi_polygons()
         self._restore_settings()
+        # Initialise ROI status labels now that both settings and polygons
+        # are loaded.
+        try:
+            self._refresh_single_roi_status()
+            self._refresh_batch_roi_markers()
+        except Exception:
+            pass
+        # ROI viewer loading is now EXPLICIT — driven by the
+        # "Load into ROI viewer" button or a double-click on a batch
+        # list item.  The earlier auto-load-on-selection design caused
+        # heavy work (napari + file load) on every single mouse click,
+        # which raced with the user's checkbox toggles and made some
+        # files un-toggleable.
+        # All we still do reactively is keep the single-file ROI status
+        # label in sync.
+        try:
+            self.e_file.textChanged.connect(
+                lambda _: self._refresh_single_roi_status())
+        except Exception:
+            pass
+
+        # Auto-load the active file into the embedded ROI viewer whenever
+        # the path settles (debounced so we don't fire load-after-every-
+        # keystroke while the user is typing or pasting a path).
+        self._roi_autoload_timer = QTimer(self)
+        self._roi_autoload_timer.setSingleShot(True)
+        self._roi_autoload_timer.setInterval(400)
+        self._roi_autoload_timer.timeout.connect(
+            self._roi_embedded_load_current_file)
+        try:
+            self.e_file.textChanged.connect(
+                lambda _: self._roi_autoload_timer.start())
+        except Exception:
+            pass
 
     # ── UI construction ───────────────────────────────────────────────────
     def _build_ui(self):
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
 
-        # Top-level vertical: [header bar] / [sidebar | tabs]
+        # Top-level vertical: [header bar] / [stack: landing OR main UI]
         top = QtWidgets.QVBoxLayout(central)
         top.setContentsMargins(0, 0, 0, 0)
         top.setSpacing(0)
@@ -659,12 +2070,19 @@ class MainWindow(QtWidgets.QMainWindow):
         # ── Header banner ────────────────────────────────────────────────
         top.addWidget(self._build_header_banner())
 
-        # ── Body: sidebar + tabs ─────────────────────────────────────────
+        # ── Stacked body: landing page (idx 0) vs main UI (idx 1) ────────
+        # Landing is a one-way gateway — once the user picks an action it
+        # disappears for the rest of the session.  Main UI rebuilds the
+        # sidebar + tab interface from before.
+        self._main_stack = QtWidgets.QStackedWidget()
+        top.addWidget(self._main_stack, stretch=1)
+        self._main_stack.addWidget(self._build_landing_page())
+
         body = QtWidgets.QWidget()
         layout = QtWidgets.QHBoxLayout(body)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        top.addWidget(body, stretch=1)
+        self._main_stack.addWidget(body)
 
         # ── Sidebar ───────────────────────────────────────────────────────
         # Fixed-width left panel; the scrollable parameter list lives
@@ -718,9 +2136,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs = QtWidgets.QTabWidget()
         self._build_import_tab()
         self._build_analysis_tab()
+        self._build_figures_tab()
         self._build_compare_tab()
         self._build_visualise_tab()
         layout.addWidget(self.tabs, stretch=1)
+
+        # Start on the landing page; main UI activates only after the user
+        # picks an action card.
+        self._main_stack.setCurrentIndex(0)
 
         # ── Console dock (hidden by default) ──────────────────────────────
         # One shared console for all tabs.  Stays hidden until the user
@@ -854,6 +2277,12 @@ class MainWindow(QtWidgets.QMainWindow):
         return sec, vb
 
     @staticmethod
+    def _make_mode_tile(title: str, subtitle: str,
+                        icon_char: str = "") -> "_ModeTile":
+        """Big segmented-control tile (custom widget — see `_ModeTile`)."""
+        return _ModeTile(title, subtitle, icon_char)
+
+    @staticmethod
     def _spin_int(value: int, lo: int, hi: int, step: int = 1,
                   tip: str = "") -> "QtWidgets.QSpinBox":
         s = _QuietSpinBox()
@@ -917,7 +2346,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # ── Preprocessing ─────────────────────────────────────────────────
         sec, gl = self._make_form_section("Preprocessing")
         gl.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
-        self.c_bg_method = QtWidgets.QComboBox()
+        self.c_bg_method = _QuietComboBox()
         self.c_bg_method.addItems(["Uniform Filter", "Rolling Ball"])
         self.c_bg_method.setToolTip(
             "Method for subtracting local background before detection.\n"
@@ -945,24 +2374,83 @@ class MainWindow(QtWidgets.QMainWindow):
         # which on a GPU backend produces 100k+ "spots" per chunk and
         # tanks throughput.  Users with known data should set minmass
         # manually; auto-detect is for exploratory runs on new data.
-        row = QtWidgets.QHBoxLayout()
         self.c_auto_minmass = QtWidgets.QCheckBox("Auto-detect")
         self.c_auto_minmass.setToolTip(
             "When checked, the pipeline picks minmass from the first chunk's\n"
             "99th-percentile pixel value × diameter²/8.  Heuristic — works on\n"
             "many datasets but may under-shoot; manual tuning is more reliable.")
         self.c_auto_minmass.setChecked(False)
-        self.s_minmass = self._spin_dbl(1.0, 0.0, 20.0, 0.05, decimals=2,
+        self.s_minmass = self._spin_dbl(1.0, 0.0, 100.0, 0.05, decimals=2,
             tip="Minimum integrated intensity for a spot.\n"
                 "Too low → many false-positive spots, slow linking, garbage tracks.\n"
                 "Too high → real spots filtered out.\n"
-                "Tune by trial: start at 1.0, decrease until you see spurious tracks.")
+                "After preprocessing (background subtract + per-frame normalise to\n"
+                "[0,1]) PALM masses typically land in the 0.5–50 range.  Start near\n"
+                "1.0 and sweep the slider — dim points vanish first as you raise it.")
+        # Slider companion — QSlider is integer-only, and a plain linear
+        # mapping over 0..5000 wastes 99% of slider travel on values above
+        # the useful range.  Use a square law: minmass = (slider/1000)² × MAX
+        # so slider≈100 ↔ minmass 50, slider≈316 ↔ minmass 500.
+        _MM_SLD_MAX = 1000
+        _MM_VAL_MAX = float(self.s_minmass.maximum())
+        def _slider_to_mass(s: int) -> float:
+            t = max(0, min(_MM_SLD_MAX, int(s))) / _MM_SLD_MAX
+            return float(t * t * _MM_VAL_MAX)
+        def _mass_to_slider(m: float) -> int:
+            import math as _math
+            t = max(0.0, min(_MM_VAL_MAX, float(m))) / _MM_VAL_MAX
+            return int(round(_math.sqrt(t) * _MM_SLD_MAX))
+        self.sld_minmass = QtWidgets.QSlider(Qt.Orientation.Horizontal)
+        self.sld_minmass.setMinimum(0)
+        self.sld_minmass.setMaximum(_MM_SLD_MAX)
+        self.sld_minmass.setSingleStep(1)
+        self.sld_minmass.setPageStep(20)
+        self.sld_minmass.setValue(_mass_to_slider(self.s_minmass.value()))
+        self.sld_minmass.setToolTip(
+            "Drag to sweep min-mass (square-law: fine at the low end, coarse\n"
+            "at the high end).  With 'Live preview' on, the ROI viewer updates\n"
+            "spot overlays as you move.  Type into the spinbox for exact values.")
+        self._minmass_sync_guard = False
+        def _on_slider(v: int):
+            if self._minmass_sync_guard: return
+            self._minmass_sync_guard = True
+            try: self.s_minmass.setValue(_slider_to_mass(v))
+            finally: self._minmass_sync_guard = False
+        def _on_spin(v: float):
+            if self._minmass_sync_guard: return
+            self._minmass_sync_guard = True
+            try: self.sld_minmass.setValue(_mass_to_slider(v))
+            finally: self._minmass_sync_guard = False
+        self.sld_minmass.valueChanged.connect(_on_slider)
+        self.s_minmass.valueChanged.connect(_on_spin)
         self.c_auto_minmass.toggled.connect(
-            lambda checked: self.s_minmass.setEnabled(not checked))
+            lambda checked: (self.s_minmass.setEnabled(not checked),
+                             self.sld_minmass.setEnabled(not checked)))
         self.s_minmass.setEnabled(True)
-        row.addWidget(self.c_auto_minmass); row.addWidget(self.s_minmass, 1)
-        wmm = QtWidgets.QWidget(); wmm.setLayout(row)
+
+        wmm = QtWidgets.QWidget()
+        vmm = QtWidgets.QVBoxLayout(wmm)
+        vmm.setContentsMargins(0, 0, 0, 0)
+        vmm.setSpacing(4)
+        row = QtWidgets.QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(self.c_auto_minmass)
+        row.addWidget(self.s_minmass, 1)
+        vmm.addLayout(row)
+        vmm.addWidget(self.sld_minmass)
         gl.addRow("Min mass", wmm)
+
+        # Push spinbox / combo edits into the live preview.  Background
+        # widgets are wired here too because the preview re-preprocesses
+        # frames using these settings to match the pipeline's mass scale.
+        self.s_diameter.valueChanged.connect(
+            lambda _=None: self._push_detection_preview_params())
+        self.s_minmass.valueChanged.connect(
+            lambda _=None: self._push_detection_preview_params())
+        self.c_bg_method.currentTextChanged.connect(
+            lambda _=None: self._push_detection_preview_params())
+        self.s_bg_radius.valueChanged.connect(
+            lambda _=None: self._push_detection_preview_params())
         layout.addWidget(sec)
 
         # ── Linking ───────────────────────────────────────────────────────
@@ -1037,31 +2525,81 @@ class MainWindow(QtWidgets.QMainWindow):
         # ── ROI ───────────────────────────────────────────────────────────
         sec, gl = self._make_form_section("ROI")
         gl.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
-        self.c_roi_mode = QtWidgets.QComboBox()
-        self.c_roi_mode.addItems(["None", "Auto threshold", "Manual threshold"])
+        self.c_roi_mode = _QuietComboBox()
+        self.c_roi_mode.addItems(
+            ["None", "Auto threshold", "Manual threshold", "Manual polygon"])
         self.c_roi_mode.setCurrentText("Auto threshold")
         self.c_roi_mode.setToolTip(
             "Restrict analysis to a region of interest in the field of view.\n"
             "• None — analyse the whole image.\n"
             "• Auto threshold — pick a threshold from the mean projection.\n"
-            "• Manual threshold — use the value below.")
+            "• Manual threshold — use the value below.\n"
+            "• Manual polygon — draw a polygon per file on the Import tab\n"
+            "  (Set ROI… buttons).  Files without a saved polygon fall back\n"
+            "  to the global Auto-threshold behaviour.")
         gl.addRow("Mode", self.c_roi_mode)
-        self.c_roi_auto_method = QtWidgets.QComboBox()
+        self.c_roi_auto_method = _QuietComboBox()
         self.c_roi_auto_method.addItems(["Li", "Otsu", "Triangle", "Mean"])
         self.c_roi_auto_method.setToolTip(
             "Auto-thresholding method (from scikit-image).  Li is robust for\n"
             "low-contrast SMLM data; Otsu for bimodal histograms.")
         gl.addRow("Auto method", self.c_roi_auto_method)
         self.s_roi_threshold = self._spin_dbl(0.08, 0.0, 1.0, 0.005, decimals=3,
-            tip="Manual threshold on the normalised mean projection [0, 1].")
-        gl.addRow("Manual threshold", self.s_roi_threshold)
-        self.c_roi_mask_mode = QtWidgets.QComboBox()
+            tip="Manual threshold on the normalised mean projection [0, 1].\n"
+                "Drag the slider below to sweep — the green mask overlay in\n"
+                "the ROI viewer updates as you move.")
+        # Slider companion — linear ×1000 mapping (range 0..1.000, step 0.001).
+        self.sld_roi_threshold = QtWidgets.QSlider(Qt.Orientation.Horizontal)
+        self.sld_roi_threshold.setMinimum(0)
+        self.sld_roi_threshold.setMaximum(1000)
+        self.sld_roi_threshold.setSingleStep(5)
+        self.sld_roi_threshold.setPageStep(50)
+        self.sld_roi_threshold.setValue(int(round(self.s_roi_threshold.value() * 1000)))
+        self.sld_roi_threshold.setToolTip(
+            "Drag to sweep manual threshold (0.000 – 1.000).  The green mask\n"
+            "in the ROI viewer redraws live, so you can see exactly which\n"
+            "pixels end up inside / outside the ROI.")
+        self._roi_thresh_sync_guard = False
+        def _on_roi_sld(v: int):
+            if self._roi_thresh_sync_guard: return
+            self._roi_thresh_sync_guard = True
+            try: self.s_roi_threshold.setValue(v / 1000.0)
+            finally: self._roi_thresh_sync_guard = False
+        def _on_roi_spin(v: float):
+            if self._roi_thresh_sync_guard: return
+            self._roi_thresh_sync_guard = True
+            try: self.sld_roi_threshold.setValue(int(round(v * 1000)))
+            finally: self._roi_thresh_sync_guard = False
+        self.sld_roi_threshold.valueChanged.connect(_on_roi_sld)
+        self.s_roi_threshold.valueChanged.connect(_on_roi_spin)
+
+        wrt = QtWidgets.QWidget()
+        vrt = QtWidgets.QVBoxLayout(wrt)
+        vrt.setContentsMargins(0, 0, 0, 0)
+        vrt.setSpacing(4)
+        vrt.addWidget(self.s_roi_threshold)
+        vrt.addWidget(self.sld_roi_threshold)
+        gl.addRow("Manual threshold", wrt)
+        self.c_roi_mask_mode = _QuietComboBox()
         self.c_roi_mask_mode.addItems(["Mean", "Sum"])
         self.c_roi_mask_mode.setToolTip(
             "Which projection is used to compute the ROI mask.\n"
             "Mean is appropriate when signal density is uniform; Sum\n"
             "emphasises bright sparse spots.")
         gl.addRow("Projection for ROI", self.c_roi_mask_mode)
+
+        # Grey out threshold-related controls when the mode doesn't use
+        # them, AND show/hide the embedded ROI viewer on the Import tab
+        # when "Manual polygon" is selected.
+        self.c_roi_mode.currentTextChanged.connect(self._on_roi_mode_changed)
+        # Push ROI mask updates to the embedded viewer whenever the user
+        # changes any of these knobs.
+        self.c_roi_auto_method.currentTextChanged.connect(
+            lambda _=None: self._push_roi_mask_params())
+        self.s_roi_threshold.valueChanged.connect(
+            lambda _=None: self._push_roi_mask_params())
+        self.c_roi_mask_mode.currentTextChanged.connect(
+            lambda _=None: self._push_roi_mask_params())
         layout.addWidget(sec)
 
         # ── Drift correction ──────────────────────────────────────────────
@@ -1097,18 +2635,18 @@ class MainWindow(QtWidgets.QMainWindow):
         # ── Performance ───────────────────────────────────────────────────
         sec, gl = self._make_form_section(f"Performance  —  {N_CPUS} cores")
         gl.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
-        self.c_backend = QtWidgets.QComboBox()
+        self.c_backend = _QuietComboBox()
         self.c_backend.addItems(self._available_backends())
         self.c_backend.setToolTip(
             "Which implementation to use for spot localisation.\n"
-            "• auto       — picks the fastest healthy backend on this machine.\n"
-            "• trackpy    — reference CPU implementation (battle-tested).\n"
-            "• torch      — PyTorch, device auto-selected.\n"
-            "• torch-mps  — force Apple GPU.  Fast when stable; on some macOS/M-chip\n"
-            "                combinations may hit memory-allocator issues at very\n"
-            "                low minmass (lots of false-positive spots).\n"
-            "• torch-cuda — force NVIDIA GPU.\n"
-            "• torch-cpu  — force PyTorch on CPU (for benchmarking).")
+            "• Auto                — pick the fastest healthy backend on this machine.\n"
+            "• Trackpy (CPU)       — reference CPU implementation (battle-tested).\n"
+            "• Torch (auto)        — PyTorch, device auto-selected.\n"
+            "• Torch — Apple MPS   — force Apple GPU.  Fast when stable; on some\n"
+            "                        macOS/M-chip combinations may hit memory-\n"
+            "                        allocator issues at very low minmass.\n"
+            "• Torch — NVIDIA CUDA — force NVIDIA GPU.\n"
+            "• Torch — CPU         — force PyTorch on CPU (for benchmarking).")
         gl.addRow("Detection backend", self.c_backend)
         self.s_workers = self._spin_int(N_CPUS, 1, N_CPUS,
             tip="Parallel CPU workers for the trackpy backend's multiprocessing\n"
@@ -1122,6 +2660,119 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(sec)
 
         layout.addStretch(1)
+
+    # ── Landing page (one-way gateway, not a tab) ─────────────────────────
+    def _build_landing_page(self) -> QtWidgets.QWidget:
+        """Full-window welcome screen shown on launch.  Once the user picks
+        an action card, the QStackedWidget swaps to the main sidebar+tabs
+        UI and there's no way back to this page for the rest of the
+        session."""
+        page = QtWidgets.QWidget()
+        page.setObjectName("landing_page")
+
+        # Use a horizontal centring wrapper so the content column is capped
+        # at ~860 px wide regardless of window width — keeps the hero text
+        # readable and the cards from stretching to absurd widths.
+        wrap = QtWidgets.QHBoxLayout(page)
+        wrap.setContentsMargins(40, 28, 40, 28)
+        wrap.addStretch(1)
+
+        column = QtWidgets.QWidget()
+        column.setMaximumWidth(860)
+        outer = QtWidgets.QVBoxLayout(column)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(18)
+
+        # Hero block.  Title uses rich text so we can colour "FIREFLY" in
+        # the accent blue while keeping "Welcome to " in the default text
+        # colour.
+        title = QtWidgets.QLabel(
+            f"Welcome to "
+            f"<span style='color:{_THEME['ACC']};'>FIREFLY</span>")
+        title.setTextFormat(Qt.TextFormat.RichText)
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setStyleSheet(
+            f"color: {_THEME['TXT']}; font-size: 28px; font-weight: 700;")
+        outer.addWidget(title)
+        sub = QtWidgets.QLabel(
+            "Fluorescence Inference & Reconstruction Engine — Framework "
+            "for Localization Yields.")
+        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sub.setWordWrap(True)
+        sub.setStyleSheet(f"color: {_THEME['TXT_MUTED']}; font-size: 13px;")
+        outer.addWidget(sub)
+        prompt = QtWidgets.QLabel("What would you like to do?")
+        prompt.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        prompt.setStyleSheet(
+            f"color: {_THEME['TXT']}; font-size: 15px; "
+            "font-weight: 600; padding-top: 8px;")
+        outer.addWidget(prompt)
+
+        # Card grid — 2x2
+        grid = QtWidgets.QGridLayout()
+        grid.setSpacing(14)
+        grid.setContentsMargins(0, 4, 0, 0)
+
+        def _go(target_tab: str, *, batch: bool | None = None):
+            def _fn():
+                if batch is True:
+                    try: self.r_mode_batch.setChecked(True)
+                    except AttributeError: pass
+                elif batch is False:
+                    try: self.r_mode_single.setChecked(True)
+                    except AttributeError: pass
+                self._enter_main_ui(target_tab)
+            return _fn
+
+        tiles = [
+            ("Analyse a sample",
+             "Pick one .czi or .tif and run the full sptPALM pipeline.",
+             "▶", _go("Import", batch=False)),
+            ("Batch a folder",
+             "Process every file in a folder, one after another, with shared settings.",
+             "⊞", _go("Import", batch=True)),
+            ("Compare groups",
+             "Load existing analysis outputs and produce a side-by-side comparison figure.",
+             "⇄", _go("Compare")),
+            ("Visualise tracks",
+             "Open a previous run in an embedded napari viewer to scrub frames and explore tracks.",
+             "◉", _go("Visualise")),
+        ]
+        for i, (ttl, desc, icon, slot) in enumerate(tiles):
+            tile = _ActionTile(ttl, desc, icon_char=icon)
+            tile.clicked.connect(slot)
+            grid.addWidget(tile, i // 2, i % 2)
+        outer.addLayout(grid, stretch=1)
+
+        # Footer row — secondary jump-link to Figures
+        footer = QtWidgets.QHBoxLayout()
+        footer.setSpacing(20)
+        footer.addStretch(1)
+        btn = QtWidgets.QPushButton("Customise figures →")
+        btn.setFlat(True)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setStyleSheet(
+            f"QPushButton {{ color: {_THEME['ACC']}; "
+            "background: transparent; border: none; padding: 6px 8px; }} "
+            f"QPushButton:hover {{ color: {_THEME['ACC_HOVER']}; "
+            "text-decoration: underline; }}")
+        btn.clicked.connect(lambda _=None: self._enter_main_ui("Figures"))
+        footer.addWidget(btn)
+        footer.addStretch(1)
+        outer.addLayout(footer)
+
+        wrap.addWidget(column, stretch=0)
+        wrap.addStretch(1)
+        return page
+
+    def _enter_main_ui(self, target_tab: str):
+        """Swap the QStackedWidget from landing → main UI and activate the
+        named tab.  Called once per session, on action-card click."""
+        self._main_stack.setCurrentIndex(1)
+        for i in range(self.tabs.count()):
+            if self.tabs.tabText(i) == target_tab:
+                self.tabs.setCurrentIndex(i)
+                return
 
     def _build_import_tab(self):
         """Import tab — single-source-of-truth for input/output config.
@@ -1141,18 +2792,43 @@ class MainWindow(QtWidgets.QMainWindow):
         v.setSpacing(12)
 
         # ── Mode toggle ───────────────────────────────────────────────────
+        # Segmented control: two big tile buttons, exclusive.  Looks like
+        # a pair of cards — fills the available width and makes the choice
+        # feel deliberate rather than incidental.
         mode_row = QtWidgets.QHBoxLayout()
-        mode_row.addWidget(QtWidgets.QLabel("Mode"))
-        self.r_mode_single = QtWidgets.QRadioButton("Single file")
-        self.r_mode_batch  = QtWidgets.QRadioButton("Batch (folder)")
+        mode_row.setSpacing(12)
+
+        self.r_mode_single = self._make_mode_tile(
+            "Single file",
+            "Analyse one .czi / .tif file end-to-end")
+        self.r_mode_batch = self._make_mode_tile(
+            "Batch (folder)",
+            "Process every file in a folder, one after another")
         self.r_mode_single.setChecked(True)
-        self._mode_group = QtWidgets.QButtonGroup(self)
-        self._mode_group.addButton(self.r_mode_single, 0)
-        self._mode_group.addButton(self.r_mode_batch, 1)
-        self.r_mode_single.toggled.connect(self._on_import_mode_changed)
-        mode_row.addWidget(self.r_mode_single)
-        mode_row.addWidget(self.r_mode_batch)
-        mode_row.addStretch(1)
+
+        # Manual exclusivity (these custom tiles aren't QAbstractButtons,
+        # so QButtonGroup can't manage them).  Clicking either uncheck
+        # the other and fires the mode-change handler.
+        def _on_single_toggled(checked):
+            if checked:
+                self.r_mode_batch.setChecked(False)
+                self._on_import_mode_changed(True)
+            elif not self.r_mode_batch.isChecked():
+                # Don't allow zero-selected state; re-check this one
+                self.r_mode_single.setChecked(True)
+
+        def _on_batch_toggled(checked):
+            if checked:
+                self.r_mode_single.setChecked(False)
+                self._on_import_mode_changed(False)
+            elif not self.r_mode_single.isChecked():
+                self.r_mode_batch.setChecked(True)
+
+        self.r_mode_single.toggled.connect(_on_single_toggled)
+        self.r_mode_batch.toggled.connect(_on_batch_toggled)
+
+        mode_row.addWidget(self.r_mode_single, 1)
+        mode_row.addWidget(self.r_mode_batch,  1)
         v.addLayout(mode_row)
 
         # ── Single-file sub-panel ─────────────────────────────────────────
@@ -1177,6 +2853,31 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addWidget(self.e_outdir); row.addWidget(b2)
         w_out = QtWidgets.QWidget(); w_out.setLayout(row)
         sg.addRow("Output folder", w_out)
+
+        # Replay-from-manifest row — load a previous run's parameters
+        # from its <stem>_run_manifest.json so you can reproduce it.
+        row = QtWidgets.QHBoxLayout()
+        self.btn_load_manifest = QtWidgets.QPushButton(
+            "Load run manifest…")
+        self.btn_load_manifest.setToolTip(
+            "Open a previous run's <stem>_run_manifest.json and apply its\n"
+            "parameters to the sidebar.  Useful for reproducing a run\n"
+            "exactly or starting a new analysis from a known-good config.")
+        self.btn_load_manifest.clicked.connect(self._on_load_manifest)
+        row.addStretch(1)
+        row.addWidget(self.btn_load_manifest)
+        w_manifest = QtWidgets.QWidget(); w_manifest.setLayout(row)
+        sg.addRow("", w_manifest)
+
+        # ROI status + explicit "Load into ROI viewer" button.  The viewer
+        # is the embedded _RoiViewer below — always visible, auto-loads
+        # whenever the input path settles.
+        self.lbl_single_roi_status = QtWidgets.QLabel(
+            "ROI: using global setting")
+        self.lbl_single_roi_status.setStyleSheet(
+            f"color: {_THEME['TXT_MUTED']};")
+        sg.addRow("Region of interest", self.lbl_single_roi_status)
+
         v.addWidget(self._single_panel)
 
         # ── Batch sub-panel ───────────────────────────────────────────────
@@ -1219,6 +2920,11 @@ class MainWindow(QtWidgets.QMainWindow):
         sel_row.addWidget(self.lbl_batch_summary)
         bg.addLayout(sel_row)
 
+        # The embedded ROI viewer below auto-loads whichever series the
+        # user clicks in the list, so no explicit "load" button is needed.
+        self.lst_batch_files.itemClicked.connect(
+            lambda _it: self._roi_embedded_load_current_file())
+
         # Where the batch outputs land
         self.lbl_batch_output_path = QtWidgets.QLabel(
             "Output → (pick an input folder first)")
@@ -1230,6 +2936,23 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Start visible state: single mode shown, batch hidden
         self._batch_panel.hide()
+
+        # ── Embedded ROI viewer (always visible) ──────────────────────────
+        self._roi_viewer_container = QtWidgets.QFrame()
+        # Reserve a min height so the panel doesn't grow from nothing the
+        # first time a file is loaded — that resize is what macOS animates
+        # as a "slide".
+        self._roi_viewer_container.setMinimumHeight(420)
+        rvl = QtWidgets.QVBoxLayout(self._roi_viewer_container)
+        rvl.setContentsMargins(0, 8, 0, 0)
+        self._roi_viewer = _RoiViewer()
+        self._roi_viewer.polygons_changed.connect(self._on_roi_polygons_changed)
+        rvl.addWidget(self._roi_viewer)
+        v.addWidget(self._roi_viewer_container, stretch=2)
+        # Pre-init the napari viewer right after construction so the very
+        # first file load doesn't have to embed napari + load data + grow
+        # the layout in one step (that triple causes the macOS slide).
+        QtCore.QTimer.singleShot(0, lambda: self._roi_viewer._ensure_viewer())
 
         self.tabs.addTab(tab, "Import")
 
@@ -1245,10 +2968,20 @@ class MainWindow(QtWidgets.QMainWindow):
         v.setContentsMargins(16, 16, 16, 16)
         v.setSpacing(10)
 
+        # Stage label on the left, elapsed-time counter on the right.
+        # Both updated by the polling timer (stage) and a 1 Hz elapsed
+        # timer (clock).
+        stage_row = QtWidgets.QHBoxLayout()
         self.run_stage_label = QtWidgets.QLabel("Idle")
         self.run_stage_label.setStyleSheet(
             f"color: {_THEME['TXT_MUTED']}; font-weight: 600; padding: 2px 0;")
-        v.addWidget(self.run_stage_label)
+        stage_row.addWidget(self.run_stage_label, 1)
+        self.lbl_elapsed = QtWidgets.QLabel("")
+        self.lbl_elapsed.setStyleSheet(
+            f"color: {_THEME['TXT_MUTED']}; font-variant-numeric: tabular-nums;")
+        self.lbl_elapsed.setAlignment(Qt.AlignmentFlag.AlignRight)
+        stage_row.addWidget(self.lbl_elapsed)
+        v.addLayout(stage_row)
 
         self.progress_bar = QtWidgets.QProgressBar()
         self.progress_bar.setRange(0, 100)
@@ -1275,17 +3008,397 @@ class MainWindow(QtWidgets.QMainWindow):
         self.batch_subprogress.hide()
         v.addWidget(self.batch_subprogress)
 
+        # Live mass histogram — chunks land here during a run so the user
+        # can sanity-check minmass without waiting for the figure.
+        self.mass_hist = _MassHistogram()
+        v.addWidget(self.mass_hist)
+
         self.run_results = _ResultsPanel(
             "Results will appear here after analysis.")
         v.addWidget(self.run_results, stretch=1)
 
         self.tabs.addTab(tab, "Analysis")
 
+    # ── Figures tab ───────────────────────────────────────────────────────
+    def _build_figures_tab(self):
+        """Customisation for figure outputs — single-sample (Analysis tab)
+        and comparison (Compare tab) — plus a live preview that updates
+        as the user changes theme / colormap settings."""
+        tab = QtWidgets.QWidget()
+        outer = QtWidgets.QHBoxLayout(tab)
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(12)
+
+        # ── Settings column ──────────────────────────────────────────────
+        settings_col = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(settings_col)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(10)
+
+        intro = QtWidgets.QLabel(
+            "Style and output format for the figures produced by the "
+            "Analysis and Compare tabs.  Preview on the right updates as "
+            "you change the theme / colormap.")
+        intro.setWordWrap(True)
+        intro.setStyleSheet(f"color: {_THEME['TXT_MUTED']};")
+        v.addWidget(intro)
+
+        # ── Single-sample figure ──────────────────────────────────────────
+        sec, gl = self._make_form_section("Single-sample figure (Analysis tab)")
+        self.c_fig_theme = _QuietComboBox()
+        self.c_fig_theme.addItems(["Dark", "Light", "Publication"])
+        self.c_fig_theme.setToolTip(
+            "Overall colour scheme for figure backgrounds, axes, and text.\n"
+            "• Dark         — GitHub-dark (matches the GUI).\n"
+            "• Light        — GitHub-light, sans-serif.\n"
+            "• Publication  — White background, black axes, serif font.")
+        gl.addRow("Theme", self.c_fig_theme)
+        self.c_fig_proj_cmap = _QuietComboBox()
+        self.c_fig_proj_cmap.addItems(
+            ["Inferno", "Hot", "Viridis", "Plasma", "Greys"])
+        self.c_fig_proj_cmap.setToolTip(
+            "Colormap for the max-projection panel.  Inferno is the\n"
+            "default — perceptually uniform with deep blacks for dark\n"
+            "backgrounds.  Greys flips automatically for light themes.")
+        gl.addRow("Projection colormap", self.c_fig_proj_cmap)
+        self.s_fig_dpi = self._spin_int(150, 72, 600, step=10,
+            tip="Pixel density for the combined PNG.  150 DPI matches the\n"
+                "default print size; bump to 300 for posters / publications.")
+        gl.addRow("PNG DPI", self.s_fig_dpi)
+        self.c_fig_save_pdf = QtWidgets.QCheckBox(
+            "Also save vector PDF alongside the PNG")
+        self.c_fig_save_pdf.setToolTip(
+            "Write a vector PDF copy of the figure.  Same content as the\n"
+            "PNG but infinitely zoomable — recommended for talks and papers.")
+        gl.addRow("", self.c_fig_save_pdf)
+        self.c_fig_per_panel = QtWidgets.QCheckBox(
+            "Also save each panel as a separate PNG")
+        self.c_fig_per_panel.setToolTip(
+            "Export each labelled panel (A, B, C, …) of the combined figure\n"
+            "to figures/panels/.  Useful when you want a single chart for a\n"
+            "talk without cropping the full grid.")
+        gl.addRow("", self.c_fig_per_panel)
+        v.addWidget(sec)
+
+        # Single-sample panel selector — only affects per-panel PNG exports
+        # (combined figure always contains every panel that has data).
+        single_panels_grp = QtWidgets.QGroupBox(
+            "Single-sample panels to export individually")
+        spg = QtWidgets.QGridLayout(single_panels_grp)
+        self._single_panel_checkboxes: dict[str, QtWidgets.QCheckBox] = {}
+        for i, (key, label) in enumerate(self.SINGLE_PANELS):
+            cb = QtWidgets.QCheckBox(f"{key}.  {label}")
+            cb.setChecked(True)
+            cb.setToolTip(
+                f"Include panel {key} ({label}) when 'Also save each panel\n"
+                "as a separate PNG' is on.  The combined figure always shows\n"
+                "every panel that has data.")
+            self._single_panel_checkboxes[key] = cb
+            spg.addWidget(cb, i // 2, i % 2)
+        v.addWidget(single_panels_grp)
+
+        # ── Comparison figure (moved from Compare tab) ────────────────────
+        sec, gl = self._make_form_section("Comparison figure (Compare tab)")
+        self.c_cmp_theme = _QuietComboBox()
+        self.c_cmp_theme.addItems(["Dark", "Light", "Publication"])
+        self.c_cmp_theme.setToolTip(
+            "Theme for the multi-group comparison figure.  Independent\n"
+            "from the single-sample theme so you can mix and match.")
+        gl.addRow("Theme", self.c_cmp_theme)
+        self.c_cmp_pdf = QtWidgets.QCheckBox(
+            "Generate multi-page PDF report (figure + parameters + stats)")
+        self.c_cmp_pdf.setChecked(True)
+        gl.addRow("", self.c_cmp_pdf)
+        v.addWidget(sec)
+
+        # Comparison panels (which sub-panels to include in the figure)
+        panels_grp = QtWidgets.QGroupBox("Comparison panels to include")
+        pg = QtWidgets.QGridLayout(panels_grp)
+        self._cmp_panel_checkboxes: dict[str, QtWidgets.QCheckBox] = {}
+        for i, (key, label) in enumerate(self.COMPARE_PANELS):
+            cb = QtWidgets.QCheckBox(label)
+            cb.setChecked(True)
+            self._cmp_panel_checkboxes[key] = cb
+            pg.addWidget(cb, i // 2, i % 2)
+        v.addWidget(panels_grp)
+        v.addStretch(1)
+
+        # ── Preview column (two stacked previews) ────────────────────────
+        preview_col = QtWidgets.QWidget()
+        pv = QtWidgets.QVBoxLayout(preview_col)
+        pv.setContentsMargins(0, 0, 0, 0)
+        pv.setSpacing(8)
+
+        def _make_preview_label(caption: str) -> QtWidgets.QLabel:
+            lbl = QtWidgets.QLabel("Rendering preview…")
+            lbl.setMinimumSize(560, 320)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            # Ignored policy in both directions → layout sizes the label
+            # from the stretch / minimum hints only, NOT from the pixmap's
+            # natural size.  Without this, every theme change produces a
+            # slightly different matplotlib output → the label's sizeHint
+            # bumps up → layout reallocates → bigger label → bigger render…
+            lbl.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
+                              QtWidgets.QSizePolicy.Policy.Ignored)
+            lbl.setStyleSheet(
+                f"QLabel {{ border: 1px solid {_THEME['BORDER']}; "
+                f"background: {_THEME['PANEL']}; color: {_THEME['TXT_MUTED']}; "
+                "border-radius: 4px; }}")
+            return lbl
+
+        cap_single = QtWidgets.QLabel("Single-sample figure")
+        cap_single.setStyleSheet(
+            f"color: {_THEME['TXT']}; font-weight: 600;")
+        pv.addWidget(cap_single)
+        self.lbl_fig_preview_single = _make_preview_label("single")
+        pv.addWidget(self.lbl_fig_preview_single, stretch=1)
+
+        cap_compare = QtWidgets.QLabel("Comparison figure")
+        cap_compare.setStyleSheet(
+            f"color: {_THEME['TXT']}; font-weight: 600;")
+        pv.addWidget(cap_compare)
+        self.lbl_fig_preview_compare = _make_preview_label("comparison")
+        pv.addWidget(self.lbl_fig_preview_compare, stretch=1)
+
+        # Cache of unscaled preview pixmaps so we can re-fit them when the
+        # labels resize (e.g. on window resize) without re-rendering.
+        self._fig_preview_pixmaps: dict[QtWidgets.QLabel, QtGui.QPixmap] = {}
+        # Install a resize filter on both labels — re-scales the cached
+        # raw pixmap to fit the new label dimensions.
+        for _lbl in (self.lbl_fig_preview_single, self.lbl_fig_preview_compare):
+            _lbl.installEventFilter(self)
+
+        hint = QtWidgets.QLabel(
+            "Rendered on a synthetic dataset — actual figures will use "
+            "your data but keep these style choices.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {_THEME['TXT_MUTED']}; font-size: 11px;")
+        pv.addWidget(hint)
+
+        outer.addWidget(settings_col, 1)
+        outer.addWidget(preview_col, 2)
+
+        # ── Debounced preview refresh ────────────────────────────────────
+        self._figpreview_timer = QTimer(self)
+        self._figpreview_timer.setSingleShot(True)
+        self._figpreview_timer.setInterval(120)
+        self._figpreview_timer.timeout.connect(self._refresh_figures_preview)
+        for w in (self.c_fig_theme, self.c_fig_proj_cmap, self.c_cmp_theme):
+            w.currentTextChanged.connect(
+                lambda _=None: self._figpreview_timer.start())
+        # First render after construction settles
+        QtCore.QTimer.singleShot(80, self._refresh_figures_preview)
+
+        self.tabs.addTab(tab, "Figures")
+
+    @staticmethod
+    def _figure_theme_palette(theme: str):
+        """Return (BG, PNL, TXT, GRD, ACC, font) for a theme name —
+        mirrors what make_figure() and compare_groups() do internally."""
+        if theme == "Light":
+            return ("#ffffff", "#f6f8fa", "#24292f",
+                    "#d0d7de", "#0969da", "sans-serif")
+        if theme == "Publication":
+            return ("#ffffff", "#ffffff", "#000000",
+                    "#cccccc", "#333333", "serif")
+        return ("#0d1117", "#161b22", "#e6edf3",
+                "#30363d", "#58a6ff", "monospace")
+
+    def _refresh_figures_preview(self):
+        """Render both single-sample and comparison previews in the user's
+        chosen styles and push them into their respective QLabels.  Runs
+        in-process (Agg backend) so it can't interfere with the analysis
+        subprocess."""
+        if not hasattr(self, "lbl_fig_preview_single"):
+            return
+        try:
+            import io
+            import numpy as np
+            import matplotlib
+            matplotlib.use("Agg", force=False)
+            import matplotlib.pyplot as plt
+        except Exception as exc:
+            self.lbl_fig_preview_single.setText(f"Preview unavailable: {exc}")
+            self.lbl_fig_preview_compare.setText(f"Preview unavailable: {exc}")
+            return
+
+        proj_cmap_name = self.c_fig_proj_cmap.currentText()
+
+        def _rc(theme):
+            BG, PNL, TXT, GRD, _ACC, font = self._figure_theme_palette(theme)
+            return {
+                "text.color": TXT, "axes.labelcolor": TXT,
+                "xtick.color": TXT, "ytick.color": TXT,
+                "axes.edgecolor": GRD, "axes.facecolor": PNL,
+                "grid.color": GRD, "grid.alpha": 0.4,
+                "font.family": font,
+            }
+
+        def _render(kind: str, theme: str) -> "QtGui.QPixmap | None":
+            BG, PNL, TXT, GRD, ACC, _font = self._figure_theme_palette(theme)
+            cmap_map = {"Inferno": "inferno", "Hot": "hot",
+                        "Viridis": "viridis", "Plasma": "plasma",
+                        "Greys": "Greys" if theme in ("Light", "Publication")
+                                         else "Greys_r"}
+            proj = cmap_map.get(proj_cmap_name, "inferno")
+            rng = np.random.default_rng(0 if kind == "single" else 1)
+            buf = io.BytesIO()
+            try:
+                with plt.rc_context(_rc(theme)):
+                    if kind == "comparison":
+                        fig = self._render_comparison_preview(
+                            plt, np, rng, BG, PNL, TXT, GRD)
+                    else:
+                        fig = self._render_single_sample_preview(
+                            plt, np, rng, BG, PNL, TXT, GRD, ACC, proj)
+                    fig.savefig(buf, format="png", facecolor=BG, dpi=440,
+                                bbox_inches="tight")
+                    plt.close(fig)
+            except Exception as exc:
+                return None, str(exc)
+            buf.seek(0)
+            pix = QtGui.QPixmap()
+            if not pix.loadFromData(buf.read()):
+                return None, "decode failed"
+            return pix, None
+
+        for label_widget, kind, theme in (
+                (self.lbl_fig_preview_single,
+                 "single", self.c_fig_theme.currentText()),
+                (self.lbl_fig_preview_compare,
+                 "comparison", self.c_cmp_theme.currentText())):
+            pix, err = _render(kind, theme)
+            if pix is None:
+                label_widget.setText(f"Preview render failed: {err}")
+                continue
+            # Cache raw, then scale once for the current label size.
+            self._fig_preview_pixmaps[label_widget] = pix
+            self._fit_preview_pixmap(label_widget)
+
+    def _fit_preview_pixmap(self, label: QtWidgets.QLabel) -> None:
+        """Scale the cached raw pixmap for `label` to its current size."""
+        pix = self._fig_preview_pixmaps.get(label)
+        if pix is None or pix.isNull():
+            return
+        size = label.size()
+        if size.width() <= 1 or size.height() <= 1:
+            return
+        scaled = pix.scaled(size,
+                            Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation)
+        label.setPixmap(scaled)
+
+    def eventFilter(self, obj, event):
+        # Re-scale cached preview pixmaps when their labels resize.
+        if (event.type() == QtCore.QEvent.Type.Resize
+                and isinstance(obj, QtWidgets.QLabel)
+                and hasattr(self, "_fig_preview_pixmaps")
+                and obj in self._fig_preview_pixmaps):
+            self._fit_preview_pixmap(obj)
+        return super().eventFilter(obj, event)
+
+    def _render_single_sample_preview(self, plt, np, rng,
+                                       BG, PNL, TXT, GRD, ACC, proj_cmap):
+        """Two-panel mock-up: projection + MSD curves."""
+        fig, axes = plt.subplots(1, 2, figsize=(7, 3.2),
+                                  facecolor=BG, dpi=110)
+        # Panel A — fake max projection (Gaussian blob + noise)
+        H = W = 48
+        Y, X = np.mgrid[0:H, 0:W]
+        img = (np.exp(-((X - 26)**2 + (Y - 22)**2) / 70) * 0.9
+               + np.exp(-((X - 12)**2 + (Y - 30)**2) / 30) * 0.5
+               + rng.random((H, W)) * 0.08)
+        ax = axes[0]
+        ax.set_facecolor(PNL)
+        ax.imshow(img, cmap=proj_cmap)
+        ax.set_title("  A   Max projection", color=TXT, loc="left",
+                     fontsize=10, fontweight="bold", pad=6)
+        ax.set_xticks([]); ax.set_yticks([])
+        for sp in ax.spines.values(): sp.set_edgecolor(GRD)
+
+        # Panel B — MSD-like curves for three motion classes
+        ax = axes[1]
+        ax.set_facecolor(PNL)
+        t = np.linspace(0.02, 1.0, 25)
+        for alpha, label, col in ((1.0, "Brownian", ACC),
+                                  (0.55, "Confined", "#f78166"),
+                                  (1.45, "Directed", "#56d364")):
+            msd = 0.05 * t**alpha + rng.normal(0, 0.004, t.size)
+            ax.plot(t, msd, marker="o", markersize=3, linewidth=1.4,
+                    color=col, label=label)
+        ax.set_xlabel("τ (s)", fontsize=9)
+        ax.set_ylabel("MSD (μm²)", fontsize=9)
+        ax.set_title("  B   Ensemble MSD", color=TXT, loc="left",
+                     fontsize=10, fontweight="bold", pad=6)
+        ax.tick_params(labelsize=8)
+        ax.grid(True, alpha=0.3)
+        leg = ax.legend(fontsize=8, frameon=False)
+        for txt in leg.get_texts(): txt.set_color(TXT)
+        for sp in ax.spines.values(): sp.set_edgecolor(GRD)
+        fig.tight_layout()
+        return fig
+
+    def _render_comparison_preview(self, plt, np, rng, BG, PNL, TXT, GRD):
+        """Two-panel mock-up resembling the Compare-tab figure: grouped
+        MSD lines + bar chart for two synthetic groups."""
+        fig, axes = plt.subplots(1, 2, figsize=(7, 3.2),
+                                  facecolor=BG, dpi=110)
+        groups = [("Pre",  "#3b6ed8", 1.00),
+                  ("Post", "#f78166", 0.70)]
+        # Panel 1 — MSD per group
+        ax = axes[0]
+        ax.set_facecolor(PNL)
+        t = np.linspace(0.02, 1.0, 25)
+        for label, col, scale in groups:
+            msd = 0.06 * scale * t**0.95 + rng.normal(0, 0.003, t.size)
+            ax.plot(t, msd, marker="o", markersize=3, linewidth=1.6,
+                    color=col, label=label)
+        ax.set_xlabel("τ (s)", fontsize=9)
+        ax.set_ylabel("MSD (μm²)", fontsize=9)
+        ax.set_title("  Ensemble MSD", color=TXT, loc="left",
+                     fontsize=10, fontweight="bold", pad=6)
+        ax.tick_params(labelsize=8)
+        ax.grid(True, alpha=0.3)
+        leg = ax.legend(fontsize=8, frameon=False)
+        for txt in leg.get_texts(): txt.set_color(TXT)
+        for sp in ax.spines.values(): sp.set_edgecolor(GRD)
+        # Panel 2 — mobile fraction bar chart
+        ax = axes[1]
+        ax.set_facecolor(PNL)
+        labels = [g[0] for g in groups]
+        cols   = [g[1] for g in groups]
+        vals   = [0.62, 0.41]
+        errs   = [0.04, 0.05]
+        ax.bar(labels, vals, yerr=errs, color=cols, edgecolor=GRD,
+               capsize=5, linewidth=1.0)
+        ax.set_ylim(0, 1.0)
+        ax.set_ylabel("Mobile fraction", fontsize=9)
+        ax.set_title("  Mobile fraction", color=TXT, loc="left",
+                     fontsize=10, fontweight="bold", pad=6)
+        ax.tick_params(labelsize=8)
+        ax.grid(True, axis="y", alpha=0.3)
+        for sp in ax.spines.values(): sp.set_edgecolor(GRD)
+        fig.tight_layout()
+        return fig
+
     # ── Batch helpers (Import-tab batch sub-panel) ───────────────────────
     @staticmethod
     def _looks_like_input_file(name: str) -> bool:
         n = name.lower()
         return n.endswith(".czi") or n.endswith(".tif") or n.endswith(".tiff")
+
+    @staticmethod
+    def _series_key(filename: str) -> str:
+        """Return the series key — filename stem with any trailing '(N)'
+        stripped.  Zeiss splits long recordings across files named like
+        `experiment.tif`, `experiment(1).tif`, `experiment(2).tif`, …
+        all of which belong to the same continuous time series and are
+        joined by the loader.  This function maps each of those back to
+        the common stem ('experiment'), so the batch UI can group them.
+        """
+        import re as _re
+        stem = os.path.splitext(filename)[0]
+        return _re.sub(r"\(\d+\)\s*$", "", stem).rstrip()
 
     def _on_batch_pick_folder(self):
         path = QtWidgets.QFileDialog.getExistingDirectory(
@@ -1301,40 +3414,98 @@ class MainWindow(QtWidgets.QMainWindow):
             self._batch_rescan(path)
 
     def _batch_rescan(self, folder: str):
-        """Populate the file list with .czi/.tif files in `folder`."""
+        """Populate the file list with one entry per file SERIES in `folder`.
+
+        Files of the form `name.tif` + `name(1).tif` + … are grouped into
+        a single series.  The primary (no-suffix) file is what gets added
+        to the batch list — the loader picks up the rest at run time, so
+        processing the series happens exactly once instead of N times.
+        """
+        # Disconnect itemChanged to prevent handler pile-up on repeated
+        # rescans.  Reconnect at the end.  (Without this, every rescan
+        # adds another connection, and stale clicks fire multiple
+        # summary recalcs and may interfere with check-state toggling.)
+        try:
+            self.lst_batch_files.itemChanged.disconnect()
+        except (TypeError, RuntimeError):
+            pass
+
+        self.lst_batch_files.blockSignals(True)
         self.lst_batch_files.clear()
+        # Per-series-key cache: list of (filename, full_path) sister files
+        self._batch_series_map: dict[str, list[tuple[str, str]]] = {}
+
         if not os.path.isdir(folder):
+            self.lst_batch_files.blockSignals(False)
             self._batch_update_summary()
             return
         try:
             names = sorted(os.listdir(folder))
         except OSError:
+            self.lst_batch_files.blockSignals(False)
             self._batch_update_summary()
             return
+
+        # Phase 1 — group files into series.
         for name in names:
             if not self._looks_like_input_file(name):
                 continue
             full = os.path.join(folder, name)
             if not os.path.isfile(full):
                 continue
-            item = QtWidgets.QListWidgetItem(name)
+            key = self._series_key(name)
+            self._batch_series_map.setdefault(key, []).append((name, full))
+
+        # Phase 2 — for each series, pick a representative file (the
+        # canonical no-suffix one, else alphabetically first) and add ONE
+        # list item per series.
+        for key in sorted(self._batch_series_map.keys()):
+            sisters = sorted(self._batch_series_map[key])
+            primary_name, primary_full = sisters[0]
+            for nm, pth in sisters:
+                bare_stem = os.path.splitext(nm)[0]
+                if bare_stem == key:
+                    primary_name, primary_full = nm, pth
+                    break
+            n = len(sisters)
+            label = primary_name if n == 1 else f"{primary_name}   × {n} files"
+            item = QtWidgets.QListWidgetItem(label)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Checked)
-            item.setData(Qt.ItemDataRole.UserRole, full)
+            item.setData(Qt.ItemDataRole.UserRole, primary_full)
+            # Cache the series count on the item for ROI-marker decoration
+            item.setData(Qt.ItemDataRole.UserRole + 1, n)
             self.lst_batch_files.addItem(item)
+
+        self.lst_batch_files.blockSignals(False)
         self.lst_batch_files.itemChanged.connect(
             lambda _: self._batch_update_summary())
         self._batch_update_summary()
+        # Mark series that already have a saved polygon ROI
+        self._refresh_batch_roi_markers()
 
     def _batch_iter_items(self):
         for i in range(self.lst_batch_files.count()):
             yield self.lst_batch_files.item(i)
 
     def _batch_update_summary(self):
-        total = self.lst_batch_files.count()
-        sel   = sum(1 for it in self._batch_iter_items()
-                    if it.checkState() == Qt.CheckState.Checked)
-        self.lbl_batch_summary.setText(f"{total} files / {sel} selected")
+        n_series      = self.lst_batch_files.count()
+        n_sel_series  = sum(1 for it in self._batch_iter_items()
+                            if it.checkState() == Qt.CheckState.Checked)
+        n_total_files = sum(
+            int(it.data(Qt.ItemDataRole.UserRole + 1) or 1)
+            for it in self._batch_iter_items())
+        n_sel_files = sum(
+            int(it.data(Qt.ItemDataRole.UserRole + 1) or 1)
+            for it in self._batch_iter_items()
+            if it.checkState() == Qt.CheckState.Checked)
+        if n_total_files == n_series:
+            self.lbl_batch_summary.setText(
+                f"{n_series} series / {n_sel_series} selected")
+        else:
+            self.lbl_batch_summary.setText(
+                f"{n_series} series ({n_total_files} files total) / "
+                f"{n_sel_series} selected ({n_sel_files} files)")
         # Show the user where the per-file outputs will land
         folder = self.e_batch_folder.text().strip()
         if folder:
@@ -1363,9 +3534,253 @@ class MainWindow(QtWidgets.QMainWindow):
                 for it in self._batch_iter_items()
                 if it.checkState() == Qt.CheckState.Checked]
 
+    # ── Embedded ROI viewer (Import tab) ─────────────────────────────────
+    def _roi_embedded_load_current_file(self):
+        """Load whichever file is currently 'active' into the embedded
+        ROI viewer.  In single mode that's `e_file`; in batch mode it's
+        the currently-highlighted item in the file list."""
+        if not hasattr(self, "_roi_viewer"):
+            return
+        path = ""
+        if self.r_mode_batch.isChecked():
+            it = self.lst_batch_files.currentItem()
+            if it is not None:
+                path = it.data(Qt.ItemDataRole.UserRole) or ""
+        else:
+            path = self.e_file.text().strip()
+        if path and os.path.isfile(path):
+            existing = self._roi_polygons.get(os.path.abspath(path))
+            self._roi_viewer.set_file(path, current_polygons=existing)
+            # Always push current parameters and turn the live overlay on —
+            # the viewer is the only detection-preview surface now, so it
+            # may as well be on whenever a file is loaded.
+            self._push_detection_preview_params()
+            self._push_roi_mask_params()
+            self._roi_viewer.enable_detection_preview(True)
+        else:
+            self._roi_viewer.set_file("", None)
+
+    def _push_roi_mask_params(self):
+        """Forward the current ROI-mode settings to the embedded viewer
+        so its auto/manual-threshold overlay reflects the sidebar in real
+        time."""
+        if not hasattr(self, "_roi_viewer"):
+            return
+        try:
+            mode = self.c_roi_mode.currentText()
+            method = self.c_roi_auto_method.currentText().lower()  # otsu/li/triangle/mean
+            threshold = float(self.s_roi_threshold.value())
+            mask_mode = self.c_roi_mask_mode.currentText().lower()  # mean/sum
+            self._roi_viewer.set_roi_mask_params(
+                mode=mode, auto_method=method,
+                threshold=threshold, mask_mode=mask_mode)
+        except Exception:
+            pass
+
+    def _push_detection_preview_params(self):
+        """Forward the current diameter / minmass / bg settings to the
+        embedded viewer.  Bg settings matter because the pipeline runs
+        detection on background-subtracted, renormalised frames — the
+        preview must do the same or the mass scale won't match."""
+        if not hasattr(self, "_roi_viewer"):
+            return
+        bg_method_map = {"Uniform Filter": "uniform_filter",
+                         "Rolling Ball":   "rolling_ball"}
+        try:
+            self._roi_viewer.set_detection_params(
+                diameter=int(self.s_diameter.value()),
+                minmass=float(self.s_minmass.value()),
+                bg_method=bg_method_map.get(
+                    self.c_bg_method.currentText(), "uniform_filter"),
+                bg_radius=int(self.s_bg_radius.value()),
+            )
+        except Exception:
+            pass
+
+    def _on_roi_polygons_changed(self, file_path: str, polys: list):
+        """The embedded viewer emits this whenever the user adds/edits/
+        removes a polygon.  Auto-persist to QSettings."""
+        if not file_path:
+            return
+        key = os.path.abspath(file_path)
+        if polys:
+            self._roi_polygons[key] = polys
+        else:
+            self._roi_polygons.pop(key, None)
+        self._save_roi_polygons()
+        # Refresh status indicators
+        self._refresh_single_roi_status()
+        self._refresh_batch_roi_markers()
+
+    # ── ROI mode enabled-state + embedded viewer visibility ───────────────
+    def _on_roi_mode_changed(self, text: str):
+        """Grey out threshold/projection controls that don't apply to the
+        active mode and push the mask overlay to the viewer."""
+        is_auto    = text == "Auto threshold"
+        is_manual  = text == "Manual threshold"
+
+        # Auto method only meaningful when in Auto-threshold mode
+        try: self.c_roi_auto_method.setEnabled(is_auto)
+        except AttributeError: pass
+        # Manual threshold spinbox only used in Manual-threshold mode
+        try: self.s_roi_threshold.setEnabled(is_manual)
+        except AttributeError: pass
+        try: self.sld_roi_threshold.setEnabled(is_manual)
+        except AttributeError: pass
+        # Projection (mean vs sum) is irrelevant in polygon mode (we use
+        # a sample mean for the preview regardless) and in None mode.
+        try: self.c_roi_mask_mode.setEnabled(is_auto or is_manual)
+        except AttributeError: pass
+
+        self._push_roi_mask_params()
+
+    # ── Per-file ROI editor ────────────────────────────────────────────────
+    _ROI_MARKER = "  ◉"
+
+    def _decorate_filename_with_roi(self, name: str, has_roi: bool) -> str:
+        """Add/remove the ◉ marker on a batch file-list item name."""
+        base = name[:-len(self._ROI_MARKER)] \
+               if name.endswith(self._ROI_MARKER) else name
+        return f"{base}{self._ROI_MARKER}" if has_roi else base
+
+    def _refresh_batch_roi_markers(self):
+        """Walk the batch file list and refresh ◉ markers based on whether
+        each item's primary file has a saved polygon ROI.
+
+        Wrapped in blockSignals so the resulting `itemChanged` flurry
+        doesn't re-trigger handlers (which can interfere with the user's
+        in-progress check-state toggles)."""
+        if not hasattr(self, "lst_batch_files"):
+            return
+        self.lst_batch_files.blockSignals(True)
+        try:
+            for it in self._batch_iter_items():
+                path = it.data(Qt.ItemDataRole.UserRole)
+                if not path:
+                    continue
+                has_roi = bool(self._roi_polygons.get(os.path.abspath(path)))
+                new_text = self._decorate_filename_with_roi(
+                    it.text(), has_roi)
+                if new_text != it.text():
+                    it.setText(new_text)
+        finally:
+            self.lst_batch_files.blockSignals(False)
+
+    def _refresh_single_roi_status(self):
+        """Update the single-file ROI status label."""
+        path = self.e_file.text().strip()
+        if not path:
+            self.lbl_single_roi_status.setText("Pick an input file first")
+        elif self._roi_polygons.get(os.path.abspath(path)):
+            n = len(self._roi_polygons[os.path.abspath(path)])
+            self.lbl_single_roi_status.setText(
+                f"✓ Custom polygon ROI saved ({n} shape{'s' if n != 1 else ''})")
+            self.lbl_single_roi_status.setStyleSheet(
+                f"color: {_THEME['SUCCESS']};")
+        else:
+            self.lbl_single_roi_status.setText("No custom ROI for this file")
+            self.lbl_single_roi_status.setStyleSheet(
+                f"color: {_THEME['TXT_MUTED']};")
+
+    def _open_roi_dialog(self, file_path: str) -> bool:
+        """Open the ROI editor for `file_path`.  Returns True if the user
+        saved (including saving an empty / cleared polygon), False on
+        Cancel."""
+        if not os.path.isfile(file_path):
+            QtWidgets.QMessageBox.warning(
+                self, "ROI editor", f"File not found:\n{file_path}")
+            return False
+        existing = self._roi_polygons.get(os.path.abspath(file_path))
+        dlg = _RoiDialog(file_path, current_polygons=existing, parent=self)
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return False
+        polys = dlg.result_polygons()
+        key = os.path.abspath(file_path)
+        if polys:
+            self._roi_polygons[key] = polys
+        else:
+            self._roi_polygons.pop(key, None)
+        self._save_roi_polygons()
+        return True
+
+    def _on_single_set_roi(self):
+        path = self.e_file.text().strip()
+        if not path or not os.path.isfile(path):
+            QtWidgets.QMessageBox.warning(
+                self, "ROI editor",
+                "Pick an input file first on the Import tab.")
+            return
+        if self._open_roi_dialog(path):
+            self._refresh_single_roi_status()
+
+    def _on_batch_set_roi(self):
+        # Use the highlighted item (currentRow), not the checked ones,
+        # so the user can edit ROIs without changing what's selected
+        # for processing.
+        it = self.lst_batch_files.currentItem()
+        if it is None:
+            QtWidgets.QMessageBox.warning(
+                self, "ROI editor",
+                "Click a file in the list to highlight it, then click "
+                "Set ROI… again.")
+            return
+        path = it.data(Qt.ItemDataRole.UserRole)
+        if self._open_roi_dialog(path):
+            self._refresh_batch_roi_markers()
+
+    def _on_batch_clear_roi(self):
+        it = self.lst_batch_files.currentItem()
+        if it is None:
+            return
+        path = it.data(Qt.ItemDataRole.UserRole)
+        key = os.path.abspath(path) if path else None
+        if key and key in self._roi_polygons:
+            del self._roi_polygons[key]
+            self._save_roi_polygons()
+            self._refresh_batch_roi_markers()
+
+    def _save_roi_polygons(self):
+        """Persist all per-file ROIs to QSettings as a JSON blob."""
+        try:
+            import json
+            payload = {k: v for k, v in self._roi_polygons.items()}
+            self._settings.setValue("roi/polygons", json.dumps(payload))
+        except Exception:
+            pass
+
+    def _load_roi_polygons(self):
+        """Load all saved per-file ROIs from QSettings."""
+        try:
+            import json
+            raw = self._settings.value("roi/polygons", type=str)
+            if raw:
+                data = json.loads(raw)
+                # Vertices come back as lists-of-lists; that's fine
+                self._roi_polygons = {k: v for k, v in data.items()
+                                       if isinstance(v, list) and v}
+        except Exception:
+            self._roi_polygons = {}
+
     # ══════════════════════════════════════════════════════════════════════
     #  COMPARE TAB
     # ══════════════════════════════════════════════════════════════════════
+    SINGLE_PANELS = [
+        ("A", "Max projection"),
+        ("B", "Trajectories"),
+        ("C", "Trajectories by D"),
+        ("D", "MSD curves"),
+        ("E", "Diffusion coefficient distribution"),
+        ("F", "Motion classification"),
+        ("G", "α (anomalous exponent) distribution"),
+        ("H", "Position density map"),
+        ("I", "Turning-angle distribution"),
+        ("J", "Mobile fraction over time"),
+        ("K", "Jump-distance distribution"),
+        ("L", "Cluster map (DBSCAN)"),
+        ("M", "Dwell-time distribution"),
+        ("N", "Moment-scaling spectrum"),
+        ("O", "Radial distribution"),
+    ]
     COMPARE_PANELS = [
         ("msd",            "Ensemble MSD"),
         ("auc",            "MSD AUC bars"),
@@ -1410,28 +3825,15 @@ class MainWindow(QtWidgets.QMainWindow):
             "stats.csv, report.pdf).")
         sg.addWidget(self.e_cmp_stem, 1, 1, 1, 2)
 
-        sg.addWidget(QtWidgets.QLabel("Figure theme"), 2, 0)
-        self.c_cmp_theme = QtWidgets.QComboBox()
-        self.c_cmp_theme.addItems(["Dark", "Light", "Publication"])
-        sg.addWidget(self.c_cmp_theme, 2, 1, 1, 2)
-
-        self.c_cmp_pdf = QtWidgets.QCheckBox(
-            "Generate multi-page PDF report (figure + parameters + stats)")
-        self.c_cmp_pdf.setChecked(True)
-        sg.addWidget(self.c_cmp_pdf, 3, 0, 1, 3)
+        # Pointer to where style settings now live
+        style_hint = QtWidgets.QLabel(
+            "<i>Figure theme, panel selection and PDF report toggle now "
+            "live on the <b>Figures</b> tab.</i>")
+        style_hint.setTextFormat(Qt.TextFormat.RichText)
+        style_hint.setStyleSheet(f"color: {_THEME['TXT_MUTED']};")
+        sg.addWidget(style_hint, 2, 0, 1, 3)
 
         v.addWidget(settings)
-
-        # ── Panel selector ────────────────────────────────────────────────
-        panels_grp = QtWidgets.QGroupBox("Panels to include")
-        pg = QtWidgets.QGridLayout(panels_grp)
-        self._cmp_panel_checkboxes: dict[str, QtWidgets.QCheckBox] = {}
-        for i, (key, label) in enumerate(self.COMPARE_PANELS):
-            cb = QtWidgets.QCheckBox(label)
-            cb.setChecked(True)
-            self._cmp_panel_checkboxes[key] = cb
-            pg.addWidget(cb, i // 2, i % 2)
-        v.addWidget(panels_grp)
 
         # ── Group cards (scrollable) ──────────────────────────────────────
         groups_area_label = QtWidgets.QLabel(
@@ -1467,22 +3869,19 @@ class MainWindow(QtWidgets.QMainWindow):
         actions.addWidget(self.btn_cmp_run)
         v.addLayout(actions)
 
-        # ── Stage label + progress bar + figure ───────────────────────────
-        self.cmp_stage_label = QtWidgets.QLabel("Idle")
-        self.cmp_stage_label.setStyleSheet(
-            f"color: {_THEME['TXT_MUTED']}; font-weight: 600; padding: 2px 0;")
-        v.addWidget(self.cmp_stage_label)
-
-        self.cmp_progress = QtWidgets.QProgressBar()
-        self.cmp_progress.setRange(0, 100); self.cmp_progress.setValue(0)
-        self.cmp_progress.setFormat("Ready")
-        v.addWidget(self.cmp_progress)
-
-        # Results panel (figure is saved to disk only — view it externally
-        # or in the Workspace tab if you want to overlay tracks).
-        self.cmp_results = _ResultsPanel(
-            "Comparison results will appear here after generation.")
-        v.addWidget(self.cmp_results, stretch=2)
+        # The status widgets (stage label, progress bar, results panel)
+        # used to live below the action row, but they were visually noisy
+        # for a tab that mostly just configures + kicks off the comparison.
+        # They're still constructed and parented to the tab so the rest of
+        # the run-machinery can call .setText / .setValue / .reset on them
+        # — but they're hidden so they don't show in the UI.  Progress is
+        # surfaced via the status bar instead.
+        self.cmp_stage_label = QtWidgets.QLabel("Idle", tab)
+        self.cmp_progress    = QtWidgets.QProgressBar(tab)
+        self.cmp_progress.setRange(0, 100)
+        self.cmp_results     = _ResultsPanel("", parent=tab)
+        for w in (self.cmp_stage_label, self.cmp_progress, self.cmp_results):
+            w.hide()
 
         self.tabs.addTab(tab, "Compare")
 
@@ -1594,7 +3993,20 @@ class MainWindow(QtWidgets.QMainWindow):
             "color: #888; padding: 40px; font-size: 13px;")
         self._ws_container_layout.addWidget(self._ws_placeholder)
 
-        v.addWidget(self._ws_container, stretch=1)
+        # ── Inspector panel (right side, populated on track click) ───────
+        self._ws_inspector = _TrackInspector()
+        # Per-run state for click→stats lookup
+        self._ws_tracks_df: "pd.DataFrame | None" = None
+        self._ws_diff_df:   "pd.DataFrame | None" = None
+        self._ws_tracks_layer = None
+
+        split = QtWidgets.QSplitter(Qt.Orientation.Horizontal)
+        split.addWidget(self._ws_container)
+        split.addWidget(self._ws_inspector)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 1)
+        split.setSizes([1000, 320])
+        v.addWidget(split, stretch=1)
 
         self.tabs.addTab(tab, "Visualise")
 
@@ -1709,11 +4121,14 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._ws_load_tracks_path(path)
 
-    def _ws_load_tracks_path(self, csv_path: str):
+    def _ws_load_tracks_path(self, csv_path: str,
+                              diff_csv_path: "str | None" = None):
         """Read a trajectories CSV and add as a napari Tracks layer.
 
         FIREFLY's trajectories.csv has columns particle, frame, x, y.
-        napari Tracks expects (track_id, t, [z,] y, x) per row.
+        napari Tracks expects (track_id, t, [z,] y, x) per row.  If a
+        diffusion-summary CSV is also supplied, the tracks are coloured
+        by motion class and stored on `self` for click→stats lookup.
         """
         v = self._ws_viewer_or_warn()
         if v is None:
@@ -1726,16 +4141,166 @@ class MainWindow(QtWidgets.QMainWindow):
             if missing:
                 raise ValueError(
                     f"CSV is missing required columns: {sorted(missing)}")
+
+            # Optional sidecar — diffusion summary keyed by particle id
+            diff_df = None
+            if diff_csv_path and os.path.isfile(diff_csv_path):
+                try:    diff_df = pd.read_csv(diff_csv_path)
+                except Exception: diff_df = None
+            else:
+                # Auto-detect: same folder, <prefix>_diffusion_summary.csv
+                guess = csv_path.replace("_trajectories.csv",
+                                          "_diffusion_summary.csv")
+                if guess != csv_path and os.path.isfile(guess):
+                    try:    diff_df = pd.read_csv(guess)
+                    except Exception: diff_df = None
+
             data = df[["particle", "frame", "y", "x"]].values.astype(float)
-            v.add_tracks(data, name=os.path.basename(csv_path),
-                         blending="opaque")
+
+            # Per-track features so we can colour by motion class if available
+            features = None
+            color_by = None
+            if diff_df is not None and "motion" in diff_df.columns:
+                motion_to_int = {"Immobile": 0, "Confined": 1,
+                                 "Brownian": 2, "Directed": 3,
+                                 "Unknown":  4}
+                motion_map = dict(zip(diff_df["particle"],
+                                      diff_df["motion"]))
+                # napari Tracks features are indexed by the rows of `data`
+                col = [motion_to_int.get(motion_map.get(int(pid), "Unknown"), 4)
+                       for pid in df["particle"].values]
+                features = {"motion_int": col}
+                color_by = "motion_int"
+
+            layer = v.add_tracks(
+                data, name=os.path.basename(csv_path),
+                blending="opaque",
+                **({"features": features, "color_by": color_by,
+                    "colormap": "turbo"} if features is not None else {}))
+
+            # Cache for the click handler
+            self._ws_tracks_df    = df
+            self._ws_diff_df      = diff_df
+            self._ws_tracks_layer = layer
+            self._attach_track_click_handler(layer)
+            self._ws_inspector.clear()
+
             self.statusBar().showMessage(
                 f"Loaded {df['particle'].nunique():,} tracks "
-                f"({len(df):,} points) into napari", 5000)
+                f"({len(df):,} points) into napari — "
+                "click a track to inspect.", 6000)
         except Exception as exc:
             QtWidgets.QMessageBox.critical(
                 self, "Load failed",
                 f"Couldn't load tracks from {os.path.basename(csv_path)}:\n\n{exc}")
+
+    def _attach_track_click_handler(self, layer):
+        """Hook a mouse-drag callback onto the Tracks layer so clicking a
+        track populates the inspector panel.  Idempotent — replaces any
+        previous handler on the same layer."""
+        if layer is None:
+            return
+        try:
+            # Wipe previous callbacks we attached
+            keep = [cb for cb in layer.mouse_drag_callbacks
+                    if getattr(cb, "_firefly_inspector", False) is False]
+            layer.mouse_drag_callbacks.clear()
+            for cb in keep:
+                layer.mouse_drag_callbacks.append(cb)
+        except Exception:
+            pass
+
+        def _on_click(_layer, event):
+            if event.type != "mouse_press":
+                return
+            try:
+                pid = self._track_id_at(event.position)
+            except Exception:
+                pid = None
+            if pid is None:
+                return
+            self._show_track_in_inspector(int(pid))
+        _on_click._firefly_inspector = True
+        try:
+            layer.mouse_drag_callbacks.append(_on_click)
+        except Exception:
+            pass
+
+    def _track_id_at(self, world_pos) -> "int | None":
+        """Return the particle id of the track closest to `world_pos`
+        in the current frame, or None if nothing is within reach."""
+        if self._ws_tracks_df is None:
+            return None
+        import numpy as _np
+        # world_pos is (t, y, x) for a Tracks layer
+        if len(world_pos) < 3:
+            return None
+        t = int(round(float(world_pos[0])))
+        y = float(world_pos[-2])
+        x = float(world_pos[-1])
+        df = self._ws_tracks_df
+        # Same-frame slice; fall back to ±1 frame so the user has some grace
+        slc = df[df["frame"] == t]
+        if slc.empty:
+            slc = df[(df["frame"] >= t - 1) & (df["frame"] <= t + 1)]
+        if slc.empty:
+            return None
+        d2 = (slc["x"].values - x) ** 2 + (slc["y"].values - y) ** 2
+        # Pixel threshold — generous so loose clicks still hit
+        idx = int(_np.argmin(d2))
+        if d2[idx] > 64.0:    # > 8 px from any point on this frame
+            return None
+        return int(slc["particle"].values[idx])
+
+    def _show_track_in_inspector(self, particle_id: int):
+        """Look up per-particle stats and push into the inspector panel."""
+        if self._ws_tracks_df is None:
+            return
+        df = self._ws_tracks_df
+        rows = df[df["particle"] == particle_id]
+        if rows.empty:
+            return
+        kwargs: dict = {"particle_id": particle_id}
+        kwargs["length"] = int(len(rows))
+        kwargs["start_frame"] = int(rows["frame"].min())
+        kwargs["end_frame"]   = int(rows["frame"].max())
+        # Net displacement + path length in PIXELS — convert to µm if we
+        # know the pixel size (overridden in the sidebar or 1.0 fallback).
+        try:
+            px = (float(self.s_pixel_size.value())
+                  if self.c_override_px.isChecked() else 1.0)
+        except AttributeError:
+            px = 1.0
+        try:
+            import numpy as _np
+            xs = rows["x"].values; ys = rows["y"].values
+            if len(xs) >= 2:
+                net = float(_np.hypot(xs[-1] - xs[0], ys[-1] - ys[0])) * px
+                seg = _np.hypot(_np.diff(xs), _np.diff(ys)).sum() * px
+                kwargs["net_displacement_um"] = net
+                kwargs["total_path_um"]       = float(seg)
+                if seg > 0:
+                    kwargs["straightness"] = net / float(seg)
+        except Exception:
+            pass
+        if "mass" in rows.columns:
+            try:    kwargs["mean_mass"] = float(rows["mass"].mean())
+            except Exception: pass
+        # Diff-summary lookups
+        diff = self._ws_diff_df
+        if diff is not None and "particle" in diff.columns:
+            d_row = diff[diff["particle"] == particle_id]
+            if not d_row.empty:
+                r = d_row.iloc[0]
+                if "D" in d_row.columns:
+                    try:    kwargs["d"] = float(r["D"])
+                    except Exception: pass
+                if "alpha" in d_row.columns:
+                    try:    kwargs["alpha"] = float(r["alpha"])
+                    except Exception: pass
+                if "motion" in d_row.columns:
+                    kwargs["motion"] = str(r["motion"])
+        self._ws_inspector.show_track(**kwargs)
 
     def _ws_on_load_run(self):
         v = self._ws_viewer_or_warn()
@@ -1795,7 +4360,11 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 self.statusBar().showMessage(
                     "Tracks loaded; original input stack not found.", 5000)
-            self._ws_load_tracks_path(tracks_path)
+            diff_path = os.path.join(extras_dir,
+                                       f"{stem}_diffusion_summary.csv")
+            self._ws_load_tracks_path(
+                tracks_path,
+                diff_csv_path=diff_path if os.path.isfile(diff_path) else None)
         except Exception as exc:
             QtWidgets.QMessageBox.critical(
                 self, "Load failed",
@@ -1900,6 +4469,13 @@ class MainWindow(QtWidgets.QMainWindow):
             ("analysis/workers",         self.s_workers,         "spin",  int),
             ("analysis/chunk_size",      self.s_chunk_size,      "spin",  int),
 
+            # ── Figures tab ───────────────────────────────────────────────
+            ("figures/theme",            self.c_fig_theme,       "combo"),
+            ("figures/proj_cmap",        self.c_fig_proj_cmap,   "combo"),
+            ("figures/dpi",              self.s_fig_dpi,         "spin",  int),
+            ("figures/save_pdf",         self.c_fig_save_pdf,    "check", _bool_cast),
+            ("figures/per_panel",        self.c_fig_per_panel,   "check", _bool_cast),
+
             # ── Compare tab ───────────────────────────────────────────────
             ("compare/outdir",           self.e_cmp_outdir,      "text"),
             ("compare/stem",             self.e_cmp_stem,        "text"),
@@ -1921,8 +4497,20 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+        # Path entries are deliberately NOT restored — every launch starts
+        # with empty file / folder fields so the user always picks fresh
+        # inputs.  Clear any previously-saved values from the QSettings
+        # store too, so they don't linger on disk.
+        _skip_paths = {"analysis/file", "analysis/outdir",
+                       "analysis/batch_folder"}
+        for _k in _skip_paths:
+            try: s.remove(_k)
+            except Exception: pass
+
         for spec in self._setting_specs():
             key, widget, kind = spec[0], spec[1], spec[2]
+            if key in _skip_paths:
+                continue
             try:
                 v = s.value(key)
                 if v is None or v == "":
@@ -1930,8 +4518,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 if kind == "text":
                     widget.setText(str(v))
                 elif kind == "combo":
-                    if str(v) in [widget.itemText(i) for i in range(widget.count())]:
-                        widget.setCurrentText(str(v))
+                    v_str = str(v)
+                    items = [widget.itemText(i)
+                             for i in range(widget.count())]
+                    if v_str in items:
+                        widget.setCurrentText(v_str)
+                    # Migration: old saved backend values were stored as
+                    # internal strings ("torch-mps") but the combo now
+                    # shows labels ("Torch — Apple MPS").  Translate if
+                    # this widget is the backend combo and the saved
+                    # value is a recognised internal value.
+                    elif widget is getattr(self, "c_backend", None):
+                        lbl = self._BACKEND_VALUE_TO_LABEL.get(v_str)
+                        if lbl and lbl in items:
+                            widget.setCurrentText(lbl)
                 elif kind == "spin":
                     caster = spec[3]
                     widget.setValue(caster(v))
@@ -1997,6 +4597,15 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+        # Single-sample panel checkbox states (Figures tab)
+        try:
+            for key, cb in self._single_panel_checkboxes.items():
+                v = s.value(f"figures/single_panel_{key}")
+                if v is not None:
+                    cb.setChecked(_bool_cast(v))
+        except Exception:
+            pass
+
     def _save_settings(self):
         """Write current selections to QSettings.  Called when starting a
         run and on window close."""
@@ -2006,8 +4615,13 @@ class MainWindow(QtWidgets.QMainWindow):
             s.setValue("window/geometry", self.saveGeometry())
         except Exception:
             pass
+        # Path entries are intentionally not persisted — see _restore_settings.
+        _skip_paths = {"analysis/file", "analysis/outdir",
+                       "analysis/batch_folder"}
         for spec in self._setting_specs():
             key, widget, kind = spec[0], spec[1], spec[2]
+            if key in _skip_paths:
+                continue
             try:
                 if kind == "text":
                     s.setValue(key, widget.text())
@@ -2035,6 +4649,13 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+        # Single-sample panel checkbox states (Figures tab)
+        try:
+            for key, cb in self._single_panel_checkboxes.items():
+                s.setValue(f"figures/single_panel_{key}", bool(cb.isChecked()))
+        except Exception:
+            pass
+
     def closeEvent(self, event):
         """Persist state on close and tear down any running subprocess."""
         try:
@@ -2056,25 +4677,44 @@ class MainWindow(QtWidgets.QMainWindow):
         super().closeEvent(event)
 
     # ── Backend availability helper ───────────────────────────────────────
+    # Two-way mapping between GUI labels and internal backend strings.
+    # The pipeline's `_resolve_backend` understands the hyphenated forms
+    # (auto / trackpy / torch / torch-mps / torch-cuda / torch-cpu); the
+    # GUI shows them as proper grammar so users don't see lowercase
+    # snake-case-y identifiers in their face.
+    _BACKEND_LABEL_TO_VALUE = {
+        "Auto":               "auto",
+        "Trackpy (CPU)":      "trackpy",
+        "Torch (auto)":       "torch",
+        "Torch — Apple MPS":  "torch-mps",
+        "Torch — NVIDIA CUDA": "torch-cuda",
+        "Torch — CPU":        "torch-cpu",
+    }
+    _BACKEND_VALUE_TO_LABEL = {v: k for k, v in _BACKEND_LABEL_TO_VALUE.items()}
+
     def _available_backends(self) -> list[str]:
-        """Return the static list of selectable backends.
+        """Return the static list of selectable backend LABELS (display
+        strings) for the dropdown.  Internal values are resolved via
+        `_backend_value_from_label` before being sent to the worker.
 
-        IMPORTANT: we deliberately do NOT probe torch here.  On some macOS /
-        PyTorch / Apple-Silicon combinations (e.g. macOS 26 + M4 + PyTorch
-        2.12.0), just importing torch and calling
-        `torch.backends.mps.is_available()` is enough to trigger noisy MPS
-        command-buffer errors on stderr and, in the worst case, kill the
-        process before the GUI is fully up.
-
-        The fix is to keep the dropdown population torch-free: show every
-        backend the user might want, then probe each one lazily inside the
-        analysis worker only when actually selected.  Unsupported
-        selections (e.g. `torch-cuda` on a Mac) raise a clean
-        RuntimeError at run time with an actionable message, which the
-        crash-report dialog surfaces — way better UX than a launch abort.
+        IMPORTANT: we deliberately do NOT probe torch here.  On some macOS
+        / PyTorch / Apple-Silicon combinations, just importing torch and
+        calling `torch.backends.mps.is_available()` is enough to trigger
+        noisy MPS command-buffer errors on stderr and, in the worst case,
+        kill the process before the GUI is fully up.  Probing happens
+        lazily inside the analysis worker only when actually selected.
         """
-        return ["auto", "trackpy", "torch",
-                "torch-mps", "torch-cuda", "torch-cpu"]
+        return list(self._BACKEND_LABEL_TO_VALUE.keys())
+
+    def _backend_value_from_label(self, label: str) -> str:
+        """Translate a dropdown label to the internal pipeline string.
+        Falls through to the label itself so old saved-settings values
+        (`torch-mps` etc.) still work after upgrading."""
+        if label in self._BACKEND_LABEL_TO_VALUE:
+            return self._BACKEND_LABEL_TO_VALUE[label]
+        if label in self._BACKEND_VALUE_TO_LABEL:
+            return label   # already an internal value
+        return label or "auto"
 
     # ── Event handlers ────────────────────────────────────────────────────
     def _on_browse_file(self):
@@ -2091,6 +4731,41 @@ class MainWindow(QtWidgets.QMainWindow):
             self, "Select output folder", os.path.expanduser("~"))
         if path:
             self.e_outdir.setText(path)
+
+    def _on_load_manifest(self):
+        """Open a `<stem>_run_manifest.json` and apply its widget_state
+        snapshot to the sidebar, plus repopulate the input/output paths."""
+        import json
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Open run manifest",
+            self.e_outdir.text() or os.path.expanduser("~"),
+            "Manifest (*_run_manifest.json);;JSON (*.json);;All files (*)")
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                manifest = json.load(fh)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self, "Couldn't load manifest", str(exc))
+            return
+        # Apply widget snapshot (most important)
+        state = manifest.get("widget_state") or {}
+        self._apply_widget_state(state)
+        # Path fields: try the original input path; if missing, leave alone
+        inp = (manifest.get("input") or {}).get("path", "") or ""
+        if inp and os.path.isfile(inp):
+            self.e_file.setText(inp)
+        # Output folder
+        outd = manifest.get("output_dir", "")
+        if outd:
+            self.e_outdir.setText(outd)
+        # Status feedback
+        v = manifest.get("firefly_version", "?")
+        when = manifest.get("created_at", "?")
+        self.statusBar().showMessage(
+            f"Loaded manifest from {os.path.basename(path)}  "
+            f"(FIREFLY {v}, {when})", 8000)
 
     # ── Params builder (shared by single-file and batch) ──────────────────
     def _build_params_for_file(self, fpath: str, out_dir: str | None) -> dict:
@@ -2109,6 +4784,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "None":              "none",
             "Auto threshold":    "auto",
             "Manual threshold":  "manual",
+            "Manual polygon":    "polygon",
         }
         max_tl = int(self.s_max_track_len.value())
         return {
@@ -2145,14 +4821,105 @@ class MainWindow(QtWidgets.QMainWindow):
             "roi_auto_method":   self.c_roi_auto_method.currentText(),
             "roi_threshold":     float(self.s_roi_threshold.value()),
             "roi_mask_mode":     self.c_roi_mask_mode.currentText(),
+            # Per-file polygon ROI lookup.  If this file has a saved
+            # polygon, it's sent regardless of the ROI-mode setting and
+            # the worker treats it as if mode were "polygon".  Files
+            # without a saved polygon fall back to the global ROI mode.
+            "roi_polygon":       self._roi_polygons.get(
+                                    os.path.abspath(fpath)) or None,
             "drift_correct":     bool(self.c_drift_correct.isChecked()),
             "drift_segment":     int(self.s_drift_segment.value()),
             "cluster_eps_nm":      float(self.s_cluster_eps_nm.value()),
             "cluster_min_samples": int(self.s_cluster_min_samples.value()),
-            "backend":           self.c_backend.currentText(),
+            "backend":           self._backend_value_from_label(
+                                    self.c_backend.currentText()),
             "workers":           int(self.s_workers.value()),
             "chunk_size":        int(self.s_chunk_size.value()),
+            # ── Figures-tab knobs (single-sample figure output) ───────────
+            "fig_theme":         self.c_fig_theme.currentText(),
+            "fig_proj_cmap":     self.c_fig_proj_cmap.currentText(),
+            "fig_dpi":           int(self.s_fig_dpi.value()),
+            "fig_save_pdf":      bool(self.c_fig_save_pdf.isChecked()),
+            "fig_per_panel":     bool(self.c_fig_per_panel.isChecked()),
+            "fig_single_panels": [k for k, cb in
+                                  self._single_panel_checkboxes.items()
+                                  if cb.isChecked()],
+            # Full widget-state snapshot — written into the run manifest
+            # so the run can be exactly replayed later via "Load manifest…"
+            "widget_state":      self._widget_state_dict(),
         }
+
+    def _widget_state_dict(self) -> dict:
+        """Return the current sidebar widget values keyed by their QSettings
+        path (e.g. 'analysis/diameter').  Mirrors `_save_settings` but
+        in-memory so we can embed it in run manifests."""
+        out: dict = {}
+        for spec in self._setting_specs():
+            key, widget, kind = spec[0], spec[1], spec[2]
+            try:
+                if   kind == "text":  out[key] = widget.text()
+                elif kind == "combo": out[key] = widget.currentText()
+                elif kind == "spin":  out[key] = widget.value()
+                elif kind == "check": out[key] = bool(widget.isChecked())
+            except Exception:
+                pass
+        # Panel-checkbox selections (single + compare) too
+        try:
+            out["figures/single_panels"] = [
+                k for k, cb in self._single_panel_checkboxes.items()
+                if cb.isChecked()]
+        except AttributeError: pass
+        try:
+            out["compare/panels"] = [
+                k for k, cb in self._cmp_panel_checkboxes.items()
+                if cb.isChecked()]
+        except AttributeError: pass
+        return out
+
+    def _apply_widget_state(self, state: dict) -> None:
+        """Push a widget-state dict (produced by `_widget_state_dict`) back
+        into the sidebar widgets.  Used by the manifest 'Replay' button."""
+        if not isinstance(state, dict):
+            return
+        # Cast helpers (mirror _restore_settings)
+        def _bool_cast(v):
+            if isinstance(v, bool): return v
+            if isinstance(v, str):  return v.lower() in ("1", "true", "yes")
+            return bool(v)
+        for spec in self._setting_specs():
+            key, widget, kind = spec[0], spec[1], spec[2]
+            if key not in state:
+                continue
+            v = state[key]
+            try:
+                if kind == "text":
+                    widget.setText(str(v))
+                elif kind == "combo":
+                    items = [widget.itemText(i)
+                             for i in range(widget.count())]
+                    if str(v) in items:
+                        widget.setCurrentText(str(v))
+                elif kind == "spin":
+                    caster = spec[3]
+                    widget.setValue(caster(v))
+                elif kind == "check":
+                    caster = spec[3]
+                    widget.setChecked(caster(v))
+            except Exception:
+                pass
+        # Panel checkboxes
+        try:
+            wanted = set(state.get("figures/single_panels", []))
+            if wanted and hasattr(self, "_single_panel_checkboxes"):
+                for k, cb in self._single_panel_checkboxes.items():
+                    cb.setChecked(k in wanted)
+        except Exception: pass
+        try:
+            wanted = set(state.get("compare/panels", []))
+            if wanted and hasattr(self, "_cmp_panel_checkboxes"):
+                for k, cb in self._cmp_panel_checkboxes.items():
+                    cb.setChecked(k in wanted)
+        except Exception: pass
 
     def _on_run_clicked(self):
         # Acting as Stop?
@@ -2212,6 +4979,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         # Auto-switch to the Analysis tab so the user sees progress
         self._switch_to_tab("Analysis")
+        self._start_elapsed_timer()
 
         params = self._build_params_for_file(
             fpath, self.e_outdir.text().strip() or None)
@@ -2228,6 +4996,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.progress_bar.setFormat("Starting…")
         self.run_stage_label.setText("Starting…")
         self.run_results.reset("Run in progress…")
+        try:
+            self.mass_hist.reset()
+            self.mass_hist.set_minmass(float(self.s_minmass.value())
+                                      if not self.c_auto_minmass.isChecked()
+                                      else None)
+        except AttributeError:
+            pass
         self._is_batch_run   = False
         self._is_compare_run = False
 
@@ -2260,6 +5035,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._switch_to_tab("Import")
             return
         self._switch_to_tab("Analysis")
+        self._start_elapsed_timer()
 
         # Batch outputs go to <input_folder>/batch_results/<stem>/  — same
         # convention as the Tk app.  Build a params dict per file.
@@ -2286,6 +5062,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.batch_subprogress.setFormat("")
         self.batch_subprogress.show()
         self.run_results.reset("Batch in progress…")
+        try:
+            self.mass_hist.reset()
+            self.mass_hist.set_minmass(float(self.s_minmass.value())
+                                      if not self.c_auto_minmass.isChecked()
+                                      else None)
+        except AttributeError:
+            pass
         self._is_batch_run   = True
         self._is_compare_run = False
 
@@ -2300,7 +5083,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._poll_timer.start()
 
         self.btn_run.setText("Stop")
-        self.statusBar().showMessage(f"Batch: 0 / {len(files)} files")
+        self.statusBar().showMessage(
+            f"Batch: 0 / {len(files)} series")
 
     def _start_compare_run(self):
         """Kick off a comparison over the configured groups."""
@@ -2425,6 +5209,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 log_buf.append(payload)
             elif kind == "progress":
                 last_progress = payload   # drop earlier intra-tick updates
+            elif kind == "mass_chunk":
+                # Live histogram update from the localisation stream
+                try:    self.mass_hist.add_chunk(payload)
+                except AttributeError: pass
             elif kind == "done":
                 # Single-file completion.  Only valid in non-batch mode;
                 # in batch mode the per-file messages are "file_done".
@@ -2530,12 +5318,15 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
 
     def _handle_file_done(self, payload: dict):
-        """One file in a batch finished successfully — not the terminal msg."""
+        """One series in a batch finished successfully — not the terminal msg.
+        ('file' here = 'series' in the GUI sense — the batch list now has
+        one entry per series, and the worker calls it once per series.)
+        """
         i, total = payload.get("index", 0), payload.get("total", 0)
         n_tracks = payload.get("n_tracks", 0)
         stem     = payload.get("stem", "")
         self.statusBar().showMessage(
-            f"Batch: {i} / {total} files complete  ({n_tracks:,} tracks)")
+            f"Batch: {i} / {total} series complete  ({n_tracks:,} tracks)")
         if total:
             pct = int(100 * i / total)
             self.batch_progress.setValue(pct)
@@ -2545,29 +5336,31 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"Last: {stem}  ({n_tracks:,} tracks)")
 
     def _handle_file_error(self, payload: dict):
-        """One file in a batch failed — log it, batch continues."""
+        """One series in a batch failed — log it, batch continues."""
         i, total = payload.get("index", 0), payload.get("total", 0)
         f = payload.get("file", "?")
         self.console_log.appendPlainText(
             f"\n  ⚠ [{i}/{total}] failed: {os.path.basename(f)}")
         self.batch_stage_label.setText(
             f"[{i}/{total}] failed: {os.path.basename(f)} — batch continues")
-        self.statusBar().showMessage(f"Batch: file {i} failed (continuing)")
+        self.statusBar().showMessage(f"Batch: series {i} failed (continuing)")
 
     def _handle_batch_done(self, payload: dict):
-        """Batch terminal message — all files attempted."""
+        """Batch terminal message — all series attempted."""
         n_total = payload.get("n_total", 0)
         n_ok    = payload.get("n_ok",    0)
         n_fail  = payload.get("n_fail",  0)
         self.batch_progress.setValue(100)
         self.batch_progress.setFormat(
-            f"Batch complete  —  {n_ok}/{n_total} succeeded, {n_fail} failed")
+            f"Batch complete  —  {n_ok}/{n_total} series succeeded, "
+            f"{n_fail} failed")
         self.batch_subprogress.hide()
         self.statusBar().showMessage(
-            f"Batch complete — {n_ok}/{n_total} succeeded, {n_fail} failed")
+            f"Batch complete — {n_ok}/{n_total} series succeeded, "
+            f"{n_fail} failed")
 
         # Populate the results panel with the batch summary
-        headline = (f"Batch complete — {n_ok}/{n_total} succeeded"
+        headline = (f"Batch complete — {n_ok}/{n_total} series succeeded"
                     + (f", {n_fail} failed" if n_fail else ""))
         # Aggregate stats across successful files
         results = payload.get("results") or []
@@ -2622,9 +5415,50 @@ class MainWindow(QtWidgets.QMainWindow):
                 self, "Analysis error", tb[-1500:])
         self.statusBar().showMessage("Error — see log")
 
+    # ── Elapsed-time tracker for the Analysis tab ─────────────────────────
+    @staticmethod
+    def _format_elapsed(secs: float) -> str:
+        secs = max(0, int(secs))
+        h, rem = divmod(secs, 3600)
+        m, s = divmod(rem, 60)
+        if h:
+            return f"{h:d}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
+
+    def _start_elapsed_timer(self):
+        import time as _time
+        self._run_start_time = _time.monotonic()
+        try:
+            self.lbl_elapsed.setText("Elapsed: 00:00")
+        except AttributeError:
+            return
+        self._elapsed_timer.start()
+
+    def _on_elapsed_tick(self):
+        if self._run_start_time is None:
+            return
+        import time as _time
+        try:
+            self.lbl_elapsed.setText(
+                f"Elapsed: {self._format_elapsed(_time.monotonic() - self._run_start_time)}")
+        except AttributeError:
+            pass
+
+    def _stop_elapsed_timer(self):
+        self._elapsed_timer.stop()
+        if self._run_start_time is not None:
+            import time as _time
+            final = self._format_elapsed(_time.monotonic() - self._run_start_time)
+            try:
+                self.lbl_elapsed.setText(f"Elapsed: {final}")
+            except AttributeError:
+                pass
+        self._run_start_time = None
+
     def _cleanup_after_run(self):
         """Tear down the subprocess + queue after a run ends."""
         self._poll_timer.stop()
+        self._stop_elapsed_timer()
         if self._proc is not None:
             try:
                 if self._proc.is_alive():
@@ -2916,16 +5750,27 @@ QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{
 }}
 
 QComboBox::drop-down {{
-    border: none;
-    width:  18px;
+    subcontrol-origin:    padding;
+    subcontrol-position:  top right;
+    background:           transparent;
+    background-color:     transparent;
+    border:               none;
+    width:                22px;
 }}
+/* Drop-down indicator rendered as a small light circle instead of the
+   default arrow / rectangle.  Width = height + border-radius half-of-side
+   keeps it perfectly round. */
 QComboBox::down-arrow {{
-    image: none;
-    width: 0; height: 0;
-    border-left:  4px solid transparent;
-    border-right: 4px solid transparent;
-    border-top:    5px solid {TXT_MUTED};
-    margin-right: 6px;
+    image:                none;
+    width:                8px;
+    height:               8px;
+    border-radius:        4px;
+    background-color:     {TXT_MUTED};
+    margin:               0 8px 0 0;
+}}
+QComboBox::down-arrow:on,
+QComboBox::down-arrow:hover {{
+    background-color:     {ACC};
 }}
 QComboBox QAbstractItemView {{
     background-color: {PANEL};
@@ -3130,6 +5975,71 @@ QFrame#section_content {{
     border-top:          none;
     border-bottom-left-radius:  5px;
     border-bottom-right-radius: 5px;
+}}
+
+/* ── Mode-toggle tiles (Import tab) ─────────────────────────────────────── */
+/* Big segmented-control cards.  Custom QFrame subclass (_ModeTile) with
+   a 'checked' Qt property — QSS uses property selectors to switch the
+   border between border-color: BORDER (unchecked) and ACC (checked). */
+QFrame#mode_tile {{
+    background-color:    {PANEL};
+    border:              1px solid {BORDER};
+    border-radius:       8px;
+}}
+QFrame#mode_tile:hover {{
+    background-color:    {PANEL_ALT};
+    border-color:        {BORDER_HI};
+}}
+QFrame#mode_tile[checked="true"] {{
+    background-color:    {PANEL_ALT};
+    border:              2px solid {ACC};
+}}
+QFrame#mode_tile[checked="true"]:hover {{
+    border-color:        {ACC_HOVER};
+}}
+
+QLabel#mode_tile_title {{
+    font-size:           14px;
+    font-weight:         700;
+    color:               {TXT};
+    background:          transparent;
+    border:              none;
+}}
+QLabel#mode_tile_subtitle {{
+    font-size:           11px;
+    color:               {TXT_MUTED};
+    background:          transparent;
+    border:              none;
+}}
+
+/* ── Action tiles (Home / landing tab) ──────────────────────────────────── */
+QFrame#action_tile {{
+    background-color:    {PANEL};
+    border:              1px solid {BORDER};
+    border-radius:       10px;
+}}
+QFrame#action_tile:hover {{
+    background-color:    {PANEL_ALT};
+    border:              1px solid {ACC};
+}}
+QLabel#action_tile_icon {{
+    font-size:           28px;
+    color:               {ACC};
+    background:          transparent;
+    border:              none;
+}}
+QLabel#action_tile_title {{
+    font-size:           18px;
+    font-weight:         700;
+    color:               {TXT};
+    background:          transparent;
+    border:              none;
+}}
+QLabel#action_tile_desc {{
+    font-size:           12px;
+    color:               {TXT_MUTED};
+    background:          transparent;
+    border:              none;
 }}
 
 /* ── Results panel ──────────────────────────────────────────────────────── */

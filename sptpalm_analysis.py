@@ -3,7 +3,7 @@ import multiprocessing
 import sys
 import os
 
-__version__ = "2.0.0"
+__version__ = "2.2.0"
 
 # Fix macOS multiprocessing crashes — must be set before any other imports
 if sys.platform == "darwin":
@@ -1284,7 +1284,7 @@ def preprocess_and_localise_adaptive(stack, diameter=7, minmass=None, percentile
                                      workers=N_CPUS, chunk_size=500,
                                      ram_headroom: float = 0.75,
                                      preview_cb=None, stop_event=None,
-                                     backend="auto"):
+                                     mass_cb=None, backend="auto"):
     """
     Adaptive dispatcher — automatically selects the fastest strategy that fits
     in available RAM.
@@ -1326,14 +1326,14 @@ def preprocess_and_localise_adaptive(stack, diameter=7, minmass=None, percentile
             stack, diameter, minmass, percentile,
             bg_radius, bg_method, workers, chunk_size,
             preview_cb=preview_cb, stop_event=stop_event,
-            backend=backend)
+            mass_cb=mass_cb, backend=backend)
 
 
 def preprocess_and_localise_stream(stack, diameter=7, minmass=None, percentile=64,
                                    bg_radius=50, bg_method="uniform_filter",
                                    workers=N_CPUS, chunk_size=500,
                                    preview_cb=None, stop_event=None,
-                                   backend="auto"):
+                                   mass_cb=None, backend="auto"):
     """
     Memory-efficient single streaming pass: preprocess + localise without ever
     materialising the full preprocessed stack in RAM.
@@ -1429,6 +1429,9 @@ def preprocess_and_localise_stream(stack, diameter=7, minmass=None, percentile=6
     locs0 = _localise_chunk_via_backend(first_pp)
     if len(locs0) > 0:
         all_locs.append(locs0)
+    if mass_cb is not None and len(locs0) > 0 and "mass" in locs0.columns:
+        try:    mass_cb(np.asarray(locs0["mass"].values, dtype=np.float32))
+        except Exception: pass
 
     # Emit preview for the first chunk (middle frame + its localisations)
     if preview_cb is not None:
@@ -1467,6 +1470,9 @@ def preprocess_and_localise_stream(stack, diameter=7, minmass=None, percentile=6
             locs_i = locs_i.copy()
             locs_i["frame"] += start
             all_locs.append(locs_i)
+        if mass_cb is not None and len(locs_i) > 0 and "mass" in locs_i.columns:
+            try:    mass_cb(np.asarray(locs_i["mass"].values, dtype=np.float32))
+            except Exception: pass
 
         # Live preview: middle frame of this chunk with detected particles
         if preview_cb is not None:
@@ -2171,17 +2177,22 @@ def _resolve_backend(name: str | None):
     and to let users force a specific device path.
     """
     if name in (None, "", "auto"):
-        # Smart-auto deliberately does NOT auto-probe MPS.
+        # Smart-auto: GPU-first.  Order is CUDA → MPS → trackpy → torch-CPU.
         #
-        # On healthy Apple-Silicon Macs MPS would be the fastest option,
-        # but on some combinations (M4 + macOS 26 + PyTorch 2.12 in
-        # particular) just probing MPS triggers Metal command-buffer OOM
-        # errors that flood stderr and can kill the process.  We can't
-        # detect "MPS is broken on this machine" reliably from Python —
-        # the errors are at C++ / Metal level — so we play it safe: auto
-        # only auto-picks CUDA (no Apple-specific reliability issue), and
-        # users who want MPS pick `torch-mps` explicitly from the
-        # dropdown.  Once they pick it once it's persisted across runs.
+        # Earlier versions skipped MPS in auto-resolution because of
+        # reliability issues observed on macOS 26 + M4 + PyTorch 2.12 (the
+        # MPS allocator producing Metal command-buffer OOMs at extreme
+        # spot density).  Most of those have been mitigated since:
+        #   • PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0 set at process start
+        #   • per-chunk + end-of-localise mps.synchronize + empty_cache
+        #   • Gaussian fit sub-batched at 5k spots/call to avoid the
+        #     batched linalg.solve issue
+        #   • subprocess isolation so Qt's Metal claim doesn't compete
+        #     with PyTorch's MPS for unified memory on Apple Silicon
+        # With those in place, MPS is the right default on Apple Silicon
+        # (~6× faster than CPU on typical SPT stacks).  If a specific
+        # machine still has trouble, users can manually pick Trackpy or
+        # Torch — CPU from the dropdown.
         if TorchBackend.is_available():
             try:
                 import torch as _torch
@@ -2189,15 +2200,20 @@ def _resolve_backend(name: str | None):
                     inst = TorchBackend()
                     inst._forced_device = "cuda"
                     return inst
+                if (hasattr(_torch.backends, "mps")
+                        and _torch.backends.mps.is_available()):
+                    inst = TorchBackend()
+                    inst._forced_device = "mps"
+                    return inst
             except Exception:
                 pass
-        # Fallback: first non-torch backend (trackpy in practice)
+        # No GPU available → reference CPU implementation (trackpy).
         for cls in _BACKEND_REGISTRY:
             if cls is TorchBackend:
                 continue
             if cls.is_available():
                 return cls()
-        # Last resort: torch on CPU, if even trackpy is missing
+        # Last resort: torch on CPU, if even trackpy is missing.
         if TorchBackend.is_available():
             inst = TorchBackend()
             inst._forced_device = "cpu"
@@ -2811,7 +2827,7 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
                 fig_theme="Dark", proj_cmap="Inferno", jdd=None,
                 turning_angles=None, mobile_frac_df=None,
                 cluster_labels=None, cluster_locs=None,
-                dwell_df=None, dwell_tau=None):
+                dwell_df=None, dwell_tau=None, return_pdf_bytes=False):
     print("  Rendering figure ...")
 
     # ── Theme palettes ─────────────────────────────────────────────────────────
@@ -3324,12 +3340,24 @@ def make_figure(stack, tracks, imsd_df, emsd_df, diff_df,
         fig.savefig(_pdf, bbox_inches="tight", facecolor=fig.get_facecolor())
         print(f"  Figure (PDF) -> {_pdf}")
 
+    pdf_bytes = None
+    if return_pdf_bytes:
+        try:
+            _pdfbuf = _io.BytesIO()
+            fig.savefig(_pdfbuf, format="pdf", bbox_inches="tight",
+                        facecolor=fig.get_facecolor())
+            pdf_bytes = _pdfbuf.getvalue()
+            _pdfbuf.close()
+        except Exception as _exc:
+            print(f"  WARN: PDF render failed: {_exc}")
+
     plt.close(fig)
     print("  Figure rendered.")
     return {
         "combined":     combined_pil,
         "panels":       panel_images,
         "panel_titles": {ltr: ax.get_title().strip() for ltr, ax in _panels},
+        "pdf_bytes":    pdf_bytes,
     }
 
 

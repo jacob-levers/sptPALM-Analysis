@@ -1,6 +1,7 @@
 FIREFLY — Fluorescence Inference & Reconstruction Engine
 =========================================================
 Framework for Localization Yields  —  By Jacob Levers
+Version 2.2.0
 
 A single-particle tracking PALM pipeline for .czi (Zeiss) and .tif/.tiff
 image stacks. Localisation, tracking, MSD / diffusion / motion-class
@@ -9,15 +10,51 @@ RCC), turning-angle and radial-distribution analysis, plus a Compare
 mode that overlays N analysis-output folders with statistical tests and
 a combined PDF report.
 
-The app has two top-level modes:
-  • Analyse Data  — run the full pipeline on a single .czi/.tif
-                    (or a whole folder of them) and save per-experiment
-                    results to disk.
-  • Compare Data  — overlay 2-6 groups of analysis output folders into
-                    a multi-panel comparative figure with per-panel
-                    statistics (Welch's t / Mann-Whitney / ANOVA /
-                    Kruskal-Wallis), Bonferroni correction and a
-                    multi-page PDF report.
+The app opens on a welcome landing page with four action cards:
+  • Analyse a sample   — run the pipeline on one .czi/.tif file
+  • Batch a folder     — process every file in a folder, sequentially
+  • Compare groups     — overlay 2-6 analysis-output folders into a
+                          comparison figure with stats + PDF report
+  • Visualise tracks   — open a previous run in an embedded napari
+                          viewer (with the interactive track inspector)
+
+Clicking a card switches to the relevant tab.  Once in the workflow
+UI, the landing page is out of the way — the tab bar at the top is
+how you move between Import / Analysis / Figures / Compare / Visualise.
+
+
+================================================================
+WHAT'S NEW IN 2.2
+================================================================
+
+  • Welcome landing page — one-way gateway with four action cards;
+    no more burying the workflow under tabs from the start.
+  • Live preview viewer on the Import tab — embedded napari viewer
+    that auto-loads when you pick a file.  Detection circles colour-
+    coded by mass, ROI threshold mask overlay, "Filtered view"
+    toggle showing the bandpass-preprocessed image, and a min-mass
+    slider that updates the spot count live.
+  • Figures tab — style and output settings (theme, projection
+    colormap, DPI, vector PDF, per-panel exports) for both single-
+    sample and comparison figures.  Live preview renders synthetic
+    examples in your chosen style so you can iterate without re-
+    running anything.
+  • Real-time mass histogram during a run — chunks stream into a
+    histogram on the Analysis tab so you can spot a bad minmass
+    before the figure is even rendered.
+  • Quality-control panel — link ratio, locs/frame, median track
+    length, gap rate, stuck-track fraction.  Colour-coded warnings
+    surface dud runs at a glance.
+  • Reproducibility manifests — every run writes a
+    <stem>_run_manifest.json with FIREFLY version, git SHA, input
+    file SHA-256, full parameters, and a widget-state snapshot.
+    A "Load run manifest…" button on the Import tab repopulates
+    every sidebar control from a saved manifest so you can replay
+    a run exactly.
+  • Interactive track inspector — click a track in the Visualise-
+    tab napari viewer to see its D, α, motion class, length,
+    displacement, mean mass and more in a side panel.  Tracks are
+    coloured by motion class via napari features.
 
 
 ================================================================
@@ -90,13 +127,18 @@ when the install finishes.  Subsequent launches are instant.
 USING THE APP — OVERVIEW
 ================================================================
 
-When you open the app you see a welcome card with two prominent buttons:
+When you open the app you see a welcome landing page with four big
+action cards:
 
-   ▶ Analyse Data       Single file or batch run from a .czi/.tif image
-   ⇆ Compare Data       Overlay results from N folders vs M folders
+   ▶ Analyse a sample   Single .czi/.tif run with the full pipeline
+   ⊞ Batch a folder     Process every file in a folder sequentially
+   ⇄ Compare groups     Overlay results from 2-6 folder groups
+   ◉ Visualise tracks   Open a prior run in the napari viewer
 
-Pick one to enter that mode. A persistent tab strip just below the
-header lets you flick between modes any time without losing state.
+Click any card to enter the workflow.  From then on the tab strip
+(Import → Analysis → Figures → Compare → Visualise) is how you move
+between sections without losing state.  The landing page is shown
+only on launch, not on every tab switch.
 
 
 ================================================================
@@ -133,6 +175,46 @@ Batch processing (multiple files / multiple series)
 5. Confirm and the runs proceed sequentially.
 6. Results for each experiment are saved to a sub-folder inside the
    selected parent, plus a batch_summary.csv summary table.
+
+Live preview viewer (Import tab)
+--------------------------------
+The Import tab embeds a napari viewer that auto-loads as soon as the
+input file path settles.  It serves five purposes simultaneously:
+
+  • Frame scrubbing      — preview ~30 sampled frames of the stack.
+  • Detection overlay    — every spot found by tp.locate on the
+                            current frame is drawn as a circle; the
+                            circle's colour encodes the spot's mass
+                            on a turbo log-scale (low = blue, high
+                            = red).  A small turbo legend strip in
+                            the header reminds you of the mapping.
+                            The status bar shows live counts and
+                            mass quantiles:
+                              "15 spots (d=7, minmass=1.42) —
+                               mass 222 / med 628 / 6458"
+                            Drag the min-mass slider (sidebar →
+                            Detection) and watch dim spots vanish.
+  • ROI threshold mask   — when ROI Mode is "Auto threshold" or
+                            "Manual threshold", a translucent green
+                            mask overlays the pixels that pass.
+                            Drag the manual-threshold slider and the
+                            mask redraws live.
+  • ROI polygon drawing  — when ROI Mode is "Manual polygon", draw
+                            the polygon directly.  Per-file
+                            polygons are auto-saved and reused on
+                            the next run for that file.
+  • Filtered view toggle — the "Filtered view" checkbox in the
+                            header swaps the background image for
+                            its bandpass-filtered version (what the
+                            detector actually sees).  Real PSFs
+                            light up, flat noise drops away.  Spot
+                            counts still come from raw frames so the
+                            numbers match the eventual run.
+
+Min-mass scale note: after FIREFLY's per-frame normalisation, useful
+minmass values are typically 0.5–50.  The slider uses a square-law
+mapping so the low end (where most real adjustments happen) gets
+fine control.
 
 Key settings to check before your first run:
   - Pixel size (µm/px)     Auto-read from file metadata. Verify it.
@@ -172,11 +254,11 @@ Workflow
    button needed).
 5. Add more groups with "+ Add group" (up to 6).  Click "× Remove"
    on a group's card to delete it (disabled when only 2 remain).
-6. Pick the figure theme (Dark / Light / Publication — same set as
-   the Analyse-mode figures).
-7. Toggle which panels you want via the checkboxes; toggle the
-   PDF report on or off.
-8. Pick an output folder and click "▶ Generate Comparison".
+6. Output folder, output filename stem.
+7. Style settings — theme, which panels are included, and whether
+   to emit the multi-page PDF report — live on the FIGURES tab now
+   (see below).
+8. Click "▶ Generate Comparison".
 
 The comparison scales gracefully:
   • 1 vs 1     two MSD curves overlaid, two bars (no scatter dots, no
@@ -253,6 +335,125 @@ folders.  Re-running an old experiment regenerates the full set.
 
 
 ================================================================
+FIGURES TAB
+================================================================
+
+Centralised style + output customisation for both the single-sample
+figure (from Analyse) and the comparison figure (from Compare).
+
+Two side-by-side previews on the right of the tab render synthetic
+sample/comparison figures in the chosen styles, updated live.
+
+Single-sample figure
+  • Theme              Dark / Light / Publication
+  • Projection cmap    Inferno / Hot / Viridis / Plasma / Greys
+  • PNG DPI            72-600 (150 default)
+  • Also save PDF      Vector copy alongside the PNG
+  • Per-panel exports  Toggle, plus a 2-column checkbox grid that
+                       picks which of the 15 panels (A-O) are
+                       written into figures/panels/.
+
+Comparison figure
+  • Theme              Independent from single-sample so you can
+                       mix styles per output type
+  • PDF report         Multi-page (figure + cover + per-replicate
+                       table + stats table)
+  • Panel selector     2-column checkbox grid (10 panels) — same
+                       choices as before, just moved here from the
+                       Compare tab.
+
+
+================================================================
+ANALYSIS TAB — LIVE FEEDBACK + QUALITY CONTROL
+================================================================
+
+While a run is in progress, the Analysis tab shows:
+
+  • Stage label + overall progress bar
+  • Elapsed-time counter ticking at 1 Hz (MM:SS or H:MM:SS)
+  • Live mass histogram — every chunk's mass values stream into a
+    40-bin histogram with a dashed orange line at your current
+    minmass.  If the histogram peak is far from the dashed line,
+    abort the run and re-tune minmass instead of waiting an hour.
+
+When a run completes, the results panel adds a Quality-control
+section with:
+
+  • Localisations linked       fraction that ended up in tracks
+                                (< 10% → red warning;
+                                 10-25% → orange; otherwise green)
+  • Locs / frame (avg)         flagged orange above 800
+  • Median track length        flagged orange below 6 frames
+  • Tracks with gaps           any track whose frame span exceeds
+                                its length
+  • Stuck tracks  (D < 1e-3)   flagged orange above 30%
+
+Followed by one-line flag messages (red ⚠ for warnings,
+muted ℹ for informational notes about gappy blinking probes etc.).
+
+
+================================================================
+REPRODUCIBILITY — RUN MANIFESTS
+================================================================
+
+Every run writes a self-contained JSON next to the outputs:
+
+   <out_dir>/<stem>_run_manifest.json
+
+It records, in one file:
+
+  • schema_version, FIREFLY version, git SHA (if running from a
+    checkout)
+  • host info (hostname, platform, Python version)
+  • created_at timestamp
+  • input.path + input.sha256 (SHA-256 of the input file's bytes)
+  • output_dir, stem
+  • parameters  — full kwargs the worker received
+  • widget_state — every sidebar control's value, keyed by setting
+    path (e.g. "analysis/diameter", "figures/theme")
+
+To replay a run, open the Import tab and click "Load run manifest…"
+next to the file/output pickers.  Picking a manifest applies the
+saved widget_state to every sidebar control and repopulates the
+input/output paths.  Hit Start and you'll reproduce the original
+run exactly (same backend, same minmass, same ROI mode, same
+figure theme, …).
+
+
+================================================================
+VISUALISE TAB — TRACK INSPECTOR
+================================================================
+
+The Visualise tab is split: napari viewer on the left, "Track
+inspector" panel on the right.
+
+  • "Load image stack…"  open a .czi / .tif as an Image layer
+  • "Load tracks…"       open a *_trajectories.csv (auto-detects a
+                          sibling *_diffusion_summary.csv so it can
+                          colour by motion class and populate the
+                          inspector)
+  • "Load analysis run…" pick a run output folder; auto-loads the
+                          original stack + tracks + diffusion-summary
+  • "Auto-load after analysis"  flips on the inspector right after
+                                 a successful Analyse run
+
+Click a track point in the viewer (within ~8 px of any point on its
+trajectory at the current frame) and the inspector populates:
+
+   Particle ID
+   Track length
+   Frame span
+   Motion class           (colour-coded — red Immobile, orange
+                            Confined, blue Brownian, green Directed)
+   Diffusion D            µm²/s
+   α (anomalous exponent)
+   Net displacement       nm  (start → end Euclidean)
+   Total path             nm  (sum of single-step lengths)
+   Straightness           net / path
+   Mean mass              average integrated mass over the track
+
+
+================================================================
 OUTPUT FILES (per analysis run)
 ================================================================
 
@@ -305,9 +506,19 @@ In data/:
                                 ensure consistent units across folders.
    <stem>_roi_mask.png          Preview of the ROI mask (if enabled)
 
+At the root of the output folder:
+
+   <stem>_run_manifest.json     Reproducibility manifest — FIREFLY
+                                version, git SHA, input file path +
+                                SHA-256, full parameters, and a
+                                widget-state snapshot.  Load via
+                                Import tab → "Load run manifest…"
+                                to replay the run exactly.
+
 Figure contents
 ---------------
-Analyse-mode combined figure (5×3 grid of panels A-O):
+Analyse-mode combined figure (15 panels A-O on a 6-row × 3-column
+grid; some rows span columns):
 
   A — Track overlay on mean projection
   B — Localisation density heatmap

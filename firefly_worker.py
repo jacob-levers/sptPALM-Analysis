@@ -84,6 +84,101 @@ class QueueLogStream:
 # ══════════════════════════════════════════════════════════════════════════════
 #  CORE PIPELINE (shared by single-file and batch entry points)
 # ══════════════════════════════════════════════════════════════════════════════
+def _write_run_manifest(*, out_dir: str, stem: str, fpath: str,
+                        params: dict) -> str:
+    """Write a `<stem>_run_manifest.json` file alongside the run outputs.
+    The manifest captures everything needed to reproduce the run:
+      • full parameters (worker-format kwargs + widget-state for the GUI)
+      • input file path + SHA-256 checksum
+      • FIREFLY version, git SHA (if available), host info
+      • timestamp + output directory
+    """
+    import datetime as _dt
+    import hashlib
+    import json
+    import platform
+    import socket
+    import subprocess
+
+    def _file_sha256(path: str, _chunk: int = 1 << 20) -> str:
+        h = hashlib.sha256()
+        try:
+            with open(path, "rb") as fh:
+                while True:
+                    blk = fh.read(_chunk)
+                    if not blk:
+                        break
+                    h.update(blk)
+            return h.hexdigest()
+        except Exception:
+            return ""
+
+    def _firefly_version() -> str:
+        try:
+            import sptpalm_analysis as _sa
+            v = getattr(_sa, "__version__", None)
+            return str(v) if v else "unknown"
+        except Exception:
+            return "unknown"
+
+    def _git_sha() -> str:
+        try:
+            here = os.path.dirname(os.path.abspath(__file__))
+            out = subprocess.check_output(
+                ["git", "-C", here, "rev-parse", "HEAD"],
+                stderr=subprocess.DEVNULL, timeout=2)
+            return out.decode().strip()
+        except Exception:
+            return ""
+
+    # Strip non-JSON-serialisable bits out of the params dict (roi_polygon
+    # is a list-of-tuples, widget_state is a flat str/num/bool dict — both
+    # are fine).  `json.dumps` raises on numpy arrays / etc., so we coerce.
+    def _jsonify(obj):
+        if isinstance(obj, (str, int, float, bool)) or obj is None:
+            return obj
+        if isinstance(obj, dict):
+            return {str(k): _jsonify(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_jsonify(x) for x in obj]
+        # numpy scalars / pandas / etc.
+        try:    return float(obj)
+        except Exception: pass
+        try:    return int(obj)
+        except Exception: pass
+        return str(obj)
+
+    widget_state = params.get("widget_state") or {}
+    # Worker-format kwargs minus the widget snapshot (it lives in its own field)
+    worker_params = {k: _jsonify(v) for k, v in params.items()
+                     if k != "widget_state"}
+
+    manifest = {
+        "schema_version":   1,
+        "firefly_version":  _firefly_version(),
+        "git_sha":          _git_sha(),
+        "created_at":       _dt.datetime.now().isoformat(timespec="seconds"),
+        "host": {
+            "name":     socket.gethostname(),
+            "platform": platform.platform(),
+            "python":   platform.python_version(),
+        },
+        "input": {
+            "path":   fpath,
+            "sha256": _file_sha256(fpath),
+        },
+        "output_dir":    out_dir,
+        "stem":          stem,
+        "parameters":    worker_params,
+        "widget_state":  _jsonify(widget_state),
+    }
+
+    path = os.path.join(out_dir, f"{stem}_run_manifest.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, indent=2)
+    return path
+
+
 class _NoTracks(Exception):
     """Raised inside _run_one_analysis when linking produces 0 trajectories.
     The wrapper catches this and emits a sensible 'done' (single-file) or
@@ -160,6 +255,16 @@ def _run_one_analysis(params: dict, msg_queue, cancel_event,
     minmass_arg = (None if p.get("auto_minmass", False)
                    else float(p["minmass"]))
 
+    # Real-time mass histogram: each chunk's mass values get pushed into
+    # the GUI via the msg queue so the user can spot a bad minmass early.
+    def _mass_cb(masses):
+        try:
+            # Truncate huge chunks so we don't flood the queue
+            arr = masses if len(masses) <= 20000 else masses[:20000]
+            msg_queue.put(("mass_chunk", arr.tolist()))
+        except Exception:
+            pass
+
     locs, mean_proj, _mm = preprocess_and_localise_adaptive(
         stack,
         diameter=int(p["diameter"]),
@@ -169,7 +274,14 @@ def _run_one_analysis(params: dict, msg_queue, cancel_event,
         workers=int(p["workers"]),
         chunk_size=int(p["chunk_size"]),
         stop_event=cancel_event,
+        mass_cb=_mass_cb,
         backend=p["backend"])
+    # Fast-path users get a single bulk emit (no per-chunk hook there).
+    try:
+        if locs is not None and len(locs) > 0 and "mass" in locs.columns:
+            _mass_cb(locs["mass"].values.astype("float32"))
+    except Exception:
+        pass
     stack_h = stack.shape[1] if stack.ndim >= 3 else 0
     stack_w = stack.shape[2] if stack.ndim >= 3 else 0
     del stack
@@ -177,19 +289,56 @@ def _run_one_analysis(params: dict, msg_queue, cancel_event,
     _check_stop()
 
     # ── ROI mask (optional) ───────────────────────────────────────────────
+    # Per-file polygon overrides the global mode: if a polygon was set
+    # for this file in the Import-tab ROI editor, treat it as polygon-mode
+    # regardless of what the sidebar says.
     roi_mode = p.get("roi_mode", "none")
+    if p.get("roi_polygon"):
+        roi_mode = "polygon"
     if roi_mode != "none" and len(locs) > 0:
         _log(f"\n── ROI mask ───────────────────────")
         try:
             from sptpalm_analysis import auto_threshold
-            if roi_mode == "auto":
-                method = (p.get("roi_auto_method") or "Li").lower()
-                thresh, _, _ = auto_threshold(mean_proj, method=method)
-            else:  # manual
-                thresh = float(p.get("roi_threshold", 0.08))
-            roi_mask = (mean_proj > thresh).astype(_np.uint8)
-            pct = 100.0 * roi_mask.mean()
-            _log(f"  Threshold = {thresh:.4f}  |  {pct:.1f}% of frame")
+            roi_mask = None
+
+            if roi_mode == "polygon":
+                # User-drawn polygon ROI.  `roi_polygon` is a list of
+                # (y, x) vertex pairs in pixel coordinates of the
+                # original frame (Y by X).  skimage's polygon2mask
+                # rasterises it into a boolean array of the same shape.
+                vertices = p.get("roi_polygon") or []
+                if not vertices:
+                    _log("  WARN: roi_mode is 'polygon' but no vertices "
+                         "were provided.  Skipping ROI.")
+                else:
+                    try:
+                        from skimage.draw import polygon2mask
+                        polys = vertices if isinstance(vertices[0][0],
+                                                       (list, tuple)) \
+                                          else [vertices]
+                        # If multiple polygons, OR their masks together
+                        h, w = mean_proj.shape
+                        roi_mask = _np.zeros((h, w), dtype=_np.uint8)
+                        for poly in polys:
+                            m = polygon2mask((h, w), _np.asarray(poly))
+                            roi_mask |= m.astype(_np.uint8)
+                        n_polys = len(polys)
+                        _log(f"  User polygon ROI: {n_polys} shape(s), "
+                             f"{100.0 * roi_mask.mean():.1f}% of frame")
+                    except Exception as poly_exc:
+                        _log(f"  WARN: polygon ROI failed — {poly_exc}.")
+                        roi_mask = None
+
+            if roi_mask is None:
+                if roi_mode == "auto":
+                    method = (p.get("roi_auto_method") or "Li").lower()
+                    thresh, _, _ = auto_threshold(mean_proj, method=method)
+                else:  # manual threshold
+                    thresh = float(p.get("roi_threshold", 0.08))
+                roi_mask = (mean_proj > thresh).astype(_np.uint8)
+                _log(f"  Threshold = {thresh:.4f}  |  "
+                     f"{100.0 * roi_mask.mean():.1f}% of frame")
+
             n_before = len(locs)
             locs = apply_roi_mask(locs, roi_mask)
             _log(f"  Locs after ROI : {len(locs):,}  "
@@ -302,10 +451,15 @@ def _run_one_analysis(params: dict, msg_queue, cancel_event,
     # ── Render figure ─────────────────────────────────────────────────────
     _log(f"\n── Saving ────────────────────────")
     _prog(90, "Rendering figure…")
+    fig_theme    = p.get("fig_theme", "Dark")
+    fig_proj_cmap = p.get("fig_proj_cmap", "Inferno")
+    want_pdf     = bool(p.get("fig_save_pdf", False))
     fig_data = make_figure(
         proj_sample, tracks, imsd_df, emsd_df, diff_df, px, fi,
+        fig_theme=fig_theme, proj_cmap=fig_proj_cmap,
         jdd=jdd, turning_angles=ta, mobile_frac_df=mf,
-        cluster_locs=cluster_xy, dwell_df=dwell_df, dwell_tau=dwell_tau)
+        cluster_locs=cluster_xy, dwell_df=dwell_df, dwell_tau=dwell_tau,
+        return_pdf_bytes=want_pdf)
     del proj_sample
 
     # ── Save outputs ──────────────────────────────────────────────────────
@@ -329,12 +483,60 @@ def _run_one_analysis(params: dict, msg_queue, cancel_event,
     _log(f"  Saved (firefly_extras/): trajectories, locs, diffusion summary")
 
     figure_path = ""
+    fig_dpi = int(p.get("fig_dpi", 150)) or 150
     try:
         figure_path = os.path.join(fig_dir, f"{stem}_sptpalm_figure.png")
-        fig_data["combined"].save(figure_path, dpi=(150, 150))
+        fig_data["combined"].save(figure_path, dpi=(fig_dpi, fig_dpi))
     except Exception as e:
         _log(f"  WARN: figure save failed: {e}")
         figure_path = ""
+
+    # Optional: vector PDF copy of the combined figure
+    if want_pdf and fig_data.get("pdf_bytes"):
+        try:
+            pdf_path = os.path.join(fig_dir, f"{stem}_sptpalm_figure.pdf")
+            with open(pdf_path, "wb") as _fh:
+                _fh.write(fig_data["pdf_bytes"])
+            _log(f"  Saved (figures/): vector PDF")
+        except Exception as e:
+            _log(f"  WARN: PDF save failed: {e}")
+
+    # Optional: per-panel PNGs (one image per labelled panel of the grid).
+    # The user can filter which panels get written via the Figures tab's
+    # "Single-sample panels to export individually" checkbox grid.
+    if bool(p.get("fig_per_panel", False)) and fig_data.get("panels"):
+        try:
+            allowed = p.get("fig_single_panels")
+            if allowed is None:
+                wanted_keys = list(fig_data["panels"].keys())
+            else:
+                allowed_set = set(allowed)
+                wanted_keys = [k for k in fig_data["panels"].keys()
+                               if k in allowed_set]
+            panel_dir = os.path.join(fig_dir, "panels")
+            os.makedirs(panel_dir, exist_ok=True)
+            n_saved = 0
+            for ltr in wanted_keys:
+                fig_data["panels"][ltr].save(
+                    os.path.join(panel_dir, f"{stem}_panel_{ltr}.png"),
+                    dpi=(fig_dpi, fig_dpi))
+                n_saved += 1
+            _log(f"  Saved (figures/panels/): {n_saved} panel PNGs")
+        except Exception as e:
+            _log(f"  WARN: per-panel save failed: {e}")
+
+    # ── Reproducibility manifest ──────────────────────────────────────────
+    # Write a self-contained JSON next to the outputs that records the
+    # exact parameters used + input-file checksum + FIREFLY version + git
+    # SHA + host info, so the run can be exactly replayed later via the
+    # "Load manifest…" button on the Import tab.
+    manifest_path = ""
+    try:
+        manifest_path = _write_run_manifest(
+            out_dir=out_dir, stem=stem, fpath=fpath, params=p)
+        _log(f"  Saved (root): {os.path.basename(manifest_path)}")
+    except Exception as e:
+        _log(f"  WARN: manifest write failed: {e}")
 
     _log(f"\n  Output folder: {out_dir}")
     _prog(100, "Complete!")
@@ -380,6 +582,78 @@ def _run_one_analysis(params: dict, msg_queue, cancel_event,
     except Exception:
         # Best-effort: don't let a stats-computation hiccup break the run
         pass
+
+    # ── Quality-control metrics ──────────────────────────────────────────
+    # Cheap to compute from data we already have; surfaced as a QC panel
+    # in the GUI so the user can catch dud runs at a glance.
+    qc: dict = {"flags": []}
+    try:
+        n_locs    = int(len(locs)) if locs is not None else 0
+        n_tracked = 0
+        gap_frac  = None
+        median_len = None
+        stuck_frac = None
+        avg_locs_pf = None
+        if tracks is not None and len(tracks) > 0:
+            n_tracked = int(len(tracks))
+            # Track-length distribution (frames per particle)
+            lens = tracks.groupby("particle").size()
+            median_len = float(lens.median())
+            # Gap rate: a track has a gap when its frame range > its length
+            try:
+                frames_per_p = tracks.groupby("particle")["frame"]
+                spans = frames_per_p.max() - frames_per_p.min() + 1
+                gap_mask = spans > lens
+                gap_frac = float(gap_mask.mean())
+            except Exception:
+                pass
+        if diff_df is not None and len(diff_df) > 0 and "D" in diff_df.columns:
+            stuck_frac = float((diff_df["D"] < 1e-3).mean())
+        if n_locs and n_frames:
+            avg_locs_pf = float(n_locs) / float(n_frames)
+        link_ratio = (float(n_tracked) / n_locs) if n_locs else None
+
+        qc.update({
+            "n_locs":              n_locs,
+            "n_tracked_locs":      n_tracked,
+            "link_ratio":          link_ratio,
+            "avg_locs_per_frame":  avg_locs_pf,
+            "median_track_length": median_len,
+            "gap_fraction":        gap_frac,
+            "stuck_fraction":      stuck_frac,
+        })
+
+        # Threshold-based flags — surface as warnings in the GUI
+        flags: list[dict] = []
+        if link_ratio is not None and link_ratio < 0.10:
+            flags.append({"level": "warn",
+                "msg": f"Only {link_ratio*100:.1f}% of localisations were "
+                       "linked into tracks — consider raising minmass or "
+                       "lowering search_range."})
+        if avg_locs_pf is not None and avg_locs_pf > 800:
+            flags.append({"level": "warn",
+                "msg": f"Very high localisation density "
+                       f"({avg_locs_pf:.0f} locs/frame).  Linking accuracy "
+                       "degrades above ~1000/frame; consider raising minmass."})
+        if median_len is not None and median_len < 6:
+            flags.append({"level": "warn",
+                "msg": f"Median track length is only {median_len:.1f} "
+                       "frames — MSD fits will be noisy.  Lower memory or "
+                       "search_range, or raise minmass."})
+        if stuck_frac is not None and stuck_frac > 0.30:
+            flags.append({"level": "warn",
+                "msg": f"{stuck_frac*100:.1f}% of tracks have "
+                       "D < 1e-3 µm²/s (likely stuck / aggregated).  "
+                       "Consider enabling Filter-by-D in the sidebar."})
+        if gap_frac is not None and gap_frac > 0.50:
+            flags.append({"level": "info",
+                "msg": f"{gap_frac*100:.1f}% of tracks contain gaps.  "
+                       "OK for blinking PALM probes; suspicious for "
+                       "constitutive markers."})
+        qc["flags"] = flags
+    except Exception:
+        pass
+    summary["qc"] = qc
 
     return {
         "stem":        stem,
