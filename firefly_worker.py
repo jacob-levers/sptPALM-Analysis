@@ -180,6 +180,71 @@ def _write_run_manifest(*, out_dir: str, stem: str, fpath: str,
     return path
 
 
+def _start_memory_watchdog(cancel_event, msg_queue,
+                            critical_gb: float = 0.8,
+                            warn_gb: float = 1.6,
+                            poll_s: float = 0.5):
+    """Background daemon that aborts the run cleanly if free RAM gets
+    dangerously low.
+
+    Two thresholds:
+      * `warn_gb`     — log a warning once when crossed (1.6 GB default)
+      * `critical_gb` — set `cancel_event` so the pipeline raises
+                        `_Cancelled` at its next stop-check
+                        (0.8 GB default)
+
+    Prevents the OS from being squeezed into swap or a kernel panic by
+    the analysis itself when long-running stages (linking, MSD over a
+    huge tracks DataFrame, figure rendering, etc.) keep allocating
+    after the initial RAM-vs-stack check passes.
+
+    Returns a `stop` Event the caller .set()s in a `finally` block to
+    shut the watchdog down at the end of the run.
+    """
+    import threading
+    try:
+        import psutil as _psutil
+    except Exception:
+        # Can't monitor without psutil — degrade silently.
+        return None
+
+    stop = threading.Event()
+
+    def _watch():
+        warned = False
+        while not stop.wait(poll_s):
+            try:
+                free_gb = _psutil.virtual_memory().available / 1e9
+            except Exception:
+                continue
+            if free_gb < critical_gb:
+                if cancel_event is not None and not cancel_event.is_set():
+                    try:
+                        msg_queue.put(("log",
+                            f"\n  ⚠ CRITICAL: only {free_gb:.2f} GB RAM "
+                            f"free — aborting to keep the system "
+                            f"responsive.  Close other apps or set a "
+                            f"larger FIREFLY_USER_RAM_RESERVE_GB and "
+                            f"re-run."))
+                    except Exception: pass
+                    cancel_event.set()
+                return
+            if not warned and free_gb < warn_gb:
+                try:
+                    msg_queue.put(("log",
+                        f"  ⚠ Memory pressure: {free_gb:.2f} GB RAM "
+                        f"free (warn < {warn_gb:.1f} GB / abort < "
+                        f"{critical_gb:.1f} GB).  Run will abort if "
+                        f"this drops further."))
+                except Exception: pass
+                warned = True
+
+    t = threading.Thread(target=_watch, daemon=True,
+                          name="FIREFLY-MemWatchdog")
+    t.start()
+    return stop
+
+
 class _NoTracks(Exception):
     """Raised inside _run_one_analysis when linking produces 0 trajectories.
     The wrapper catches this and emits a sensible 'done' (single-file) or
@@ -289,7 +354,11 @@ def _run_one_analysis(params: dict, msg_queue, cancel_event,
     # (analysis itself keeps running — only the cosmetic stream pauses).
     try:    import psutil as _ps
     except Exception: _ps = None
-    _MEM_FLOOR_GB = 1.5
+    # Pause live preview as soon as memory pressure starts — well before
+    # the watchdog's abort threshold.  Frees ~tens of MB of pickle/queue
+    # traffic per second when memory's getting tight, without affecting
+    # the analysis itself.
+    _MEM_FLOOR_GB = 2.5
 
     def _system_under_pressure() -> bool:
         if _ps is None:
@@ -908,6 +977,11 @@ def run_analysis(params: dict, msg_queue, cancel_event):
     def _log(msg: str):       msg_queue.put(("log", msg))
     def _prog(pct, msg):      msg_queue.put(("progress", (int(pct), str(msg))))
 
+    # Memory watchdog — aborts the run cleanly if free RAM falls
+    # below the critical threshold, preventing the OS-level OOM /
+    # kernel freeze that we saw previously.
+    _wd_stop = _start_memory_watchdog(cancel_event, msg_queue)
+
     try:
         _log("── Worker subprocess started ──")
         _prog(0, "Importing pipeline…")
@@ -924,6 +998,8 @@ def run_analysis(params: dict, msg_queue, cancel_event):
         else:
             msg_queue.put(("error", traceback.format_exc()))
     finally:
+        if _wd_stop is not None:
+            _wd_stop.set()
         try: sys.stdout.flush()
         except Exception: pass
         try: sys.stderr.flush()
@@ -958,6 +1034,11 @@ def run_comparison(comparison_params: dict, msg_queue, cancel_event):
 
     def _log(msg: str):  msg_queue.put(("log", msg))
     def _prog(pct, msg): msg_queue.put(("progress", (int(pct), str(msg))))
+
+    # Memory watchdog — Compare can load multiple full tracks
+    # DataFrames simultaneously + re-derive MSD/JDD/dwell/turning
+    # angles for each, easily blowing the budget on 16 GB machines.
+    _wd_stop = _start_memory_watchdog(cancel_event, msg_queue)
 
     try:
         _log("── Compare worker subprocess started ──")
@@ -1026,6 +1107,8 @@ def run_comparison(comparison_params: dict, msg_queue, cancel_event):
         else:
             msg_queue.put(("error", traceback.format_exc()))
     finally:
+        if _wd_stop is not None:
+            _wd_stop.set()
         try: sys.stdout.flush()
         except Exception: pass
         try: sys.stderr.flush()
@@ -1058,6 +1141,10 @@ def run_batch_analysis(params_list: list, msg_queue, cancel_event):
 
     def _log(msg: str):  msg_queue.put(("log", msg))
     def _prog(pct, msg): msg_queue.put(("progress", (int(pct), str(msg))))
+
+    # Memory watchdog — one shared across the whole batch so a series
+    # halfway through doesn't push the system into swap.
+    _wd_stop = _start_memory_watchdog(cancel_event, msg_queue)
 
     try:
         n = len(params_list)
@@ -1139,6 +1226,8 @@ def run_batch_analysis(params_list: list, msg_queue, cancel_event):
     except BaseException:
         msg_queue.put(("error", traceback.format_exc()))
     finally:
+        if _wd_stop is not None:
+            _wd_stop.set()
         try: sys.stdout.flush()
         except Exception: pass
         try: sys.stderr.flush()
