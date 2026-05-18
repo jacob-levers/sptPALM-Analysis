@@ -298,6 +298,16 @@ def _run_one_analysis(params: dict, msg_queue, cancel_event,
     for d in (fig_dir, data_dir, extras_dir):
         os.makedirs(d, exist_ok=True)
 
+    # Route disk-backed memmap stacks next to the output dir by default
+    # (typically on the user's data drive, which has more headroom than
+    # the system /var/folders temp).  An explicit FIREFLY_TEMP_DIR env
+    # var still wins.  Skipped for external-CSV mode (no memmap needed).
+    try:
+        from sptpalm_analysis import set_temp_stack_dir as _set_tmp
+        if not os.environ.get("FIREFLY_TEMP_DIR"):
+            _set_tmp(out_dir)
+    except Exception: pass
+
     # ── Source-of-localisations branch ────────────────────────────────────
     # Two modes:
     #   • "image"        — load stack + preprocess + localise (the default
@@ -1340,6 +1350,20 @@ def run_batch_analysis(params_list: list, msg_queue, cancel_event):
                     "file": params["file"], "tb": tb,
                 }))
                 # Continue with next file rather than aborting the whole batch
+            finally:
+                # Release the previous file's disk-backed memmap stack
+                # before starting the next file.  Without this, a 13-file
+                # batch can leave ~13 × 16 GB of temp files behind on the
+                # boot volume (atexit cleanup only fires at process exit)
+                # and hits ENOSPC mid-run.  Also gc.collect() so the
+                # memmap object is dropped before the OS unlinks the file
+                # (matters on Windows; harmless on POSIX).
+                try:
+                    import gc as _gc
+                    _gc.collect()
+                    from sptpalm_analysis import cleanup_temp_stack_paths
+                    cleanup_temp_stack_paths()
+                except Exception: pass
 
         # All done
         n_ok   = sum(1 for r in results if r.get("ok"))

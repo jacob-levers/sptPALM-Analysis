@@ -706,6 +706,24 @@ def _load_single_tif(path, stop_event=None):
 # of the run.  Register an atexit hook to remove these temp files so they
 # don't accumulate.
 _firefly_temp_stack_paths: list = []
+# Optional override for where the disk-backed memmap is created.  Set
+# via env var FIREFLY_TEMP_DIR or via set_temp_stack_dir().  Defaults to
+# the OS temp dir (e.g. /var/folders/.../T on macOS), which lives on the
+# system volume — often the smallest drive on the machine.  Pointing
+# this at the user's data drive avoids ENOSPC on long batches.
+_firefly_temp_stack_dir: "str | None" = None
+
+def set_temp_stack_dir(d: "str | None") -> None:
+    """Override the directory used for disk-backed memmap stacks."""
+    global _firefly_temp_stack_dir
+    _firefly_temp_stack_dir = d or None
+
+def _resolve_temp_stack_dir() -> "str | None":
+    d = _firefly_temp_stack_dir or os.environ.get("FIREFLY_TEMP_DIR") or None
+    if d and not os.path.isdir(d):
+        try: os.makedirs(d, exist_ok=True)
+        except Exception: return None
+    return d
 
 def _register_temp_stack_path(p: str) -> None:
     import atexit
@@ -713,10 +731,23 @@ def _register_temp_stack_path(p: str) -> None:
         atexit.register(_cleanup_temp_stack_paths)
     _firefly_temp_stack_paths.append(p)
 
+# Public alias used by the batch runner between files.
+def cleanup_temp_stack_paths() -> None:
+    _cleanup_temp_stack_paths()
+
 def _cleanup_temp_stack_paths() -> None:
+    """Remove every temp memmap file registered so far and clear the list.
+
+    Safe to call mid-run between batch files — by the time a per-file
+    analysis returns, the `combined` memmap reference has gone out of
+    scope, so `os.remove` will succeed on POSIX (the OS unlinks the
+    inode; any lingering mapping survives until the last fd closes) and
+    on Windows once gc has reclaimed the memmap object.
+    """
     for p in list(_firefly_temp_stack_paths):
         try:    os.remove(p)
         except Exception: pass
+    _firefly_temp_stack_paths.clear()
 
 
 #  How much physical RAM to leave for the OS + the user's other apps.
@@ -834,9 +865,25 @@ def load_tif(path, stop_event=None, files=None):
         pass
 
     if use_memmap:
-        import tempfile
+        import tempfile, shutil
+        tmp_dir = _resolve_temp_stack_dir()
+        # If the chosen temp dir doesn't have enough free disk space for
+        # the memmap, fall back to the OS default — better an obscure
+        # /var/folders path than an immediate ENOSPC.
+        if tmp_dir is not None:
+            try:
+                disk_free = shutil.disk_usage(tmp_dir).free
+                if disk_free < total_size * 1.05:
+                    print(f"  [warn] FIREFLY_TEMP_DIR={tmp_dir} has only "
+                          f"{disk_free/1e9:.1f} GB free but the memmap "
+                          f"needs {total_gb:.1f} GB — falling back to "
+                          f"the OS temp dir.", flush=True)
+                    tmp_dir = None
+            except Exception:
+                tmp_dir = None
         tmp_fh = tempfile.NamedTemporaryFile(
-            prefix="firefly_stack_", suffix=".raw", delete=False)
+            prefix="firefly_stack_", suffix=".raw", delete=False,
+            dir=tmp_dir)
         tmp_path = tmp_fh.name
         tmp_fh.close()
         _register_temp_stack_path(tmp_path)
