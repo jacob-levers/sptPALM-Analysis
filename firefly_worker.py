@@ -560,11 +560,23 @@ def _run_one_analysis(params: dict, msg_queue, cancel_event,
     mf  = compute_mobile_fraction_over_time(
         tracks, diff_df, fi,
         d_threshold=float(p.get("mobile_d_threshold", 0.05)))
-    _, cluster_stats_df, _, cluster_xy = compute_clusters(
+    cluster_labels, cluster_stats_df, _, cluster_xy = compute_clusters(
         locs, px,
         eps_um=float(p.get("cluster_eps_nm", 50.0)) / 1000.0,
         min_samples=int(p.get("cluster_min_samples", 10)))
     dwell_df, dwell_tau = compute_dwell_times(tracks, diff_df, fi)
+    # MSS slope per track — merged into diff_df so the figure's MSS
+    # panel and downstream CSVs see it.  Skipped silently when there
+    # are no tracks long enough (compute_mss returns an empty frame).
+    try:
+        mss_df = compute_mss(tracks, px, fi)
+        if mss_df is not None and len(mss_df) > 0:
+            diff_df = diff_df.merge(mss_df, on="particle", how="left")
+            _log(f"  MSS slopes computed for {len(mss_df):,} tracks")
+        else:
+            _log(f"  MSS: no tracks long enough — panel N will be empty")
+    except Exception as exc:
+        _log(f"  WARN: MSS computation failed: {exc}")
     _check_stop()
 
     # ── Render figure ─────────────────────────────────────────────────────
@@ -577,7 +589,8 @@ def _run_one_analysis(params: dict, msg_queue, cancel_event,
         proj_sample, tracks, imsd_df, emsd_df, diff_df, px, fi,
         fig_theme=fig_theme, proj_cmap=fig_proj_cmap,
         jdd=jdd, turning_angles=ta, mobile_frac_df=mf,
-        cluster_locs=cluster_xy, dwell_df=dwell_df, dwell_tau=dwell_tau,
+        cluster_labels=cluster_labels, cluster_locs=cluster_xy,
+        dwell_df=dwell_df, dwell_tau=dwell_tau,
         return_pdf_bytes=want_pdf)
     del proj_sample
 
