@@ -43,6 +43,17 @@ from __future__ import annotations
 import os
 import sys
 
+# ── CUDA sidecar injection ───────────────────────────────────────────────────
+# Must run BEFORE any torch import so the CUDA-built torch in
+# %LOCALAPPDATA%\FIREFLY\torch-cuda can shadow the bundled CPU build.
+# A failure here (no GPU, no sidecar, permissions, etc.) must NEVER
+# crash startup — fall through silently to the CPU build.
+try:
+    from cuda_installer import inject_sidecar_into_sys_path
+    inject_sidecar_into_sys_path()
+except Exception:
+    pass
+
 # ── MPS allocator tuning (must be set BEFORE torch import anywhere) ───────────
 # Disable the high-watermark check so MPS aggressively reuses memory instead
 # of holding committed blocks across ops.  Enable CPU fallback so missing
@@ -2619,6 +2630,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_ui()
         self._install_menubar()
         self._install_crash_hooks()
+        # First-launch CUDA-acceleration prompt (Windows + NVIDIA only;
+        # no-op everywhere else).  Deferred so the main window paints
+        # first, then the modal QMessageBox appears on top of it.
+        QtCore.QTimer.singleShot(500, self._maybe_offer_cuda_install)
         self._load_icon()
         self._load_roi_polygons()
         self._restore_settings()
@@ -3434,6 +3449,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 "(esp. on GPU) but more RAM. 500 is balanced; tune up if your\n"
                 "stack and free RAM are large.")
         gl.addRow("Chunk size (frames)", self.s_chunk_size)
+
+        # Manual GPU-acceleration entry point — Windows only.  When CUDA
+        # is already installed the button uninstalls; otherwise it kicks
+        # off the same downloader the first-launch prompt uses.
+        self._cuda_btn = QtWidgets.QPushButton("Set up GPU acceleration…")
+        self._cuda_btn.setToolTip(
+            "Download the CUDA build of PyTorch (~2.5 GB) to "
+            "%LOCALAPPDATA%\\FIREFLY\\torch-cuda so FIREFLY can use your "
+            "NVIDIA GPU for ~5–10× faster localisation.")
+        self._cuda_btn.clicked.connect(self._on_cuda_button_clicked)
+        self._cuda_btn.setVisible(sys.platform == "win32")
+        gl.addRow("", self._cuda_btn)
+
         layout.addWidget(sec)
 
         layout.addStretch(1)
@@ -7021,6 +7049,206 @@ class MainWindow(QtWidgets.QMainWindow):
             self._analysis_stack.setCurrentIndex(1)
         except AttributeError:
             pass
+
+    # ── CUDA-torch sidecar installer (Windows + NVIDIA only) ─────────────
+    def _maybe_offer_cuda_install(self):
+        """First-launch (and every-launch-until-handled) prompt that
+        offers to download the CUDA build of PyTorch into a sidecar
+        directory.  Silent no-op on macOS/Linux or when the user
+        previously declined or already installed."""
+        try:
+            import cuda_installer as _cu
+        except Exception:
+            return
+        try:
+            if not _cu.is_windows():
+                return
+            if _cu.is_installed():
+                return
+            if _cu.user_declined():
+                return
+            gpu = _cu.detect_nvidia_gpu()
+            if not gpu:
+                return
+            msg = (
+                f"NVIDIA {gpu} detected.\n\n"
+                "Install CUDA acceleration for ~5–10× faster "
+                "localisation?\n\n"
+                "One-time ~2.5 GB download to "
+                "%LOCALAPPDATA%\\FIREFLY\\torch-cuda."
+            )
+            reply = QtWidgets.QMessageBox.question(
+                self, "Install CUDA acceleration?", msg,
+                QtWidgets.QMessageBox.StandardButton.Yes
+                | QtWidgets.QMessageBox.StandardButton.No,
+                QtWidgets.QMessageBox.StandardButton.Yes,
+            )
+            if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+                self._run_cuda_install()
+            else:
+                try:
+                    _cu.mark_declined()
+                except Exception:
+                    pass
+        except Exception:
+            # Never let installer code crash the GUI on startup.
+            pass
+
+    def _on_cuda_button_clicked(self):
+        """Manual entry point from the Performance section button."""
+        try:
+            import cuda_installer as _cu
+        except Exception:
+            QtWidgets.QMessageBox.warning(
+                self, "CUDA installer unavailable",
+                "The CUDA installer module could not be loaded.")
+            return
+        if _cu.is_installed():
+            reply = QtWidgets.QMessageBox.question(
+                self, "Remove CUDA acceleration?",
+                "CUDA acceleration is currently installed at\n"
+                f"{_cu.sidecar_dir()}\n\n"
+                "Remove it?  (You can reinstall any time.)",
+                QtWidgets.QMessageBox.StandardButton.Yes
+                | QtWidgets.QMessageBox.StandardButton.No,
+                QtWidgets.QMessageBox.StandardButton.No,
+            )
+            if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+                try:
+                    _cu.uninstall()
+                    QtWidgets.QMessageBox.information(
+                        self, "CUDA removed",
+                        "CUDA acceleration has been removed.  Restart "
+                        "FIREFLY to drop back to the bundled CPU build.")
+                except Exception as exc:
+                    QtWidgets.QMessageBox.warning(
+                        self, "Removal failed", str(exc))
+            return
+        # Not installed → kick off the same flow as the auto-prompt.
+        try:
+            _cu.clear_declined()
+        except Exception:
+            pass
+        self._run_cuda_install()
+
+    def _run_cuda_install(self):
+        """Drive the download + extract in a background QThread and show
+        a cancellable QProgressDialog with two phases."""
+        try:
+            import cuda_installer as _cu
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "CUDA installer unavailable", str(exc))
+            return
+
+        dlg = QtWidgets.QProgressDialog(
+            "Preparing download…", "Cancel", 0, 100, self)
+        dlg.setWindowTitle("Installing CUDA acceleration")
+        dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.setMinimumDuration(0)
+        dlg.setValue(0)
+
+        # Background worker — QObject moved to a QThread (NOT a
+        # QThread subclass).  Signals dispatch back to the GUI thread.
+        class _CudaWorker(QtCore.QObject):
+            progress = QtCore.Signal(int, str)   # pct, label
+            finished = QtCore.Signal()
+            failed   = QtCore.Signal(str)
+
+            def __init__(self, cancel_check):
+                super().__init__()
+                self._cancel_check = cancel_check
+
+            @QtCore.Slot()
+            def run(self):
+                try:
+                    def _dl_cb(done, total):
+                        if total > 0:
+                            pct = int(done * 100 / total)
+                        else:
+                            # Unknown total — show MB downloaded
+                            pct = 0
+                        mb = done / (1024 * 1024)
+                        if total > 0:
+                            tot_mb = total / (1024 * 1024)
+                            label = (f"Downloading torch-CUDA wheel… "
+                                     f"{mb:.0f} / {tot_mb:.0f} MB")
+                        else:
+                            label = (f"Downloading torch-CUDA wheel… "
+                                     f"{mb:.0f} MB")
+                        self.progress.emit(pct, label)
+
+                    def _ex_cb(done, total):
+                        if total > 0:
+                            pct = int(done * 100 / total)
+                        else:
+                            pct = 0
+                        self.progress.emit(
+                            pct, f"Extracting… {done} / {total} files")
+
+                    _cu.install_cuda_torch(
+                        download_progress_cb=_dl_cb,
+                        extract_progress_cb=_ex_cb,
+                        cancel_cb=self._cancel_check,
+                    )
+                    self.finished.emit()
+                except Exception as exc:
+                    self.failed.emit(str(exc))
+
+        thread = QtCore.QThread(self)
+        worker = _CudaWorker(cancel_check=lambda: dlg.wasCanceled())
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+
+        # Keep refs alive on self until the thread exits
+        self._cuda_thread = thread
+        self._cuda_worker = worker
+
+        def _on_progress(pct, label):
+            try:
+                dlg.setLabelText(label)
+                dlg.setValue(max(0, min(100, pct)))
+            except Exception:
+                pass
+
+        def _cleanup():
+            try:
+                thread.quit()
+                thread.wait(2000)
+            except Exception:
+                pass
+            try:
+                dlg.close()
+            except Exception:
+                pass
+            self._cuda_thread = None
+            self._cuda_worker = None
+
+        def _on_finished():
+            _cleanup()
+            QtWidgets.QMessageBox.information(
+                self, "CUDA installed",
+                "CUDA acceleration installed successfully.\n\n"
+                "Restart FIREFLY to use GPU acceleration.")
+
+        def _on_failed(msg):
+            _cleanup()
+            # Make sure the user can retry on next launch.
+            try:
+                _cu.clear_declined()
+            except Exception:
+                pass
+            QtWidgets.QMessageBox.warning(
+                self, "CUDA install failed", msg)
+
+        worker.progress.connect(_on_progress)
+        worker.finished.connect(_on_finished)
+        worker.failed.connect(_on_failed)
+
+        thread.start()
+        dlg.show()
 
     # ── Crash reporter integration ────────────────────────────────────────
     def _install_menubar(self):

@@ -33,6 +33,18 @@ import time
 import traceback
 
 
+# ── CUDA sidecar injection ───────────────────────────────────────────────────
+# Must run BEFORE any torch import so the CUDA-built torch in
+# %LOCALAPPDATA%\FIREFLY\torch-cuda can shadow the bundled CPU build.
+# A failure here (no GPU, no sidecar, permissions, etc.) must NEVER
+# crash the worker — fall through silently to the CPU build.
+try:
+    from cuda_installer import inject_sidecar_into_sys_path
+    inject_sidecar_into_sys_path()
+except Exception:
+    pass
+
+
 # ── MPS allocator tuning — must be set BEFORE torch import anywhere ──────────
 # See app_qt.py for the rationale.  Setting here too is cheap
 # insurance in case the parent's setting somehow didn't reach the child.

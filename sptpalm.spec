@@ -86,6 +86,7 @@ hidden += [
     "firefly_worker",
     "crash_reporter",
     "sptpalm_analysis",
+    "cuda_installer",
     # Encoding tables sometimes missed in frozen builds
     "encodings.utf_8",
     "encodings.ascii",
@@ -139,6 +140,7 @@ except Exception:
 datas += [("sptpalm_analysis.py", ".")]
 datas += [("firefly_worker.py",   ".")]
 datas += [("crash_reporter.py",   ".")]
+datas += [("cuda_installer.py",   ".")]
 
 # Bundle the app icon PNG so the Qt window/dock icon can be loaded
 # at runtime from sys._MEIPASS/assets/icon.png in frozen mode.
