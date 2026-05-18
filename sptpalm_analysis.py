@@ -2792,6 +2792,38 @@ def _resolve_backend(name: str | None):
             raise RuntimeError(
                 "Torch device pin requested but PyTorch isn't installed.")
         forced = name[len("torch-"):]
+        # Validate the requested device is actually available BEFORE
+        # we start running the pipeline — otherwise the failure happens
+        # mid-localisation with a cryptic "Torch not compiled with CUDA
+        # enabled" assertion, after the user has already waited for
+        # frame loading + preprocessing.
+        try:
+            import torch as _torch
+            short = forced.split(":", 1)[0]
+            if short == "cuda" and not _torch.cuda.is_available():
+                raise RuntimeError(
+                    "You selected the NVIDIA CUDA backend but the "
+                    "bundled PyTorch is CPU-only.\n\n"
+                    "Fix: on Windows, click the 'Set up GPU acceleration…' "
+                    "button in the Analysis sidebar to install the CUDA "
+                    "wheel — or change the Detection backend dropdown to "
+                    "'Auto' or 'Torch — CPU' to continue without GPU.")
+            if short == "mps":
+                has_mps = (hasattr(_torch.backends, "mps")
+                           and _torch.backends.mps.is_available())
+                if not has_mps:
+                    raise RuntimeError(
+                        "You selected the Apple MPS backend but this "
+                        "system doesn't have MPS available "
+                        "(MPS requires Apple Silicon + macOS 12+).\n\n"
+                        "Change the Detection backend dropdown to 'Auto' "
+                        "or 'Torch — CPU' to continue.")
+        except RuntimeError:
+            raise
+        except Exception:
+            # If we can't introspect torch for any reason, fall through
+            # and let the original code path produce its native error.
+            pass
         inst = TorchBackend()
         inst._forced_device = forced
         return inst

@@ -5855,6 +5855,63 @@ class MainWindow(QtWidgets.QMainWindow):
             return label   # already an internal value
         return label or "auto"
 
+    def _validate_selected_backend(self) -> bool:
+        """Pre-flight check before a run.  Catches the common "user picked
+        CUDA on a CPU-only torch" footgun BEFORE the analysis subprocess
+        wastes minutes on frame loading + preprocessing only to crash on
+        the first CUDA call with "Torch not compiled with CUDA enabled".
+
+        Returns True if the run should proceed, False if the user
+        cancelled after we surfaced the problem.  Offers a one-click
+        switch to a safe fallback so the user doesn't have to navigate
+        back to the dropdown.
+        """
+        value = self._backend_value_from_label(self.c_backend.currentText())
+        if not value or not value.startswith("torch-"):
+            return True
+        forced = value[len("torch-"):].split(":", 1)[0]
+        try:
+            import torch as _t
+            if forced == "cuda" and not _t.cuda.is_available():
+                msg = (
+                    "You picked the NVIDIA CUDA backend, but the bundled "
+                    "PyTorch is CPU-only.\n\n"
+                    "Options:\n"
+                    "  • Cancel, then click 'Set up GPU acceleration…' in "
+                    "the Performance section to install the CUDA wheel.\n"
+                    "  • Or switch to a CPU/Auto backend now and continue.")
+                box = QtWidgets.QMessageBox(
+                    QtWidgets.QMessageBox.Icon.Warning,
+                    "CUDA backend unavailable", msg,
+                    QtWidgets.QMessageBox.StandardButton.NoButton, self)
+                btn_switch = box.addButton(
+                    "Switch to Auto and continue",
+                    QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+                btn_cancel = box.addButton(
+                    "Cancel",
+                    QtWidgets.QMessageBox.ButtonRole.RejectRole)
+                box.setDefaultButton(btn_switch)
+                box.exec()
+                if box.clickedButton() is btn_switch:
+                    self.c_backend.setCurrentText("Auto")
+                    return True
+                return False
+            if forced == "mps":
+                has_mps = (hasattr(_t.backends, "mps")
+                           and _t.backends.mps.is_available())
+                if not has_mps:
+                    QtWidgets.QMessageBox.warning(
+                        self, "MPS backend unavailable",
+                        "You picked the Apple MPS backend, but this system "
+                        "doesn't have MPS available (needs Apple Silicon + "
+                        "macOS 12+).  Switch to Auto or Torch — CPU.")
+                    return False
+        except Exception:
+            # If torch import itself fails, let the worker emit its own
+            # error — don't block the user here.
+            pass
+        return True
+
     # ── Event handlers ────────────────────────────────────────────────────
     def _on_browse_file(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -6477,6 +6534,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Pick an input file on the Import tab first.")
             self._switch_to_tab("Import")
             return
+        # Pre-flight backend validation — catches "user picked CUDA on
+        # a CPU-only torch" before we waste minutes on frame loading.
+        if not self._validate_selected_backend():
+            return
         # Auto-switch to the Analysis tab so the user sees progress
         self._switch_to_tab("Analysis")
         self._start_elapsed_timer()
@@ -6544,6 +6605,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 "On the Import tab, switch to Batch mode and pick a "
                 "folder + at least one file.")
             self._switch_to_tab("Import")
+            return
+        if not self._validate_selected_backend():
             return
         self._switch_to_tab("Analysis")
         self._start_elapsed_timer()
