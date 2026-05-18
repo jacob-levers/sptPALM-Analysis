@@ -3,7 +3,7 @@ import multiprocessing
 import sys
 import os
 
-__version__ = "2.4.0"
+__version__ = "2.4.1"
 
 # Fix macOS multiprocessing crashes — must be set before any other imports
 if sys.platform == "darwin":
@@ -882,12 +882,16 @@ def load_tif(path, stop_event=None, files=None):
 # (-1 for 1-indexed tools); units lets us convert nm → px on the fly.
 _CSV_PRESETS: dict = {
     "PALM-Tracer": {
-        "frame":     ("Plane", "frame", "Frame"),
+        # Output columns vary slightly between PALM-Tracer versions
+        # (.csv from the newer GUI vs .txt from older MetaMorph plug-in).
+        "frame":     ("Plane", "Frame", "frame",
+                       "Slice", "T", "t"),
         "frame_offset": -1,                 # PALM-Tracer is 1-indexed
-        "x":         ("X", "x"),
-        "y":         ("Y", "y"),
+        "x":         ("X", "Centroid X", "Centroid_X", "x", "Position X"),
+        "y":         ("Y", "Centroid Y", "Centroid_Y", "y", "Position Y"),
         "xy_unit":   "px",
-        "mass":      ("IntegratedIntensity", "Mass", "Amp", "mass"),
+        "mass":      ("IntegratedIntensity", "Integrated Intensity",
+                       "Mass", "Amp", "Amplitude", "Intensity", "mass"),
     },
     "ThunderSTORM": {
         "frame":     ("frame", "Frame"),
@@ -923,13 +927,17 @@ def load_external_locs(csv_path: str, preset: str = "auto",
                        pixel_size_um: float = 0.106,
                        column_map: "dict | None" = None,
                        frame_offset: int | None = None):
-    """Load a localisations CSV exported by an external tool and map
+    """Load a localisations file exported by an external tool and map
     its columns to FIREFLY's canonical schema {frame, x, y, mass}.
+
+    Accepts `.csv`, `.txt` and `.tsv` — PALM-Tracer's UI emits
+    tab-separated `.txt` files; ThunderSTORM and Picasso use commas.
+    The separator is auto-detected by pandas' python engine.
 
     Parameters
     ----------
     csv_path : str
-        Path to the input CSV (header row required).
+        Path to the input file (header row required).
     preset : str
         One of "PALM-Tracer", "ThunderSTORM", "Picasso", "Custom", or
         "auto" to sniff the header.
@@ -949,7 +957,34 @@ def load_external_locs(csv_path: str, preset: str = "auto",
     float `y` (pixels), float `mass` (raw intensity / photon count).
     """
     import pandas as _pd
-    df = _pd.read_csv(csv_path)
+    # Try comma first (most CSV exports); fall back to auto-detect via
+    # the python engine which sniffs the separator from the first row.
+    # PALM-Tracer's .txt uses tabs; Picasso .csv uses commas; ThunderSTORM
+    # uses commas.  Auto-detect handles all of them but is slower, so
+    # we do the comma fast path first and only fall back if it produced
+    # a single ugly all-in-one-column DataFrame.
+    df = None
+    last_exc: Exception | None = None
+    for kwargs in (
+        {"sep": ",", "engine": "c"},
+        {"sep": "\t", "engine": "c"},
+        {"sep": None, "engine": "python"},   # python engine sniffs the sep
+    ):
+        try:
+            attempt = _pd.read_csv(csv_path, **kwargs)
+        except Exception as exc:
+            last_exc = exc
+            continue
+        if attempt.shape[1] > 1:        # actually parsed multiple columns
+            df = attempt
+            print(f"  Parsed CSV with sep={kwargs['sep']!r}")
+            break
+    if df is None:
+        if last_exc is not None:
+            raise last_exc
+        raise ValueError(
+            f"Couldn't parse {csv_path} as CSV / TSV — single-column "
+            f"result on every attempted separator.")
 
     if preset == "auto" or not preset:
         sniffed = _autodetect_csv_preset(list(df.columns))

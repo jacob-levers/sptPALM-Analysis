@@ -3748,13 +3748,13 @@ class MainWindow(QtWidgets.QMainWindow):
         row = QtWidgets.QHBoxLayout()
         self.e_csv_path = QtWidgets.QLineEdit()
         self.e_csv_path.setPlaceholderText(
-            "Pick a localisations CSV from PALM-Tracer / "
-            "ThunderSTORM / Picasso…")
+            "Pick a localisations file (.csv / .txt / .tsv) from "
+            "PALM-Tracer / ThunderSTORM / Picasso…")
         btn_csv = QtWidgets.QPushButton("Browse")
         btn_csv.clicked.connect(self._on_browse_csv)
         row.addWidget(self.e_csv_path, 1); row.addWidget(btn_csv)
         w_csv = QtWidgets.QWidget(); w_csv.setLayout(row)
-        cg.addRow("Localisations CSV", w_csv)
+        cg.addRow("Localisations file", w_csv)
         # Preset combo
         self.c_csv_preset = _QuietComboBox()
         self.c_csv_preset.addItems(
@@ -5846,9 +5846,12 @@ class MainWindow(QtWidgets.QMainWindow):
     # ── External-CSV pickers ──────────────────────────────────────────────
     def _on_browse_csv(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Select localisations CSV",
+            self, "Select localisations file",
             self.e_csv_outdir.text() or os.path.expanduser("~"),
-            "CSV (*.csv);;All files (*)")
+            "Localisations (*.csv *.txt *.tsv);;"
+            "CSV (*.csv);;"
+            "Tab / text (*.txt *.tsv);;"
+            "All files (*)")
         if path:
             self.e_csv_path.setText(path)
             if not self.e_csv_outdir.text():
