@@ -7238,14 +7238,17 @@ class MainWindow(QtWidgets.QMainWindow):
                         self.progress.emit(
                             pct, f"Extracting… {done} / {total} files")
 
-                    # Use the URL we resolved on the main thread to
-                    # skip a second `import torch` inside the worker.
-                    _cu.install_cuda_torch_from_url(
-                        self._wheel_url,
+                    # Auto-fallback across cu124 → cu121 → cu118 so a
+                    # missing cu124 wheel for a brand-new torch version
+                    # doesn't dead-end with HTTP 404.
+                    def _status(msg):
+                        self.progress.emit(0, msg)
+                    _cu.install_cuda_torch_auto(
                         torch_version=self._torch_version,
                         download_progress_cb=_dl_cb,
                         extract_progress_cb=_ex_cb,
                         cancel_cb=self._cancel_check,
+                        status_cb=_status,
                     )
                     self.finished.emit()
                 except Exception as exc:
@@ -7263,14 +7266,55 @@ class MainWindow(QtWidgets.QMainWindow):
         self._cuda_thread = thread
         self._cuda_worker = worker
 
+        # Heartbeat — while we're still in the "connecting" phase (no
+        # bytes downloaded yet) the dialog would otherwise show a frozen
+        # static label.  Tick once a second so the user can see the app
+        # is alive.  Stops automatically when real download progress
+        # starts arriving.
+        import time as _t
+        self._cuda_started_at = _t.monotonic()
+        self._cuda_last_label = (
+            f"Connecting to download.pytorch.org…\n"
+            f"(torch {ver} + cu124)")
+        self._cuda_in_real_progress = False
+
+        def _heartbeat():
+            if self._cuda_in_real_progress:
+                return
+            try:
+                elapsed = int(_t.monotonic() - self._cuda_started_at)
+                dlg.setLabelText(
+                    f"{self._cuda_last_label}  ({elapsed} s elapsed)")
+            except Exception:
+                pass
+
+        self._cuda_heartbeat = QtCore.QTimer(self)
+        self._cuda_heartbeat.setInterval(1000)
+        self._cuda_heartbeat.timeout.connect(_heartbeat)
+        self._cuda_heartbeat.start()
+
         def _on_progress(pct, label):
             try:
+                # Anything that mentions MB or files is real download/
+                # extract progress — switch off the elapsed-time
+                # heartbeat and let the worker drive the label.
+                if ("MB" in label) or ("files" in label):
+                    self._cuda_in_real_progress = True
+                else:
+                    # Still in connecting / fallback-tag-trying phase
+                    # — remember the label so the heartbeat can append
+                    # elapsed time without flicker.
+                    self._cuda_last_label = label
                 dlg.setLabelText(label)
                 dlg.setValue(max(0, min(100, pct)))
             except Exception:
                 pass
 
         def _cleanup():
+            try:
+                self._cuda_heartbeat.stop()
+            except Exception:
+                pass
             try:
                 thread.quit()
                 thread.wait(2000)
@@ -7282,6 +7326,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
             self._cuda_thread = None
             self._cuda_worker = None
+            self._cuda_heartbeat = None
 
         def _on_finished():
             _cleanup()
