@@ -220,7 +220,16 @@ def download_wheel(url: str,
     and removes the partial file.
     """
     os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
-    chunk_size = 64 * 1024
+    # Bigger chunks → fewer read() syscalls AND fewer progress signals
+    # queued to the GUI thread.  At ~50 MB/s on a 64 KB chunk that's
+    # ~800 signal emissions per second, which overwhelms Qt's event
+    # queue and starves paint events — Windows then marks the app
+    # "Not Responding" even though the download is fine.  256 KB cuts
+    # that to ~200/s and we additionally throttle progress_cb to
+    # ~10 Hz below.
+    chunk_size = 256 * 1024
+    progress_throttle_s = 0.1   # 10 Hz cap on progress callbacks
+    last_progress_t = 0.0
     # Remove any stale partial from a prior attempt
     try:
         if os.path.exists(dest_path):
@@ -274,11 +283,25 @@ def download_wheel(url: str,
                         break
                     out.write(chunk)
                     downloaded += len(chunk)
+                    # Throttle progress emissions to ~10 Hz.  Without
+                    # this, a fast connection floods the main Qt event
+                    # queue with thousands of queued slot calls per
+                    # second, paint events get starved, and Windows
+                    # marks the app "Not Responding".
                     if progress_cb is not None:
-                        try:
-                            progress_cb(downloaded, total)
-                        except Exception:
-                            pass
+                        now = time.monotonic()
+                        if (now - last_progress_t) >= progress_throttle_s:
+                            last_progress_t = now
+                            try:
+                                progress_cb(downloaded, total)
+                            except Exception:
+                                pass
+                # Final 100 % tick so the bar visibly hits the end.
+                if progress_cb is not None:
+                    try:
+                        progress_cb(downloaded, total)
+                    except Exception:
+                        pass
     except urllib.error.HTTPError as exc:
         try:
             os.remove(dest_path)
@@ -317,19 +340,24 @@ def extract_wheel(wheel_path: str,
                   progress_cb: Optional[Callable[[int, int], None]] = None
                   ) -> None:
     """Extract the .whl (a zip) into dest_dir.  progress_cb(done, total)
-    is invoked every ~50 files."""
+    is invoked at ~10 Hz."""
     os.makedirs(dest_dir, exist_ok=True)
+    last_t = 0.0
+    progress_throttle_s = 0.1
     try:
         with zipfile.ZipFile(wheel_path) as zf:
             names = zf.namelist()
             total = len(names)
             for i, name in enumerate(names, start=1):
                 zf.extract(name, dest_dir)
-                if progress_cb is not None and (i % 50 == 0 or i == total):
-                    try:
-                        progress_cb(i, total)
-                    except Exception:
-                        pass
+                if progress_cb is not None:
+                    now = time.monotonic()
+                    if (now - last_t) >= progress_throttle_s or i == total:
+                        last_t = now
+                        try:
+                            progress_cb(i, total)
+                        except Exception:
+                            pass
     except zipfile.BadZipFile as exc:
         raise RuntimeError(
             "The downloaded CUDA PyTorch wheel is corrupt.  Please try "
