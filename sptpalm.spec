@@ -121,7 +121,15 @@ except Exception:
 for _pkg in ("numpy", "pandas", "scipy", "scikit-image", "scikit-learn",
              "matplotlib", "napari", "vispy", "magicgui", "npe2",
              "tifffile", "trackpy", "joblib", "Pillow", "psutil",
-             "dask", "torch"):
+             "dask", "torch",
+             # Qt bindings — napari probes for these via
+             # `importlib.metadata.version("PySide6")` to decide which
+             # Qt backend to use.  Without the .dist-info the probe
+             # raises PackageNotFoundError and napari falls back to
+             # "Cannot show napari window".
+             "PySide6", "shiboken6", "qtpy", "superqt", "pydantic",
+             "imageio", "scikit-image", "cachey", "lazy_loader",
+             "pint", "app-model", "in-n-out", "psygnal"):
     try:
         datas += copy_metadata(_pkg)
     except Exception:
