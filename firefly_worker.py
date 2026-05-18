@@ -269,6 +269,7 @@ def _run_one_analysis(params: dict, msg_queue, cancel_event,
         compute_mobile_fraction_over_time, compute_clusters,
         compute_dwell_times, compute_mss, correct_drift,
         make_figure, save_palmtracer_csvs, apply_roi_mask, _Cancelled,
+        load_external_locs,
     )
 
     # Helper: check stop event at major pipeline boundaries.  Most of the
@@ -290,32 +291,82 @@ def _run_one_analysis(params: dict, msg_queue, cancel_event,
     for d in (fig_dir, data_dir, extras_dir):
         os.makedirs(d, exist_ok=True)
 
-    # ── Load ──────────────────────────────────────────────────────────────
-    _log(f"\n── Load ──────────────────────────")
-    _prog(5, "Loading stack…")
-    stack, meta_px, meta_fi = load_file(
-        fpath, channel=int(p.get("channel", 0)),
-        stop_event=cancel_event,
-        files=p.get("series_files"))
+    # ── Source-of-localisations branch ────────────────────────────────────
+    # Two modes:
+    #   • "image"        — load stack + preprocess + localise (the default
+    #                       PALM pipeline; uses GPU when available).
+    #   • "external_csv" — skip detection; load a CSV exported from
+    #                       PALM-Tracer / ThunderSTORM / Picasso and feed
+    #                       its localisations into linking + downstream
+    #                       analyses unchanged.
+    source = p.get("source", "image")
+    external_csv = source == "external_csv"
 
-    # Override file-embedded metadata only when the user explicitly ticked
-    # the "Override" checkbox (the GUI sends None otherwise).
-    px = p.get("pixel_size") or meta_px or 0.106
-    fi = p.get("frame_interval") or meta_fi or 0.02
-    n_frames = len(stack)
-    _log(f"  Shape: {stack.shape}  (T x Y x X)")
-    _log(f"  Frames: {n_frames:,}  |  px={px} µm  fi={fi} s")
-
-    # Sample frames evenly across the stack for the figure-background panel.
-    # Doing it before localisation keeps peak RAM down.
     import numpy as _np
-    n_proj = min(200, n_frames)
-    proj_idx = _np.linspace(0, n_frames - 1, n_proj, dtype=int)
-    proj_sample = stack[proj_idx].copy()
+    if not external_csv:
+        # ── Load ──────────────────────────────────────────────────────────
+        _log(f"\n── Load ──────────────────────────")
+        _prog(5, "Loading stack…")
+        stack, meta_px, meta_fi = load_file(
+            fpath, channel=int(p.get("channel", 0)),
+            stop_event=cancel_event,
+            files=p.get("series_files"))
+        # Override file-embedded metadata only when the user explicitly
+        # ticked the "Override" checkbox.
+        px = p.get("pixel_size") or meta_px or 0.106
+        fi = p.get("frame_interval") or meta_fi or 0.02
+        n_frames = len(stack)
+        _log(f"  Shape: {stack.shape}  (T x Y x X)")
+        _log(f"  Frames: {n_frames:,}  |  px={px} µm  fi={fi} s")
+        # Sample frames for the figure-background panel.
+        n_proj = min(200, n_frames)
+        proj_idx = _np.linspace(0, n_frames - 1, n_proj, dtype=int)
+        proj_sample = stack[proj_idx].copy()
+    else:
+        # ── External CSV path ────────────────────────────────────────────
+        _log(f"\n── Load (external CSV) ───────────")
+        _prog(5, "Reading localisations from CSV…")
+        # Pixel size and frame interval come from the GUI; we don't try
+        # to infer them from the CSV (most tools don't embed them).
+        px = float(p.get("pixel_size") or 0.106)
+        fi = float(p.get("frame_interval") or 0.02)
+        locs_extern = load_external_locs(
+            fpath,
+            preset=p.get("csv_preset", "auto"),
+            pixel_size_um=px,
+            column_map=p.get("csv_column_map"),
+            frame_offset=p.get("csv_frame_offset"))
+        n_frames = int(locs_extern["frame"].max()) + 1
+        _log(f"  Frames: {n_frames:,}  |  px={px} µm  fi={fi} s")
+        # If the user provided a background image, sample frames from it
+        # for the figure's max-projection panel.  Otherwise hand the
+        # downstream code a blank canvas — make_figure handles that case.
+        bg_path = p.get("bg_image_path") or ""
+        if bg_path and os.path.isfile(bg_path):
+            try:
+                _log(f"  Loading background image: "
+                     f"{os.path.basename(bg_path)}")
+                bg_stack, _, _ = load_file(
+                    bg_path, channel=int(p.get("channel", 0)),
+                    stop_event=cancel_event)
+                n_bg = len(bg_stack)
+                n_proj = min(200, n_bg)
+                proj_idx = _np.linspace(0, n_bg - 1, n_proj, dtype=int)
+                proj_sample = bg_stack[proj_idx].copy()
+                del bg_stack
+            except Exception as exc:
+                _log(f"  WARN: background image failed to load — "
+                     f"figure projection panel will be blank.  ({exc})")
+                proj_sample = _np.zeros((1, 256, 256), dtype=_np.float32)
+        else:
+            proj_sample = _np.zeros((1, 256, 256), dtype=_np.float32)
 
     # ── Localisation ──────────────────────────────────────────────────────
     _log(f"\n── Localisation ──────────────────")
-    _prog(20, "Localising…")
+    if external_csv:
+        _prog(45, "Localisations loaded from CSV")
+    else:
+        _prog(20, "Localising…")
 
     # "Auto-detect minmass": pass None and let the pipeline pick a
     # data-dependent threshold from the first chunk's 99th percentile.
@@ -424,33 +475,52 @@ def _run_one_analysis(params: dict, msg_queue, cancel_event,
         except Exception:
             pass
 
-    try:
-        locs, mean_proj, _mm = preprocess_and_localise_adaptive(
-            stack,
-            diameter=int(p["diameter"]),
-            minmass=minmass_arg,
-            bg_radius=int(p.get("bg_radius", 10)),
-            bg_method=p.get("bg_method", "uniform_filter"),
-            workers=int(p["workers"]),
-            chunk_size=int(p["chunk_size"]),
-            stop_event=cancel_event,
-            mass_cb=_mass_cb,
-            preview_cb=_preview_cb,
-            backend=p["backend"])
-    finally:
-        # Stop the preview pump and let it drain whatever's left
+    if not external_csv:
+        try:
+            locs, mean_proj, _mm = preprocess_and_localise_adaptive(
+                stack,
+                diameter=int(p["diameter"]),
+                minmass=minmass_arg,
+                bg_radius=int(p.get("bg_radius", 10)),
+                bg_method=p.get("bg_method", "uniform_filter"),
+                workers=int(p["workers"]),
+                chunk_size=int(p["chunk_size"]),
+                stop_event=cancel_event,
+                mass_cb=_mass_cb,
+                preview_cb=_preview_cb,
+                backend=p["backend"])
+        finally:
+            # Stop the preview pump and let it drain whatever's left
+            _preview_stop.set()
+            try:    _preview_thread.join(timeout=1.0)
+            except Exception: pass
+        # Fast-path users get a single bulk emit (no per-chunk hook there).
+        try:
+            if locs is not None and len(locs) > 0 and "mass" in locs.columns:
+                _mass_cb(locs["mass"].values.astype("float32"))
+        except Exception:
+            pass
+        stack_h = stack.shape[1] if stack.ndim >= 3 else 0
+        stack_w = stack.shape[2] if stack.ndim >= 3 else 0
+    else:
+        # External CSV path: locs already loaded, no preview pump.
+        locs = locs_extern
+        stack_h = stack_w = 0
+        if proj_sample is not None and proj_sample.ndim >= 3:
+            stack_h = int(proj_sample.shape[1])
+            stack_w = int(proj_sample.shape[2])
+        # Stop the (idle) preview pump cleanly so it doesn't linger.
         _preview_stop.set()
         try:    _preview_thread.join(timeout=1.0)
         except Exception: pass
-    # Fast-path users get a single bulk emit (no per-chunk hook there).
-    try:
-        if locs is not None and len(locs) > 0 and "mass" in locs.columns:
-            _mass_cb(locs["mass"].values.astype("float32"))
-    except Exception:
-        pass
-    stack_h = stack.shape[1] if stack.ndim >= 3 else 0
-    stack_w = stack.shape[2] if stack.ndim >= 3 else 0
-    del stack
+        # Emit one mass-histogram update so the live histogram isn't empty
+        try:
+            if "mass" in locs.columns and len(locs) > 0:
+                _mass_cb(locs["mass"].values.astype("float32"))
+        except Exception:
+            pass
+    if not external_csv:
+        del stack
     _log(f"  → {len(locs):,} localisations")
     _check_stop()
 

@@ -3,7 +3,7 @@ import multiprocessing
 import sys
 import os
 
-__version__ = "2.3.4"
+__version__ = "2.4.0"
 
 # Fix macOS multiprocessing crashes — must be set before any other imports
 if sys.platform == "darwin":
@@ -874,6 +874,153 @@ def load_tif(path, stop_event=None, files=None):
     if px_um_out is not None: print(f"  Pixel size  : {px_um_out} µm  (from file metadata)")
     if fi_s_out is not None:  print(f"  Frame interval: {fi_s_out} s  (from file metadata)")
     return combined, px_um_out, fi_s_out
+
+
+# ── External-localisations loader ─────────────────────────────────────────────
+# Schema for a "preset" that maps an external tool's CSV columns to FIREFLY's
+# canonical {frame, x, y, mass}.  Frame offset is added to the source values
+# (-1 for 1-indexed tools); units lets us convert nm → px on the fly.
+_CSV_PRESETS: dict = {
+    "PALM-Tracer": {
+        "frame":     ("Plane", "frame", "Frame"),
+        "frame_offset": -1,                 # PALM-Tracer is 1-indexed
+        "x":         ("X", "x"),
+        "y":         ("Y", "y"),
+        "xy_unit":   "px",
+        "mass":      ("IntegratedIntensity", "Mass", "Amp", "mass"),
+    },
+    "ThunderSTORM": {
+        "frame":     ("frame", "Frame"),
+        "frame_offset": -1,                 # ThunderSTORM is 1-indexed
+        "x":         ("x [nm]", "x_nm", "x"),
+        "y":         ("y [nm]", "y_nm", "y"),
+        "xy_unit":   "nm",
+        "mass":      ("intensity [photon]", "intensity", "photons"),
+    },
+    "Picasso": {
+        "frame":     ("frame",),
+        "frame_offset": 0,                  # Picasso is 0-indexed
+        "x":         ("x", "x_pix"),
+        "y":         ("y", "y_pix"),
+        "xy_unit":   "px",
+        "mass":      ("photons", "photon", "intensity"),
+    },
+}
+
+
+def _autodetect_csv_preset(columns: "list[str]") -> "str | None":
+    """Best-effort: pick a preset whose required columns are all present."""
+    cols = set(c.strip() for c in columns)
+    for name, spec in _CSV_PRESETS.items():
+        # Need at least frame, x, y resolvable from this column set
+        def _any(opts): return any(o in cols for o in opts)
+        if (_any(spec["frame"]) and _any(spec["x"]) and _any(spec["y"])):
+            return name
+    return None
+
+
+def load_external_locs(csv_path: str, preset: str = "auto",
+                       pixel_size_um: float = 0.106,
+                       column_map: "dict | None" = None,
+                       frame_offset: int | None = None):
+    """Load a localisations CSV exported by an external tool and map
+    its columns to FIREFLY's canonical schema {frame, x, y, mass}.
+
+    Parameters
+    ----------
+    csv_path : str
+        Path to the input CSV (header row required).
+    preset : str
+        One of "PALM-Tracer", "ThunderSTORM", "Picasso", "Custom", or
+        "auto" to sniff the header.
+    pixel_size_um : float
+        Needed only for presets whose `x` / `y` are in nm
+        (e.g. ThunderSTORM) so we can convert to pixel units.
+    column_map : dict, optional
+        Required when `preset == "Custom"`.  Map canonical name →
+        source column name, e.g. {"frame": "plane_idx", "x": "x_um",
+        "y": "y_um", "mass": "amp"}.
+    frame_offset : int, optional
+        Overrides the preset's default (use -1 for 1-indexed sources).
+
+    Returns
+    -------
+    pandas.DataFrame  with columns int `frame`, float `x` (pixels),
+    float `y` (pixels), float `mass` (raw intensity / photon count).
+    """
+    import pandas as _pd
+    df = _pd.read_csv(csv_path)
+
+    if preset == "auto" or not preset:
+        sniffed = _autodetect_csv_preset(list(df.columns))
+        if sniffed is None:
+            raise ValueError(
+                f"Couldn't auto-detect a CSV preset for {csv_path} — "
+                f"header columns: {list(df.columns)}.  Use one of "
+                f"{list(_CSV_PRESETS) + ['Custom']} explicitly.")
+        preset = sniffed
+        print(f"  Auto-detected preset: {preset}")
+
+    # Resolve column names to use for each canonical field
+    if preset == "Custom":
+        if not column_map:
+            raise ValueError("Custom preset requires `column_map`")
+        mapping = {k: v for k, v in column_map.items() if v}
+        spec = {}      # no implicit offsets / units
+    else:
+        spec = _CSV_PRESETS.get(preset)
+        if spec is None:
+            raise ValueError(
+                f"Unknown preset '{preset}'.  Available: "
+                f"{list(_CSV_PRESETS) + ['Custom']}")
+        mapping = {}
+        for canonical in ("frame", "x", "y", "mass"):
+            for col in spec.get(canonical, ()):
+                if col in df.columns:
+                    mapping[canonical] = col
+                    break
+        # frame, x, y are required; mass is optional
+        for required in ("frame", "x", "y"):
+            if required not in mapping:
+                raise ValueError(
+                    f"Couldn't find a '{required}' column in {csv_path} "
+                    f"using preset '{preset}'.  Tried "
+                    f"{spec.get(required, ())}.  Header was: "
+                    f"{list(df.columns)}")
+
+    out = _pd.DataFrame()
+    out["frame"] = df[mapping["frame"]].astype("int64")
+    fo = frame_offset if frame_offset is not None else spec.get("frame_offset", 0)
+    if fo:
+        out["frame"] = out["frame"] + int(fo)
+    if (out["frame"] < 0).any():
+        # Drop any negative-frame rows that resulted from a wrong offset
+        n_bad = int((out["frame"] < 0).sum())
+        print(f"  WARN: {n_bad} localisations have frame < 0 after offset "
+              f"({fo}) — dropping them.")
+        keep = out["frame"] >= 0
+        df = df.loc[keep].reset_index(drop=True)
+        out = out.loc[keep].reset_index(drop=True)
+
+    x = df[mapping["x"]].astype(float).values
+    y = df[mapping["y"]].astype(float).values
+    if spec.get("xy_unit") == "nm":
+        x = x / (pixel_size_um * 1000.0)
+        y = y / (pixel_size_um * 1000.0)
+    out["x"] = x
+    out["y"] = y
+
+    if "mass" in mapping:
+        out["mass"] = df[mapping["mass"]].astype(float).values
+    else:
+        # Detection already happened upstream; downstream stages tolerate
+        # a constant mass column.  Filter-by-mass becomes a no-op which
+        # is the right behaviour for pre-filtered external data.
+        out["mass"] = 1.0
+    print(f"  Loaded {len(out):,} external localisations "
+          f"(preset={preset}, frames {int(out['frame'].min())}–"
+          f"{int(out['frame'].max())})")
+    return out
 
 
 def load_file(path, channel=0, stop_event=None, files=None):

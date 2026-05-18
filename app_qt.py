@@ -2712,6 +2712,13 @@ class MainWindow(QtWidgets.QMainWindow):
         # Build all parameter sections inside the scrollable area
         self._build_sidebar(sb_layout)
 
+        # Mirror each row-widget's tooltip onto its label, so hovering
+        # the SETTING NAME (e.g. "Pixel size (µm)") shows the same
+        # explanation as hovering the spinbox.  Done in one post-build
+        # sweep so individual addRow() calls don't have to remember to
+        # do it themselves.
+        self._propagate_form_tooltips(scroll_inner)
+
         # Pinned Start/Stop button outside the scroll area
         btn_container = QtWidgets.QWidget()
         btn_layout    = QtWidgets.QVBoxLayout(btn_container)
@@ -2889,12 +2896,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._console_dock.setWidget(self.console_log)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea,
                            self._console_dock)
-        # Hidden by default; user has to click Console to open.  Float
-        # the dock so toggling it open doesn't push the main window
-        # taller — the floating panel just appears next to the app and
-        # the user can drag it back into the main window if they want.
-        self._console_dock.setFloating(True)
-        self._console_dock.resize(800, 280)
+        # Docked at the bottom by default — Qt will shrink the central
+        # widget to accommodate, rather than growing the window.  Users
+        # can still drag the dock's title bar out to float it, or close
+        # it via the × button.  Hidden until the Console toolbar button
+        # is clicked.
+        self._console_dock.setFloating(False)
         self._console_dock.hide()
         # Keep the toggle button in sync when the dock is closed via its
         # own ✕ button
@@ -2928,6 +2935,71 @@ class MainWindow(QtWidgets.QMainWindow):
         form.setVerticalSpacing(6)
         sec.content_layout.addLayout(form)
         return sec, form
+
+    @staticmethod
+    def _propagate_form_tooltips(root: "QtWidgets.QWidget") -> None:
+        """Walk every QFormLayout in `root`'s subtree and copy each
+        row-widget's tooltip onto its label so hovering the SETTING
+        NAME (not just the spinbox / combo) reveals the explanation.
+
+        For rows whose field is a wrapper QWidget containing other
+        widgets (e.g. the Pixel-size row's `[Override checkbox]
+        [spinbox]` pair), we look for the most informative child
+        tooltip instead of the wrapper's own (which is empty).
+        """
+        def _best_tip(widget: "QtWidgets.QWidget") -> str:
+            tip = widget.toolTip() or ""
+            if tip.strip():
+                return tip
+            # Wrapper widget — fall through to the most specific child
+            # that carries a tooltip.  Prefer spinboxes / combos /
+            # sliders, then any other tooltip-bearing widget.
+            preferred = (QtWidgets.QAbstractSpinBox,
+                         QtWidgets.QComboBox,
+                         QtWidgets.QSlider,
+                         QtWidgets.QCheckBox,
+                         QtWidgets.QLineEdit)
+            best = ""
+            for cls in preferred:
+                for child in widget.findChildren(cls):
+                    t = (child.toolTip() or "").strip()
+                    if t:
+                        return t
+            for child in widget.findChildren(QtWidgets.QWidget):
+                t = (child.toolTip() or "").strip()
+                if t and len(t) > len(best):
+                    best = t
+            return best
+
+        # findChildren on a QWidget returns every QObject descendant
+        # matching the type; QFormLayout is a QObject under the parent
+        # widget hierarchy.
+        for form in root.findChildren(QtWidgets.QFormLayout):
+            try:
+                rows = form.rowCount()
+            except Exception:
+                continue
+            label_role = QtWidgets.QFormLayout.ItemRole.LabelRole
+            field_role = QtWidgets.QFormLayout.ItemRole.FieldRole
+            for r in range(rows):
+                lbl_item = form.itemAt(r, label_role)
+                fld_item = form.itemAt(r, field_role)
+                if lbl_item is None or fld_item is None:
+                    continue
+                lbl = lbl_item.widget()
+                fld = fld_item.widget()
+                if lbl is None or fld is None:
+                    continue
+                if (lbl.toolTip() or "").strip():
+                    continue   # caller already set one explicitly
+                tip = _best_tip(fld)
+                if tip:
+                    lbl.setToolTip(tip)
+                    # macOS sometimes needs a wider hover region than
+                    # the label's tightly-fitted geometry; this attribute
+                    # lets the label receive enter/leave events properly.
+                    lbl.setAttribute(
+                        Qt.WidgetAttribute.WA_AlwaysShowToolTips, True)
 
     @staticmethod
     def _make_vbox_section(title: str):
@@ -3072,17 +3144,26 @@ class MainWindow(QtWidgets.QMainWindow):
         # manually; auto-detect is for exploratory runs on new data.
         self.c_auto_minmass = QtWidgets.QCheckBox("Auto-detect")
         self.c_auto_minmass.setToolTip(
-            "When checked, the pipeline picks minmass from the first chunk's\n"
-            "99th-percentile pixel value × diameter²/8.  Heuristic — works on\n"
-            "many datasets but may under-shoot; manual tuning is more reliable.")
+            "When checked, the pipeline picks the detection threshold from\n"
+            "the first chunk's 99th-percentile pixel value × diameter²/8.\n"
+            "Heuristic — works on many datasets but may under-shoot; manual\n"
+            "tuning is more reliable.\n\n"
+            "Equivalent to PALM-Tracer's 'Threshold' field but measured on\n"
+            "the integrated raw intensity (trackpy 'mass') rather than on\n"
+            "the wavelet domain.")
         self.c_auto_minmass.setChecked(False)
         self.s_minmass = self._spin_dbl(1.0, 0.0, 100.0, 0.05, decimals=2,
-            tip="Minimum integrated intensity for a spot.\n"
+            tip="Detection threshold — minimum integrated intensity\n"
+                "(trackpy 'mass') for a spot to be kept.\n\n"
                 "Too low → many false-positive spots, slow linking, garbage tracks.\n"
-                "Too high → real spots filtered out.\n"
-                "After preprocessing (background subtract + per-frame normalise to\n"
-                "[0,1]) PALM masses typically land in the 0.5–50 range.  Start near\n"
-                "1.0 and sweep the slider — dim points vanish first as you raise it.")
+                "Too high → real spots filtered out.\n\n"
+                "After preprocessing (background subtract + per-frame\n"
+                "normalise to [0,1]) values typically land in the 0.5–50\n"
+                "range.  Start near 1.0 and sweep the slider — dim points\n"
+                "vanish first as you raise it.\n\n"
+                "Equivalent role to PALM-Tracer's 'Threshold' field, but the\n"
+                "unit is integrated raw intensity here, not k-σ on the\n"
+                "wavelet plane — values don't transfer directly between tools.")
         # Slider companion — QSlider is integer-only, and a plain linear
         # mapping over 0..5000 wastes 99% of slider travel on values above
         # the useful range.  Use a square law: minmass = (slider/1000)² × MAX
@@ -3103,8 +3184,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sld_minmass.setPageStep(20)
         self.sld_minmass.setValue(_mass_to_slider(self.s_minmass.value()))
         self.sld_minmass.setToolTip(
-            "Drag to sweep min-mass (square-law: fine at the low end, coarse\n"
-            "at the high end).  With 'Live preview' on, the ROI viewer updates\n"
+            "Drag to sweep the detection threshold (square-law: fine at the\n"
+            "low end, coarse at the high end).  The preview viewer updates\n"
             "spot overlays as you move.  Type into the spinbox for exact values.")
         self._minmass_sync_guard = False
         def _on_slider(v: int):
@@ -3134,7 +3215,7 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addWidget(self.s_minmass, 1)
         vmm.addLayout(row)
         vmm.addWidget(self.sld_minmass)
-        gl.addRow("Min mass", wmm)
+        gl.addRow("Threshold", wmm)
 
         # Push spinbox / combo edits into the live preview.  Background
         # widgets are wired here too because the preview re-preprocesses
@@ -3500,31 +3581,33 @@ class MainWindow(QtWidgets.QMainWindow):
         self.r_mode_batch = self._make_mode_tile(
             "Batch (folder)",
             "Process every file in a folder, one after another")
+        self.r_mode_csv = self._make_mode_tile(
+            "External CSV",
+            "Skip detection — load localisations from PALM-Tracer /\n"
+            "ThunderSTORM / Picasso and run linking + downstream\n"
+            "analyses only")
         self.r_mode_single.setChecked(True)
 
         # Manual exclusivity (these custom tiles aren't QAbstractButtons,
-        # so QButtonGroup can't manage them).  Clicking either uncheck
-        # the other and fires the mode-change handler.
-        def _on_single_toggled(checked):
-            if checked:
-                self.r_mode_batch.setChecked(False)
-                self._on_import_mode_changed(True)
-            elif not self.r_mode_batch.isChecked():
-                # Don't allow zero-selected state; re-check this one
-                self.r_mode_single.setChecked(True)
+        # so QButtonGroup can't manage them).  Clicking one unchecks the
+        # others and fires the mode-change handler.  Modes are tracked
+        # by string for clarity now that we have three of them.
+        def _set_mode(name: str):
+            self.r_mode_single.setChecked(name == "single")
+            self.r_mode_batch.setChecked(name == "batch")
+            self.r_mode_csv.setChecked(name == "csv")
+            self._on_import_mode_changed(name)
 
-        def _on_batch_toggled(checked):
-            if checked:
-                self.r_mode_single.setChecked(False)
-                self._on_import_mode_changed(False)
-            elif not self.r_mode_single.isChecked():
-                self.r_mode_batch.setChecked(True)
-
-        self.r_mode_single.toggled.connect(_on_single_toggled)
-        self.r_mode_batch.toggled.connect(_on_batch_toggled)
+        self.r_mode_single.toggled.connect(
+            lambda checked: _set_mode("single") if checked else None)
+        self.r_mode_batch.toggled.connect(
+            lambda checked: _set_mode("batch")  if checked else None)
+        self.r_mode_csv.toggled.connect(
+            lambda checked: _set_mode("csv")    if checked else None)
 
         mode_row.addWidget(self.r_mode_single, 1)
         mode_row.addWidget(self.r_mode_batch,  1)
+        mode_row.addWidget(self.r_mode_csv,    1)
         v.addLayout(mode_row)
 
         # ── Single-file sub-panel ─────────────────────────────────────────
@@ -3652,8 +3735,72 @@ class MainWindow(QtWidgets.QMainWindow):
 
         v.addWidget(self._batch_panel, stretch=1)
 
-        # Start visible state: single mode shown, batch hidden
+        # ── External-CSV sub-panel ────────────────────────────────────────
+        # "Skip detection" mode: load localisations from PALM-Tracer /
+        # ThunderSTORM / Picasso and run linking + downstream analyses
+        # only.  No image is loaded, so the live preview viewer below
+        # shows a placeholder unless the user supplies a background image
+        # (optional, used for the figure's max-projection panel only).
+        self._csv_panel = QtWidgets.QGroupBox("External CSV")
+        cg = QtWidgets.QFormLayout(self._csv_panel)
+        cg.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        # Input CSV
+        row = QtWidgets.QHBoxLayout()
+        self.e_csv_path = QtWidgets.QLineEdit()
+        self.e_csv_path.setPlaceholderText(
+            "Pick a localisations CSV from PALM-Tracer / "
+            "ThunderSTORM / Picasso…")
+        btn_csv = QtWidgets.QPushButton("Browse")
+        btn_csv.clicked.connect(self._on_browse_csv)
+        row.addWidget(self.e_csv_path, 1); row.addWidget(btn_csv)
+        w_csv = QtWidgets.QWidget(); w_csv.setLayout(row)
+        cg.addRow("Localisations CSV", w_csv)
+        # Preset combo
+        self.c_csv_preset = _QuietComboBox()
+        self.c_csv_preset.addItems(
+            ["Auto-detect", "PALM-Tracer", "ThunderSTORM",
+             "Picasso", "Custom"])
+        self.c_csv_preset.setToolTip(
+            "Source-tool preset.  Tells FIREFLY how to interpret the\n"
+            "CSV's columns (frame indexing, x/y units, mass column).\n"
+            "Auto-detect sniffs the header; pick a specific preset if\n"
+            "auto-detect picks the wrong one.")
+        cg.addRow("Source preset", self.c_csv_preset)
+        # Output folder
+        row = QtWidgets.QHBoxLayout()
+        self.e_csv_outdir = QtWidgets.QLineEdit()
+        self.e_csv_outdir.setPlaceholderText(
+            "Output folder for figure + CSV / JSON artifacts")
+        btn_csv_out = QtWidgets.QPushButton("Browse")
+        btn_csv_out.clicked.connect(self._on_browse_csv_outdir)
+        row.addWidget(self.e_csv_outdir, 1); row.addWidget(btn_csv_out)
+        w_csv_out = QtWidgets.QWidget(); w_csv_out.setLayout(row)
+        cg.addRow("Output folder", w_csv_out)
+        # Optional background image
+        row = QtWidgets.QHBoxLayout()
+        self.e_csv_bg = QtWidgets.QLineEdit()
+        self.e_csv_bg.setPlaceholderText(
+            "Optional — used only for the figure's max-projection panel")
+        btn_csv_bg = QtWidgets.QPushButton("Browse")
+        btn_csv_bg.clicked.connect(self._on_browse_csv_bg)
+        row.addWidget(self.e_csv_bg, 1); row.addWidget(btn_csv_bg)
+        w_csv_bg = QtWidgets.QWidget(); w_csv_bg.setLayout(row)
+        cg.addRow("Background image", w_csv_bg)
+        # Helpful note about which sidebar settings still matter
+        hint = QtWidgets.QLabel(
+            "External CSV mode uses:  Pixel size · Frame interval · "
+            "Linking · Diffusion · ROI · Drift correction · Clustering · "
+            "Figures.  Detection / preprocessing sidebar sections are "
+            "ignored.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {_THEME['TXT_MUTED']}; font-size: 11px;")
+        cg.addRow("", hint)
+        v.addWidget(self._csv_panel, stretch=1)
+
+        # Start visible state: single mode shown, others hidden
         self._batch_panel.hide()
+        self._csv_panel.hide()
+        self._import_mode = "single"
 
         # ── Embedded ROI viewer (always visible) ──────────────────────────
         self._roi_viewer_container = QtWidgets.QFrame()
@@ -3674,9 +3821,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.tabs.addTab(tab, "Import")
 
-    def _on_import_mode_changed(self, single_checked: bool):
-        self._single_panel.setVisible(single_checked)
-        self._batch_panel.setVisible(not single_checked)
+    def _on_import_mode_changed(self, mode):
+        """Show whichever sub-panel matches the new mode and hide the
+        others.  Accepts a string ("single" / "batch" / "csv") for the
+        new tri-state mode toggle; falls back to bool for the legacy
+        two-mode call sites."""
+        # Legacy callers pass a bool (single=True / batch=False).
+        if isinstance(mode, bool):
+            mode = "single" if mode else "batch"
+        self._import_mode = mode
+        try:    self._single_panel.setVisible(mode == "single")
+        except AttributeError: pass
+        try:    self._batch_panel.setVisible(mode == "batch")
+        except AttributeError: pass
+        try:    self._csv_panel.setVisible(mode == "csv")
+        except AttributeError: pass
 
     def _build_analysis_tab(self):
         """Analysis tab — pure status display.  Stage label, progress bar,
@@ -5684,6 +5843,32 @@ class MainWindow(QtWidgets.QMainWindow):
         if path:
             self.e_outdir.setText(path)
 
+    # ── External-CSV pickers ──────────────────────────────────────────────
+    def _on_browse_csv(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select localisations CSV",
+            self.e_csv_outdir.text() or os.path.expanduser("~"),
+            "CSV (*.csv);;All files (*)")
+        if path:
+            self.e_csv_path.setText(path)
+            if not self.e_csv_outdir.text():
+                self.e_csv_outdir.setText(os.path.dirname(path))
+
+    def _on_browse_csv_outdir(self):
+        path = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Select output folder",
+            self.e_csv_outdir.text() or os.path.expanduser("~"))
+        if path:
+            self.e_csv_outdir.setText(path)
+
+    def _on_browse_csv_bg(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select background image (optional)",
+            self.e_csv_outdir.text() or os.path.expanduser("~"),
+            "Image stacks (*.czi *.tif *.tiff);;All files (*)")
+        if path:
+            self.e_csv_bg.setText(path)
+
     def _on_load_manifest(self):
         """Open a `<stem>_run_manifest.json` and apply its widget_state
         snapshot to the sidebar, plus repopulate the input/output paths."""
@@ -6173,6 +6358,8 @@ class MainWindow(QtWidgets.QMainWindow):
         active_tab_label = self.tabs.tabText(self.tabs.currentIndex())
         if active_tab_label.startswith("Compare"):
             self._start_compare_run()
+        elif getattr(self, "r_mode_csv", None) and self.r_mode_csv.isChecked():
+            self._start_csv_run()
         elif self.r_mode_batch.isChecked():
             self._start_batch_run()
         else:
@@ -6185,6 +6372,71 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.tabs.tabText(i).startswith(label):
                 self.tabs.setCurrentIndex(i)
                 return
+
+    def _start_csv_run(self):
+        """External-CSV mode: skip detection, treat the CSV as the
+        localisations source and run the rest of the pipeline."""
+        csv_path = self.e_csv_path.text().strip()
+        if not csv_path or not os.path.isfile(csv_path):
+            QtWidgets.QMessageBox.warning(
+                self, "No CSV",
+                "Pick a localisations CSV on the Import tab first.")
+            self._switch_to_tab("Import")
+            return
+        out_dir = self.e_csv_outdir.text().strip() or os.path.dirname(csv_path)
+        self._switch_to_tab("Analysis")
+        self._start_elapsed_timer()
+
+        # Build params the same way as a normal run, then override the
+        # source-related fields.  Using the same widget snapshot means
+        # ROI / drift / linking / MSD / figure settings are honoured.
+        params = self._build_params_for_file(csv_path, out_dir)
+        # Pixel size / frame interval default off the sidebar even when
+        # the Override checkboxes are unticked — there's no file metadata
+        # to fall back on for a CSV.
+        if not params.get("pixel_size"):
+            params["pixel_size"] = float(self.s_pixel_size.value())
+        if not params.get("frame_interval"):
+            params["frame_interval"] = float(self.s_frame_interval.value())
+        preset = self.c_csv_preset.currentText()
+        params["source"] = "external_csv"
+        params["csv_preset"] = (
+            "auto" if preset == "Auto-detect" else preset)
+        bg = self.e_csv_bg.text().strip()
+        if bg and os.path.isfile(bg):
+            params["bg_image_path"] = bg
+
+        try:
+            self._save_settings()
+        except Exception:
+            pass
+
+        # Clear UI for new run
+        self.console_log.clear()
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("Starting…")
+        self.run_stage_label.setText("Starting…")
+        self.run_results.reset("Run in progress…")
+        try:
+            self.mass_hist.reset()
+            self.live_view.reset()
+            self._analysis_stack.setCurrentIndex(0)
+        except AttributeError:
+            pass
+        self._is_batch_run   = False
+        self._is_compare_run = False
+
+        self._msg_queue    = multiprocessing.Queue(maxsize=2000)
+        self._cancel_event = multiprocessing.Event()
+        self._proc = multiprocessing.Process(
+            target=_run_analysis_in_subprocess,
+            args=(params, self._msg_queue, self._cancel_event),
+            name="FIREFLY-AnalysisWorker",
+            daemon=False)
+        self._proc.start()
+        self._poll_timer.start()
+        self.btn_run.setText("Stop")
+        self.statusBar().showMessage("Running (external CSV)…")
 
     def _start_single_run(self):
         fpath = self.e_file.text().strip()
@@ -6825,7 +7077,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     "Pixel size":         self.s_pixel_size.value(),
                     "Frame interval":     self.s_frame_interval.value(),
                     "Detection diameter": self.s_diameter.value(),
-                    "Min mass":           self.s_minmass.value(),
+                    "Threshold":          self.s_minmass.value(),
                     "Detection backend":  self.c_backend.currentText(),
                     "Running":            (self._proc is not None
                                             and self._proc.is_alive()),
