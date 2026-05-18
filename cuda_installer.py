@@ -246,27 +246,50 @@ def download_wheel(url: str,
 
     # Watchdog for stalled reads.  resp.read(N) can block forever on
     # Windows when the TLS connection stalls mid-stream (same bug class
-    # that hung HEAD on cu118).  We sample `downloaded` every 2 s in a
-    # daemon thread; if no bytes arrive for `read_stall_s` seconds we
-    # tear the response down.  The worker's read call then returns
-    # cleanly (or raises) and we fail with a clear error instead of
-    # hanging the app forever.
+    # that hung HEAD on cu118) or when Windows Defender / a corporate
+    # firewall is intercepting the .whl write.  We sample `downloaded`
+    # every 1 s in a daemon thread; if no bytes arrive for
+    # `read_stall_s` seconds we tear the response down.  The worker's
+    # read call then returns cleanly (or raises) and we fail with a
+    # clear error instead of hanging the app forever.
+    #
+    # We ALSO emit an "activity heartbeat" log line every 2 s from the
+    # same daemon thread so the debug-log window keeps updating while
+    # the worker thread is blocked in resp.read() — without this, the
+    # log appears frozen at "Starting read loop" and the user can't
+    # tell whether anything is happening at all.
     import threading
-    read_stall_s = 30.0
+    read_stall_s = 10.0
     progress_state = {"downloaded": 0, "last_change_t": time.monotonic(),
-                       "should_abort": False}
+                       "should_abort": False, "done": False}
     resp_holder: dict = {"resp": None}
 
     def _stall_watchdog():
+        wd_start = time.monotonic()
+        last_heartbeat_at = wd_start
+        last_reported_bytes = 0
         while not progress_state["should_abort"]:
-            time.sleep(2.0)
+            time.sleep(1.0)
             now = time.monotonic()
             elapsed = now - progress_state["last_change_t"]
             if progress_state.get("done"):
                 return
+            # Heartbeat every 2 s — proves the watchdog thread (and
+            # therefore the Python interpreter / main loop) is alive,
+            # and shows whether bytes are trickling in slowly.
+            dl = progress_state["downloaded"]
+            if now - last_heartbeat_at >= 2.0:
+                last_heartbeat_at = now
+                if dl == last_reported_bytes:
+                    _log(f"  … still waiting for first chunk "
+                         f"({elapsed:.0f}s since last activity)")
+                else:
+                    _log(f"  … downloading slowly: {dl/1e6:.1f} MB so far "
+                         f"({(dl/1e6)/(now-wd_start):.2f} MB/s avg)")
+                last_reported_bytes = dl
             if elapsed > read_stall_s:
                 _log(f"  → STALL WATCHDOG: no data for {elapsed:.0f}s, "
-                     f"aborting (downloaded {progress_state['downloaded']/1e6:.1f} MB)")
+                     f"aborting (downloaded {dl/1e6:.1f} MB)")
                 progress_state["should_abort"] = True
                 try:
                     r = resp_holder.get("resp")
@@ -326,10 +349,22 @@ def download_wheel(url: str,
                     if progress_state["should_abort"]:
                         raise RuntimeError(
                             "Download stalled — no data received from "
-                            "download.pytorch.org for 30 seconds.  Your "
-                            "connection or a firewall is dropping the "
-                            "transfer mid-stream.  Try again, or install "
-                            "from source (see README).")
+                            "download.pytorch.org for 10 seconds, even "
+                            "though the HTTPS connection is alive.\n\n"
+                            "Common causes on Windows:\n"
+                            "  • Windows Defender / antivirus real-time "
+                            "scanning is blocking writes to the .whl "
+                            "file.  Try temporarily excluding "
+                            "%LOCALAPPDATA%\\FIREFLY\\torch-cuda from "
+                            "antivirus scanning, then retry.\n"
+                            "  • A corporate firewall / VPN doing TLS "
+                            "deep packet inspection is buffering the "
+                            "stream.  Try on a different network.\n"
+                            "  • If neither applies: install FIREFLY "
+                            "from source instead (see README's "
+                            "'Enabling CUDA' section) — that path uses "
+                            "pip's own download stack, which is more "
+                            "tolerant of these issues.")
                     out.write(chunk)
                     downloaded += len(chunk)
                     chunk_count += 1
