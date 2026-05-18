@@ -183,7 +183,8 @@ def _write_run_manifest(*, out_dir: str, stem: str, fpath: str,
 def _start_memory_watchdog(cancel_event, msg_queue,
                             critical_gb: float = 0.8,
                             warn_gb: float = 1.6,
-                            poll_s: float = 0.5):
+                            poll_s: float = 0.5,
+                            mem_abort_event=None):
     """Background daemon that aborts the run cleanly if free RAM gets
     dangerously low.
 
@@ -227,6 +228,12 @@ def _start_memory_watchdog(cancel_event, msg_queue,
                             f"larger FIREFLY_USER_RAM_RESERVE_GB and "
                             f"re-run."))
                     except Exception: pass
+                    # Signal that THIS abort came from the watchdog (not
+                    # the user) so the batch handler can skip-and-continue
+                    # to the next file rather than killing the whole run.
+                    if mem_abort_event is not None:
+                        try: mem_abort_event.set()
+                        except Exception: pass
                     cancel_event.set()
                 return
             if not warned and free_gb < warn_gb:
@@ -1213,8 +1220,14 @@ def run_batch_analysis(params_list: list, msg_queue, cancel_event):
     def _prog(pct, msg): msg_queue.put(("progress", (int(pct), str(msg))))
 
     # Memory watchdog — one shared across the whole batch so a series
-    # halfway through doesn't push the system into swap.
-    _wd_stop = _start_memory_watchdog(cancel_event, msg_queue)
+    # halfway through doesn't push the system into swap.  We pass a
+    # separate `mem_abort` Event so the per-file exception handler can
+    # tell a watchdog-triggered _Cancelled apart from a real user-stop:
+    # the former should skip-and-continue, the latter aborts the batch.
+    import threading as _th
+    mem_abort = _th.Event()
+    _wd_stop = _start_memory_watchdog(
+        cancel_event, msg_queue, mem_abort_event=mem_abort)
 
     try:
         n = len(params_list)
@@ -1223,6 +1236,28 @@ def run_batch_analysis(params_list: list, msg_queue, cancel_event):
 
         for i, params in enumerate(params_list, 1):
             if cancel_event.is_set():
+                # Same distinction as the inner handler: a watchdog
+                # abort raised at the file boundary should skip this
+                # file, not terminate the batch.
+                if mem_abort.is_set():
+                    _log(f"\n  ⚠ Memory watchdog abort persisted into "
+                         f"file {i}/{n} — skipping this file.")
+                    mem_abort.clear()
+                    cancel_event.clear()
+                    try:
+                        import gc as _gc
+                        _gc.collect()
+                    except Exception: pass
+                    results.append({"index": i, "ok": False,
+                                    "file": params["file"],
+                                    "error": "memory watchdog abort"})
+                    msg_queue.put(("file_error", {
+                        "index": i, "total": n,
+                        "file": params["file"],
+                        "tb": "Aborted by memory watchdog "
+                              "(insufficient free RAM).",
+                    }))
+                    continue
                 _log("\n── Batch stopped by user ──")
                 msg_queue.put(("stopped", None))
                 return
@@ -1266,6 +1301,32 @@ def run_batch_analysis(params_list: list, msg_queue, cancel_event):
                 }))
             except BaseException as exc:
                 if type(exc).__name__ in ("_Cancelled", "_Stopped"):
+                    # Distinguish memory-watchdog abort (skip this file,
+                    # try the next — freeing the memmap usually recovers
+                    # enough RAM) from a real user-cancel (terminate the
+                    # whole batch).
+                    if mem_abort.is_set():
+                        _log(f"\n  ⚠ File {i}/{n} ({fname}) aborted by "
+                             f"memory watchdog — skipping and continuing "
+                             f"with the next file.")
+                        results.append({"index": i, "ok": False,
+                                        "file": params["file"],
+                                        "error": "memory watchdog abort"})
+                        msg_queue.put(("file_error", {
+                            "index": i, "total": n,
+                            "file": params["file"],
+                            "tb": "Aborted by memory watchdog "
+                                  "(insufficient free RAM).",
+                        }))
+                        # Reset both events + try to release the previous
+                        # file's allocations before moving on.
+                        mem_abort.clear()
+                        cancel_event.clear()
+                        try:
+                            import gc as _gc
+                            _gc.collect()
+                        except Exception: pass
+                        continue
                     _log("\n── Batch stopped by user ──")
                     msg_queue.put(("stopped", None))
                     return
