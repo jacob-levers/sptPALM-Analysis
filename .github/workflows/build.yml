@@ -89,10 +89,15 @@ jobs:
         # FIRST (matching the >=2.3,<3 pin from requirements.txt) — the
         # subsequent `pip install -r requirements.txt` then sees torch
         # already satisfied and leaves the CUDA build in place.
-        # cu124 = CUDA 12.4 runtime, broadest current driver support.
+        #
+        # cu118 (CUDA 11.8) is the smallest current CUDA torch wheel —
+        # the larger cu121/cu124 builds push the final .exe over
+        # GitHub's 2 GiB release-asset cap, which causes the
+        # "size must be less than 2147483648" upload failure.  cu118
+        # still covers any NVIDIA driver >= R450 (Sep 2020).
         run: |
           pip install --upgrade pip
-          pip install --index-url https://download.pytorch.org/whl/cu124 "torch>=2.3,<3"
+          pip install --index-url https://download.pytorch.org/whl/cu118 "torch>=2.3,<3"
           pip install -r requirements.txt
           pip install "pyinstaller==6.11.1"   # pinned for reproducible bundling behaviour
 
@@ -124,10 +129,20 @@ jobs:
             Write-Error "FATAL: $exe not produced by build"
             exit 1
           }
-          $sizeMB = (Get-Item $exe).Length / 1MB
+          $sizeBytes = (Get-Item $exe).Length
+          $sizeMB = $sizeBytes / 1MB
           Write-Host ("FIREFLY.exe size: {0:N1} MB" -f $sizeMB)
           if ($sizeMB -lt 50) {
             Write-Error "FATAL: $exe is suspiciously small ($sizeMB MB) — bundle is incomplete"
+            exit 1
+          }
+          # GitHub Releases caps individual assets at 2 GiB (2,147,483,648
+          # bytes).  Fail HERE with a clear message instead of letting the
+          # upload step error out cryptically with
+          #   "Validation Failed: size must be less than 2147483648"
+          $cap = 2147483648
+          if ($sizeBytes -ge $cap) {
+            Write-Error ("FATAL: $exe is {0:N0} bytes — GitHub Releases cap is {1:N0}.  Switch to a smaller CUDA wheel or revert to CPU torch." -f $sizeBytes, $cap)
             exit 1
           }
 
