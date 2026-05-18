@@ -1,7 +1,7 @@
 # sptPALM Analysis Pipeline — runtime dependencies
 # Install with:  pip install -r requirements.txt
 
-numpy
+numpy<2            # napari 0.4.x was built against the numpy 1.x C-ABI — numpy 2.x breaks the frozen build's napari/vispy import
 pandas
 scipy
 matplotlib

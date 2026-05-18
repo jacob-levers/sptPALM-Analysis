@@ -104,7 +104,7 @@ every tab switch.
   drops back cleanly when it's unavailable.
 - **Streaming chunked localisation** so large stacks (10⁴+ frames) don't
   need to live in RAM all at once. Each chunk's mass values stream into a
-  live histogram on the Analysis tab so a bad min-mass is obvious within
+  live histogram on the Analysis tab so a bad threshold is obvious within
   seconds.
 - **Live detection preview** during analysis — every preprocessed frame
   flows through a 60 FPS canvas with detected spots overlaid, so you can
@@ -227,10 +227,10 @@ Four modes:
 
 1. **Import** tab — pick a `.czi` / `.tif` input file. The preview
    viewer below auto-loads with 30 sampled frames; scrub through them and
-   tune the **Diameter**, **Min mass** and **Background radius** in the
+   tune the **Diameter**, **Threshold** and **Background radius** in the
    sidebar.
 2. Detection circles are coloured by mass (blue = dim, red = bright);
-   when you raise min-mass the dim ones vanish first.
+   when you raise threshold the dim ones vanish first.
 3. If you want a custom ROI: set **ROI Mode = Manual polygon** in the
    sidebar and draw it on the viewer; it persists per file.
 4. Click **Start**. Switch to the **Analysis** tab to watch the live
@@ -341,11 +341,11 @@ verified"**
 → Right-click the app → **Open** → **Open anyway** the first time.
 
 **No particles found / very few trajectories**
-→ Lower the PSF diameter by 2 px. Disable **Auto-detect** for min-mass
+→ Lower the PSF diameter by 2 px. Disable **Auto-detect** for threshold
 and try smaller values. Check the **channel** index for CZI files.
 
 **Too many trajectories / noise being tracked**
-→ Raise min-mass. Raise background radius. Enable ROI masking.
+→ Raise threshold. Raise background radius. Enable ROI masking.
 
 **Pixel size or frame interval shows as a warning**
 → Couldn't read the metadata. Tick **Override** and enter the right
