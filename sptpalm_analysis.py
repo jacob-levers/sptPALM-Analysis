@@ -3,7 +3,7 @@ import multiprocessing
 import sys
 import os
 
-__version__ = "2.4.1"
+__version__ = "2.4.2"
 
 # Fix macOS multiprocessing crashes — must be set before any other imports
 if sys.platform == "darwin":
@@ -882,16 +882,21 @@ def load_tif(path, stop_event=None, files=None):
 # (-1 for 1-indexed tools); units lets us convert nm → px on the fly.
 _CSV_PRESETS: dict = {
     "PALM-Tracer": {
-        # Output columns vary slightly between PALM-Tracer versions
-        # (.csv from the newer GUI vs .txt from older MetaMorph plug-in).
-        "frame":     ("Plane", "Frame", "frame",
-                       "Slice", "T", "t"),
+        # Output columns vary slightly between PALM-Tracer versions:
+        # the modern `locPALMTracer.txt` exporter uses `Plane`,
+        # `CentroidX(px)`, `CentroidY(px)`, `Integrated_Intensity`; older
+        # MetaMorph plug-ins used `X` / `Y` / `IntegratedIntensity`.
+        # Both are listed here so auto-detect catches either.
+        "frame":     ("Plane", "Frame", "frame", "Slice", "T", "t"),
         "frame_offset": -1,                 # PALM-Tracer is 1-indexed
-        "x":         ("X", "Centroid X", "Centroid_X", "x", "Position X"),
-        "y":         ("Y", "Centroid Y", "Centroid_Y", "y", "Position Y"),
+        "x":         ("CentroidX(px)", "Centroid X", "Centroid_X",
+                       "X", "x", "Position X"),
+        "y":         ("CentroidY(px)", "Centroid Y", "Centroid_Y",
+                       "Y", "y", "Position Y"),
         "xy_unit":   "px",
-        "mass":      ("IntegratedIntensity", "Integrated Intensity",
-                       "Mass", "Amp", "Amplitude", "Intensity", "mass"),
+        "mass":      ("Integrated_Intensity", "IntegratedIntensity",
+                       "Integrated Intensity", "Mass", "Amp",
+                       "Amplitude", "Intensity", "mass"),
     },
     "ThunderSTORM": {
         "frame":     ("frame", "Frame"),
@@ -957,34 +962,106 @@ def load_external_locs(csv_path: str, preset: str = "auto",
     float `y` (pixels), float `mass` (raw intensity / photon count).
     """
     import pandas as _pd
-    # Try comma first (most CSV exports); fall back to auto-detect via
-    # the python engine which sniffs the separator from the first row.
-    # PALM-Tracer's .txt uses tabs; Picasso .csv uses commas; ThunderSTORM
-    # uses commas.  Auto-detect handles all of them but is slower, so
-    # we do the comma fast path first and only fall back if it produced
-    # a single ugly all-in-one-column DataFrame.
+    # PALM-Tracer's `locPALMTracer.txt` has a 2-row metadata block at
+    # the top before the actual data header:
+    #     Width  Height  nb_Planes  ...  (8 cols)
+    #     512    512     16000      ...  (values)
+    #     id     Plane   ...        (14 cols — actual table header)
+    #     1      1       ...        (data)
+    #     ...
+    # ThunderSTORM and Picasso put their column header on line 1.  We
+    # peek at the file's first ~20 lines, find the row whose column
+    # count matches the maximum (i.e. the actual data header row), and
+    # tell pandas to start reading from there.  Bonus: extract pixel
+    # size / frame interval from the PALM-Tracer metadata block when
+    # present, and remember them on the returned DataFrame's attrs.
+    pt_meta: dict = {}
+    header_line = 0
+    try:
+        with open(csv_path, "r", encoding="utf-8", errors="replace") as fh:
+            preview = [next(fh).rstrip("\r\n") for _ in range(20)]
+    except StopIteration:
+        with open(csv_path, "r", encoding="utf-8", errors="replace") as fh:
+            preview = fh.read().splitlines()[:20]
+    except Exception:
+        preview = []
+    if preview:
+        def _split(line: str, seps=("\t", ",", ";", "|")):
+            best = (line,)   # fall-through
+            for s in seps:
+                bits = line.split(s)
+                if len(bits) > len(best):
+                    best = bits
+            return list(best)
+        # PALM-Tracer metadata-row detector: row 1 starts with "Width"
+        # and the values row follows.  Lift the pixel size + frame
+        # interval out for later use.
+        if (preview and "Width" in preview[0]
+                and "Pixel_Size" in preview[0]):
+            meta_keys = _split(preview[0])
+            meta_vals = _split(preview[1]) if len(preview) > 1 else []
+            for k, v in zip(meta_keys, meta_vals):
+                pt_meta[k.strip()] = v.strip()
+            try:
+                pt_meta["pixel_size_um"] = float(pt_meta.get(
+                    "Pixel_Size(um)", "0") or 0)
+            except Exception: pass
+            try:
+                pt_meta["frame_interval_s"] = float(pt_meta.get(
+                    "Frame_Duration(s)", "0") or 0)
+            except Exception: pass
+
+        # Find the line with the highest column count (that's where the
+        # actual table starts).  Tie-break to the *latest* such line so
+        # PALM-Tracer's 8-column metadata rows don't outrank the
+        # 14-column data table.
+        widths = [len(_split(ln)) for ln in preview]
+        max_w  = max(widths) if widths else 0
+        for i, w in enumerate(widths):
+            if w == max_w:
+                header_line = i
+        if header_line > 0:
+            print(f"  Skipping {header_line} metadata row(s) before the "
+                  f"data table.")
+
+    # Try comma → tab → python-engine sniff.  First attempt that yields
+    # more than one column wins.  The `skiprows` value is the
+    # metadata-block size detected above.
     df = None
     last_exc: Exception | None = None
     for kwargs in (
-        {"sep": ",", "engine": "c"},
-        {"sep": "\t", "engine": "c"},
-        {"sep": None, "engine": "python"},   # python engine sniffs the sep
+        {"sep": "\t",  "engine": "c"},
+        {"sep": ",",   "engine": "c"},
+        {"sep": None,  "engine": "python"},
     ):
         try:
-            attempt = _pd.read_csv(csv_path, **kwargs)
+            attempt = _pd.read_csv(
+                csv_path, skiprows=header_line, **kwargs)
         except Exception as exc:
             last_exc = exc
             continue
-        if attempt.shape[1] > 1:        # actually parsed multiple columns
+        if attempt.shape[1] > 1:
             df = attempt
-            print(f"  Parsed CSV with sep={kwargs['sep']!r}")
+            print(f"  Parsed file with sep={kwargs['sep']!r}, "
+                  f"skiprows={header_line}, "
+                  f"{len(df):,} rows × {df.shape[1]} columns")
             break
     if df is None:
         if last_exc is not None:
             raise last_exc
         raise ValueError(
-            f"Couldn't parse {csv_path} as CSV / TSV — single-column "
-            f"result on every attempted separator.")
+            f"Couldn't parse {csv_path} — single-column result on "
+            f"every attempted separator / skiprows combination.")
+
+    # Apply PALM-Tracer's embedded metadata to pixel_size_um when the
+    # caller didn't specify one (or used the default).  This lets users
+    # drop a PALM-Tracer file in and have the units come out right
+    # without typing 0.106 again.
+    pt_px = pt_meta.get("pixel_size_um")
+    if pt_px and abs(pixel_size_um - 0.106) < 1e-9:
+        # Default value — replace with PALM-Tracer's value
+        print(f"  Using pixel size {pt_px:.4f} µm from PALM-Tracer metadata")
+        pixel_size_um = float(pt_px)
 
     if preset == "auto" or not preset:
         sniffed = _autodetect_csv_preset(list(df.columns))
