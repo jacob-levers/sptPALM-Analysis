@@ -356,6 +356,58 @@ def install_cuda_torch(cuda_tag: str = "cu124",
             "the sidecar directory.  The wheel layout may be unexpected.")
 
 
+def install_cuda_torch_from_url(url: str,
+                                 *,
+                                 torch_version: str,
+                                 cuda_tag: str = "cu124",
+                                 download_progress_cb=None,
+                                 extract_progress_cb=None,
+                                 cancel_cb=None) -> None:
+    """Same as install_cuda_torch() but with the wheel URL already
+    resolved by the caller — avoids a second `import torch` (which is
+    slow on Windows onefile bundles).  `torch_version` is only used
+    to name the temporary .whl file.
+
+    Raises RuntimeError with user-facing wording on any failure.
+    """
+    sd = sidecar_dir()
+    wheel_path = os.path.join(sd, f"torch-{torch_version}+{cuda_tag}.whl")
+    extracted = sidecar_extracted_dir()
+
+    # Wipe any half-done previous attempt so we start clean.
+    try:
+        if os.path.isdir(extracted):
+            shutil.rmtree(extracted, ignore_errors=True)
+    except Exception:
+        pass
+
+    download_wheel(url, wheel_path,
+                   progress_cb=download_progress_cb,
+                   cancel_cb=cancel_cb)
+
+    if cancel_cb is not None:
+        try:
+            if cancel_cb():
+                try: os.remove(wheel_path)
+                except Exception: pass
+                raise RuntimeError("Installation cancelled by user.")
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+
+    extract_wheel(wheel_path, extracted,
+                  progress_cb=extract_progress_cb)
+
+    try: os.remove(wheel_path)
+    except Exception: pass
+
+    if not is_installed():
+        raise RuntimeError(
+            "Extraction completed but torch/__init__.py is missing in "
+            "the sidecar directory.  The wheel layout may be unexpected.")
+
+
 # ── sys.path injection ────────────────────────────────────────────────────────
 def inject_sidecar_into_sys_path() -> None:
     """Prepend the sidecar's extracted directory to sys.path so subsequent

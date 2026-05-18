@@ -7141,8 +7141,51 @@ class MainWindow(QtWidgets.QMainWindow):
                 self, "CUDA installer unavailable", str(exc))
             return
 
+        # ── Resolve torch version + wheel URL on the MAIN thread ─────────
+        # `import torch` from a Windows onefile bundle takes 10–30 s on
+        # first call (it unpacks ~500 MB of DLLs to %TEMP%) and holds
+        # the GIL the whole time.  If this ran inside the QThread worker,
+        # the dialog would sit at 0 % / "Preparing download…" for half a
+        # minute with no feedback and the user would think the app froze.
+        # Doing it here, with a busy cursor + status-bar message, gives
+        # immediate feedback and means the worker can start downloading
+        # the moment its thread spins up.
+        QtWidgets.QApplication.setOverrideCursor(
+            QtGui.QCursor(Qt.CursorShape.WaitCursor))
+        try:
+            try:
+                self.statusBar().showMessage(
+                    "Resolving PyTorch version (first time may take 30 s)…")
+            except Exception: pass
+            try:
+                ver = _cu.bundled_torch_version()
+            except Exception:
+                ver = None
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            try: self.statusBar().clearMessage()
+            except Exception: pass
+
+        if not ver:
+            QtWidgets.QMessageBox.warning(
+                self, "CUDA install failed",
+                "Could not determine the bundled PyTorch version — cannot "
+                "pick a matching CUDA wheel.  Try installing from source "
+                "instead (see README).")
+            return
+
+        try:
+            url = _cu.cuda_wheel_url(ver, cuda_tag="cu124")
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "CUDA install failed",
+                f"Could not build the CUDA wheel URL: {exc}")
+            return
+
         dlg = QtWidgets.QProgressDialog(
-            "Preparing download…", "Cancel", 0, 100, self)
+            f"Connecting to download.pytorch.org…\n"
+            f"(torch {ver} + cu124)",
+            "Cancel", 0, 100, self)
         dlg.setWindowTitle("Installing CUDA acceleration")
         dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
         dlg.setAutoClose(False)
@@ -7157,12 +7200,19 @@ class MainWindow(QtWidgets.QMainWindow):
             finished = QtCore.Signal()
             failed   = QtCore.Signal(str)
 
-            def __init__(self, cancel_check):
+            def __init__(self, cancel_check, wheel_url, torch_version):
                 super().__init__()
-                self._cancel_check = cancel_check
+                self._cancel_check  = cancel_check
+                self._wheel_url     = wheel_url
+                self._torch_version = torch_version
 
             @QtCore.Slot()
             def run(self):
+                # Heartbeat immediately so the user sees activity instead
+                # of an apparently-frozen 0 % dialog while urlopen is
+                # waiting for the server to start sending bytes.
+                self.progress.emit(
+                    0, "Connecting to download.pytorch.org…")
                 try:
                     def _dl_cb(done, total):
                         if total > 0:
@@ -7188,7 +7238,11 @@ class MainWindow(QtWidgets.QMainWindow):
                         self.progress.emit(
                             pct, f"Extracting… {done} / {total} files")
 
-                    _cu.install_cuda_torch(
+                    # Use the URL we resolved on the main thread to
+                    # skip a second `import torch` inside the worker.
+                    _cu.install_cuda_torch_from_url(
+                        self._wheel_url,
+                        torch_version=self._torch_version,
                         download_progress_cb=_dl_cb,
                         extract_progress_cb=_ex_cb,
                         cancel_cb=self._cancel_check,
@@ -7198,7 +7252,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.failed.emit(str(exc))
 
         thread = QtCore.QThread(self)
-        worker = _CudaWorker(cancel_check=lambda: dlg.wasCanceled())
+        worker = _CudaWorker(
+            cancel_check=lambda: dlg.wasCanceled(),
+            wheel_url=url,
+            torch_version=ver)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
 
