@@ -25,3 +25,4 @@ torch>=2.3,<3      # GPU localiser backend (MPS on Apple Silicon, CUDA on NVIDIA
 # in the Workspace tab for frame scrubbing + track overlay.
 PySide6>=6.6,<7
 napari[pyside6]>=0.4.19,<0.5
+dask[array]       # napari's lazy image loader degrades to a "missing dask" warning without this

@@ -11,7 +11,8 @@ Outputs:
   Windows: dist/FIREFLY.exe  (onefile)
 """
 
-from PyInstaller.utils.hooks import collect_submodules, collect_data_files
+from PyInstaller.utils.hooks import (
+    collect_submodules, collect_data_files, copy_metadata)
 import os
 import sys
 
@@ -105,6 +106,33 @@ try:
     datas += collect_data_files("vispy")
     datas += collect_data_files("magicgui")
     datas += collect_data_files("npe2")
+except Exception:
+    pass
+
+# `.dist-info` metadata for scientific packages.  Without this, pandas's
+# `import_optional_dependency("numpy")` (and similar checks in napari,
+# scikit-image, scipy, etc.) raises the misleading
+#   "Missing optional dependency 'numpy'"
+# error at runtime in the frozen build — even though the package itself
+# is bundled and importable.  `importlib.metadata.version(pkg)` resolves
+# against the .dist-info directory, which PyInstaller doesn't pick up
+# automatically for collect_submodules.  copy_metadata fixes that.
+for _pkg in ("numpy", "pandas", "scipy", "scikit-image", "scikit-learn",
+             "matplotlib", "napari", "vispy", "magicgui", "npe2",
+             "tifffile", "trackpy", "joblib", "Pillow", "psutil",
+             "dask", "torch"):
+    try:
+        datas += copy_metadata(_pkg)
+    except Exception:
+        # Package not installed at freeze time — fine, just skip it.
+        pass
+
+# Dask is napari's preferred lazy-load backend.  Pull its submodules
+# in too so napari's image-loading code path doesn't bail with the
+# "Dask array requirements are not installed" prompt.
+try:
+    hidden += collect_submodules("dask")
+    datas   += collect_data_files("dask")
 except Exception:
     pass
 
