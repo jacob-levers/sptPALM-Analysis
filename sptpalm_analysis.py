@@ -3,7 +3,7 @@ import multiprocessing
 import sys
 import os
 
-__version__ = "2.4.2"
+__version__ = "2.4.3"
 
 # Fix macOS multiprocessing crashes — must be set before any other imports
 if sys.platform == "darwin":
@@ -1011,15 +1011,31 @@ def load_external_locs(csv_path: str, preset: str = "auto",
                     "Frame_Duration(s)", "0") or 0)
             except Exception: pass
 
-        # Find the line with the highest column count (that's where the
-        # actual table starts).  Tie-break to the *latest* such line so
-        # PALM-Tracer's 8-column metadata rows don't outrank the
-        # 14-column data table.
-        widths = [len(_split(ln)) for ln in preview]
+        # Find the actual data header.  Rules:
+        #   1. It must have the highest column count seen in the preview
+        #      (otherwise PALM-Tracer's 8-col metadata rows win).
+        #   2. Its fields must LOOK like header names — i.e. contain
+        #      mostly letters, not just numbers.  Otherwise we'd pick a
+        #      data row whenever the metadata block was a different
+        #      width from the table.
+        # Among all rows that satisfy both, take the FIRST one.
+        def _looks_like_header(fields):
+            # A header row's fields are mostly non-numeric tokens.
+            if not fields:
+                return False
+            letter_count = sum(
+                1 for f in fields
+                if any(c.isalpha() for c in f))
+            return letter_count >= max(2, len(fields) // 2)
+
+        split_rows = [_split(ln) for ln in preview]
+        widths = [len(r) for r in split_rows]
         max_w  = max(widths) if widths else 0
-        for i, w in enumerate(widths):
-            if w == max_w:
+        header_line = 0
+        for i, row in enumerate(split_rows):
+            if len(row) == max_w and _looks_like_header(row):
                 header_line = i
+                break
         if header_line > 0:
             print(f"  Skipping {header_line} metadata row(s) before the "
                   f"data table.")
