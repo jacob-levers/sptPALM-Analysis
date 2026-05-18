@@ -56,6 +56,15 @@ release on the [Releases page](https://github.com/jacob-levers/FIREFLY/releases)
 2. Double-click to launch. First launch unpacks bundled libraries to
    `%TEMP%` (~30 s); subsequent launches are instant.
 
+> **GPU acceleration on Windows:** the bundled `FIREFLY-Windows.exe`
+> ships **CPU-only** PyTorch. The CUDA-enabled torch wheel is ~2.5 GB
+> on its own and pushes the .exe past GitHub Releases' 2 GiB asset
+> cap, so we can't bundle it. If you have an NVIDIA GPU and want to
+> run the localiser on it, follow **"From source (advanced)"** below
+> and add the CUDA install step shown there. macOS Apple-Silicon
+> users already get MPS acceleration from the bundled torch — no
+> extra setup needed.
+
 ### From source (advanced)
 
 Python 3.10 or newer. Clone the repo and run the launcher for your OS — it
@@ -74,6 +83,22 @@ First launch opens a terminal showing pip installing PySide6, napari,
 PyTorch, scipy and friends (~3–8 minutes). The GUI starts automatically
 when the install finishes; subsequent launches skip the install and open
 immediately.
+
+**Enabling CUDA (Windows + NVIDIA GPU)**
+
+The default `pip install torch` on Windows pulls the CPU-only wheel.
+To get a CUDA-enabled torch, run *after* the first-launch install
+finishes (still inside the project's virtual environment):
+
+```powershell
+.\venv\Scripts\activate
+pip install --upgrade --index-url https://download.pytorch.org/whl/cu124 "torch>=2.3,<3"
+```
+
+Restart FIREFLY. The Analysis tab's backend dropdown will pick up
+CUDA automatically; `Backend: torch (device: cuda)` should appear in
+the log when a run starts. cu124 needs an NVIDIA driver ≥ R535
+(Aug 2023); for older drivers swap `cu124` for `cu121` or `cu118`.
 
 ---
 

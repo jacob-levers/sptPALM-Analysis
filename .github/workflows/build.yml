@@ -83,37 +83,22 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        # IMPORTANT — torch order matters on Windows.
-        # `pip install torch` from PyPI pulls the CPU-only wheel.  The
-        # CUDA wheels live on PyTorch's own index, so we install them
-        # FIRST (matching the >=2.3,<3 pin from requirements.txt) — the
-        # subsequent `pip install -r requirements.txt` then sees torch
-        # already satisfied and leaves the CUDA build in place.
+        # The bundled Windows .exe ships CPU-only torch.
         #
-        # cu118 (CUDA 11.8) is the smallest current CUDA torch wheel —
-        # the larger cu121/cu124 builds push the final .exe over
-        # GitHub's 2 GiB release-asset cap, which causes the
-        # "size must be less than 2147483648" upload failure.  cu118
-        # still covers any NVIDIA driver >= R450 (Sep 2020).
+        # We TRIED CUDA wheels (cu118 + cu124) but every variant pushed
+        # the final .exe past GitHub Releases' 2,147,483,648-byte asset
+        # cap (cu118 → 2.98 GB, cu124 → ~3.2 GB).  PyInstaller's LZMA
+        # compression can't meaningfully shrink already-compiled CUDA
+        # DLL blobs, so no CUDA wheel will fit.
+        #
+        # Users who need GPU acceleration on Windows should follow the
+        # "Run from source for CUDA support" section in README.md — that
+        # installs torch from PyTorch's own index against a local Python
+        # interpreter, which has no asset-size constraint.
         run: |
           pip install --upgrade pip
-          pip install --index-url https://download.pytorch.org/whl/cu118 "torch>=2.3,<3"
           pip install -r requirements.txt
           pip install "pyinstaller==6.11.1"   # pinned for reproducible bundling behaviour
-
-      - name: Verify CUDA torch bundle
-        # Sanity-check: the wheel we just installed should self-report
-        # as a CUDA build (version string ends in +cuXYZ).  If the index
-        # resolved to the CPU wheel anyway, fail fast — better to break
-        # the build than ship another CPU-only .exe.
-        shell: pwsh
-        run: |
-          $ver = python -c "import torch; print(torch.__version__)"
-          Write-Host "torch version: $ver"
-          if (-not ($ver -match '\+cu')) {
-            Write-Error "FATAL: torch is not a CUDA build ($ver) — Windows users would silently fall back to CPU"
-            exit 1
-          }
 
       - name: Build exe (onefile)
         # Spec produces a single self-contained FIREFLY.exe.  All binaries
