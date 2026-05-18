@@ -244,6 +244,38 @@ def download_wheel(url: str,
     _log(f"GET {url}")
     _log(f"  dest: {dest_path}")
 
+    # Watchdog for stalled reads.  resp.read(N) can block forever on
+    # Windows when the TLS connection stalls mid-stream (same bug class
+    # that hung HEAD on cu118).  We sample `downloaded` every 2 s in a
+    # daemon thread; if no bytes arrive for `read_stall_s` seconds we
+    # tear the response down.  The worker's read call then returns
+    # cleanly (or raises) and we fail with a clear error instead of
+    # hanging the app forever.
+    import threading
+    read_stall_s = 30.0
+    progress_state = {"downloaded": 0, "last_change_t": time.monotonic(),
+                       "should_abort": False}
+    resp_holder: dict = {"resp": None}
+
+    def _stall_watchdog():
+        while not progress_state["should_abort"]:
+            time.sleep(2.0)
+            now = time.monotonic()
+            elapsed = now - progress_state["last_change_t"]
+            if progress_state.get("done"):
+                return
+            if elapsed > read_stall_s:
+                _log(f"  → STALL WATCHDOG: no data for {elapsed:.0f}s, "
+                     f"aborting (downloaded {progress_state['downloaded']/1e6:.1f} MB)")
+                progress_state["should_abort"] = True
+                try:
+                    r = resp_holder.get("resp")
+                    if r is not None:
+                        r.close()
+                except Exception:
+                    pass
+                return
+
     try:
         req = urllib.request.Request(
             url, headers={"User-Agent": "FIREFLY-CUDA-installer/1.0"})
@@ -251,13 +283,22 @@ def download_wheel(url: str,
         # leaving the user staring at a frozen-looking dialog.
         t0 = time.monotonic()
         with urllib.request.urlopen(req, timeout=20) as resp:
+            resp_holder["resp"] = resp
             _log(f"  HTTP {getattr(resp, 'status', '?')} "
                  f"in {time.monotonic()-t0:.2f}s")
             try:
                 total = int(resp.headers.get("Content-Length") or 0)
             except Exception:
                 total = 0
+            _log(f"  Content-Length: {total/1e6:.1f} MB")
+            _log(f"  Starting read loop (chunk={chunk_size//1024} KB, "
+                 f"stall watchdog={read_stall_s:.0f}s)")
+            wdog = threading.Thread(target=_stall_watchdog, daemon=True,
+                                     name="cuda-download-stall-watchdog")
+            wdog.start()
             downloaded = 0
+            chunk_count = 0
+            last_diag_t = time.monotonic()
             with open(dest_path, "wb") as out:
                 while True:
                     if cancel_cb is not None:
@@ -272,6 +313,7 @@ def download_wheel(url: str,
                                     os.remove(dest_path)
                                 except Exception:
                                     pass
+                                progress_state["should_abort"] = True
                                 raise RuntimeError(
                                     "Download cancelled by user.")
                         except RuntimeError:
@@ -281,15 +323,31 @@ def download_wheel(url: str,
                     chunk = resp.read(chunk_size)
                     if not chunk:
                         break
+                    if progress_state["should_abort"]:
+                        raise RuntimeError(
+                            "Download stalled — no data received from "
+                            "download.pytorch.org for 30 seconds.  Your "
+                            "connection or a firewall is dropping the "
+                            "transfer mid-stream.  Try again, or install "
+                            "from source (see README).")
                     out.write(chunk)
                     downloaded += len(chunk)
+                    chunk_count += 1
+                    # Diagnostic log: first 3 chunks individually (so we
+                    # can see bytes ARE arriving), then once every 1 s.
+                    now = time.monotonic()
+                    if chunk_count <= 3 or (now - last_diag_t) >= 1.0:
+                        last_diag_t = now
+                        _log(f"  + chunk {chunk_count}: "
+                             f"{downloaded/1e6:.1f} MB / {total/1e6:.0f} MB")
+                    progress_state["downloaded"] = downloaded
+                    progress_state["last_change_t"] = now
                     # Throttle progress emissions to ~10 Hz.  Without
                     # this, a fast connection floods the main Qt event
                     # queue with thousands of queued slot calls per
                     # second, paint events get starved, and Windows
                     # marks the app "Not Responding".
                     if progress_cb is not None:
-                        now = time.monotonic()
                         if (now - last_progress_t) >= progress_throttle_s:
                             last_progress_t = now
                             try:
@@ -297,12 +355,17 @@ def download_wheel(url: str,
                             except Exception:
                                 pass
                 # Final 100 % tick so the bar visibly hits the end.
+                progress_state["done"] = True
+                _log(f"  ✓ download complete: {downloaded/1e6:.1f} MB "
+                     f"in {time.monotonic()-t0:.1f}s "
+                     f"({(downloaded/1e6)/(time.monotonic()-t0):.1f} MB/s)")
                 if progress_cb is not None:
                     try:
                         progress_cb(downloaded, total)
                     except Exception:
                         pass
     except urllib.error.HTTPError as exc:
+        progress_state["should_abort"] = True
         try:
             os.remove(dest_path)
         except Exception:
