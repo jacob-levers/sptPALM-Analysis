@@ -20,10 +20,43 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 import zipfile
 from typing import Callable, Optional
+
+
+# ── Diagnostic log plumbing ───────────────────────────────────────────────────
+# When a user reports "it gets stuck", we need a step-by-step breadcrumb
+# trail of what the installer was doing.  Modules outside cuda_installer
+# can register a callback via set_log_callback(); every call to _log()
+# inside this module forwards there in addition to stdout.
+_log_cb: Optional[Callable[[str], None]] = None
+_log_t0: float = 0.0
+
+
+def set_log_callback(cb: Optional[Callable[[str], None]]) -> None:
+    """Register a callable that receives each diagnostic line.  Pass
+    None to clear.  Lines are also always printed to stdout."""
+    global _log_cb, _log_t0
+    _log_cb = cb
+    _log_t0 = time.monotonic()
+
+
+def _log(msg: str) -> None:
+    """Emit a timestamped diagnostic line."""
+    elapsed = time.monotonic() - _log_t0 if _log_t0 else 0.0
+    line = f"[+{elapsed:5.2f}s] {msg}"
+    try:
+        print(line, flush=True)
+    except Exception:
+        pass
+    if _log_cb is not None:
+        try:
+            _log_cb(line)
+        except Exception:
+            pass
 
 
 # ── Platform helpers ──────────────────────────────────────────────────────────
@@ -199,14 +232,18 @@ def download_wheel(url: str,
     # appears stuck, the user (and we) can read the log to see if the
     # URL itself is 404 (wrong torch version → no matching cu wheel)
     # vs a real network problem.
-    print(f"[CUDA installer] GET {url}", flush=True)
+    _log(f"GET {url}")
+    _log(f"  dest: {dest_path}")
 
     try:
         req = urllib.request.Request(
             url, headers={"User-Agent": "FIREFLY-CUDA-installer/1.0"})
         # 20 s timeout (was 30) so a dead URL fails fast instead of
         # leaving the user staring at a frozen-looking dialog.
+        t0 = time.monotonic()
         with urllib.request.urlopen(req, timeout=20) as resp:
+            _log(f"  HTTP {getattr(resp, 'status', '?')} "
+                 f"in {time.monotonic()-t0:.2f}s")
             try:
                 total = int(resp.headers.get("Content-Length") or 0)
             except Exception:
@@ -371,21 +408,26 @@ def url_exists(url: str, timeout: float = 8.0) -> bool:
     raises.  Sub-second on a working connection — much faster than
     waiting for a full download to fail.
     """
+    _log(f"HEAD {url}")
+    _log(f"  (timeout={timeout}s)")
     try:
         req = urllib.request.Request(
             url, method="HEAD",
             headers={"User-Agent": "FIREFLY-CUDA-installer/1.0"})
+        t0 = time.monotonic()
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return 200 <= int(getattr(resp, "status", 0) or 0) < 300
+            dt = time.monotonic() - t0
+            code = int(getattr(resp, "status", 0) or 0)
+            _log(f"  → HTTP {code} in {dt:.2f}s")
+            return 200 <= code < 300
     except urllib.error.HTTPError as exc:
-        # 404 == doesn't exist (try next tag).  Other 4xx/5xx → treat
-        # the same so we fall through and don't hang waiting.
-        print(f"[CUDA installer] HEAD {url} → HTTP {exc.code}",
-              flush=True)
+        _log(f"  → HTTPError {exc.code}: {exc.reason}")
+        return False
+    except urllib.error.URLError as exc:
+        _log(f"  → URLError: {exc.reason}")
         return False
     except Exception as exc:
-        print(f"[CUDA installer] HEAD {url} → {type(exc).__name__}: {exc}",
-              flush=True)
+        _log(f"  → {type(exc).__name__}: {exc}")
         return False
 
 
@@ -407,21 +449,27 @@ def install_cuda_torch_auto(torch_version: str,
     `status_cb(msg)` is called between attempts so the GUI can update
     its label ("Checking cu121…", "Found cu121, downloading…").
     """
+    _log(f"install_cuda_torch_auto starting — torch_version={torch_version}, "
+         f"cuda_tags={cuda_tags}")
     chosen_tag: Optional[str] = None
     tried_urls = []
     for tag in cuda_tags:
         url = cuda_wheel_url(torch_version, cuda_tag=tag)
         tried_urls.append(url)
+        _log(f"--- Checking {tag} ---")
         if status_cb is not None:
             try: status_cb(f"Checking torch {torch_version} + {tag}…")
             except Exception: pass
         if cancel_cb is not None and cancel_cb():
             raise RuntimeError("Installation cancelled by user.")
         if url_exists(url):
+            _log(f"  ✓ {tag} is available, will download")
             chosen_tag = tag
             break
+        _log(f"  ✗ {tag} not available, trying next")
 
     if chosen_tag is None:
+        _log("✗ No CUDA tag returned a working wheel URL")
         # All three HEAD-checks said "not found" — make the failure
         # actionable instead of mysterious.  Most likely cause: the
         # bundled torch version isn't a real release on PyTorch's

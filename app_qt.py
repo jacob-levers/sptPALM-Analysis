@@ -7187,16 +7187,54 @@ class MainWindow(QtWidgets.QMainWindow):
             f"(torch {ver} + cu124)",
             "Cancel", 0, 100, self)
         dlg.setWindowTitle("Installing CUDA acceleration")
-        dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
+        # NON-modal so the debug log window below can stay visible
+        # alongside.  Cancel button still works.
+        dlg.setWindowModality(Qt.WindowModality.NonModal)
         dlg.setAutoClose(False)
         dlg.setAutoReset(False)
         dlg.setMinimumDuration(0)
         dlg.setValue(0)
 
+        # Live debug-log window — every step inside cuda_installer logs
+        # here so we can see exactly where things stall.  Non-modal,
+        # docked next to the progress dialog so a screenshot captures
+        # both.  Auto-shown when the install starts; the user can close
+        # it any time (it's just for diagnosis).
+        log_win = QtWidgets.QDialog(self)
+        log_win.setWindowTitle("CUDA install — debug log")
+        log_win.setModal(False)
+        log_win.resize(720, 360)
+        log_layout = QtWidgets.QVBoxLayout(log_win)
+        log_layout.setContentsMargins(8, 8, 8, 8)
+        log_view = QtWidgets.QPlainTextEdit(log_win)
+        log_view.setReadOnly(True)
+        log_view.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
+        try:
+            log_view.setFont(QtGui.QFont("Menlo, Consolas, monospace", 10))
+        except Exception:
+            pass
+        log_layout.addWidget(log_view)
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_copy = QtWidgets.QPushButton("Copy all", log_win)
+        btn_close = QtWidgets.QPushButton("Close", log_win)
+        btn_row.addWidget(btn_copy)
+        btn_row.addStretch(1)
+        btn_row.addWidget(btn_close)
+        log_layout.addLayout(btn_row)
+
+        def _copy_log():
+            QtWidgets.QApplication.clipboard().setText(log_view.toPlainText())
+        btn_copy.clicked.connect(_copy_log)
+        btn_close.clicked.connect(log_win.hide)
+        self._cuda_log_win = log_win
+        self._cuda_log_view = log_view
+        log_win.show()
+
         # Background worker — QObject moved to a QThread (NOT a
         # QThread subclass).  Signals dispatch back to the GUI thread.
         class _CudaWorker(QtCore.QObject):
             progress = QtCore.Signal(int, str)   # pct, label
+            log      = QtCore.Signal(str)        # one diagnostic line
             finished = QtCore.Signal()
             failed   = QtCore.Signal(str)
 
@@ -7213,6 +7251,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 # waiting for the server to start sending bytes.
                 self.progress.emit(
                     0, "Connecting to download.pytorch.org…")
+                # Wire cuda_installer's diagnostic stream to this
+                # worker's log signal so the debug-log window sees
+                # every step in real time.
+                try:
+                    _cu.set_log_callback(self.log.emit)
+                except Exception:
+                    pass
                 try:
                     def _dl_cb(done, total):
                         if total > 0:
@@ -7315,6 +7360,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._cuda_heartbeat.stop()
             except Exception:
                 pass
+            # Clear the cuda_installer log hook so the worker can't emit
+            # into a slot that's about to be destroyed.
+            try:
+                _cu.set_log_callback(None)
+            except Exception:
+                pass
             try:
                 thread.quit()
                 thread.wait(2000)
@@ -7324,6 +7375,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 dlg.close()
             except Exception:
                 pass
+            # Keep the debug log window open — the whole point is for
+            # the user to read/copy the trace after success/failure.
             self._cuda_thread = None
             self._cuda_worker = None
             self._cuda_heartbeat = None
@@ -7356,7 +7409,17 @@ class MainWindow(QtWidgets.QMainWindow):
             box.activateWindow()
             box.exec()
 
+        def _on_log(line):
+            try:
+                self._cuda_log_view.appendPlainText(line)
+                # Auto-scroll to bottom
+                bar = self._cuda_log_view.verticalScrollBar()
+                bar.setValue(bar.maximum())
+            except Exception:
+                pass
+
         worker.progress.connect(_on_progress)
+        worker.log.connect(_on_log)
         worker.finished.connect(_on_finished)
         worker.failed.connect(_on_failed)
 
