@@ -612,7 +612,93 @@ def _run_one_analysis(params: dict, msg_queue, cancel_event,
                   index=False)
     diff_df.to_csv(os.path.join(extras_dir, f"{stem}_diffusion_summary.csv"),
                    index=False)
-    _log(f"  Saved (firefly_extras/): trajectories, locs, diffusion summary")
+
+    # ── Additional per-experiment artifacts ────────────────────────────────
+    # The Compare tab reads these by name to plot JDD / dwell-time CDF /
+    # turning-angle / radial-distribution / mobile-fraction-over-time
+    # panels.  Previously they were computed for the single-sample figure
+    # but never persisted, so a FIREFLY run dropped silently out of the
+    # corresponding Compare-tab panels.
+    extras_saved = ["locs", "trajectories", "diffusion summary"]
+    try:
+        if emsd_df is not None and len(emsd_df):
+            emsd_df.to_csv(
+                os.path.join(extras_dir, f"{stem}_ensemble_msd.csv"),
+                index=False)
+            extras_saved.append("ensemble MSD")
+    except Exception as exc:
+        _log(f"  WARN: ensemble-MSD save failed: {exc}")
+    try:
+        if jdd:
+            import json as _json
+            def _jsonable(x):
+                # numpy scalars / arrays / pandas → JSON-friendly
+                if hasattr(x, "tolist"):    return x.tolist()
+                if isinstance(x, (set,)):   return list(x)
+                return x
+            payload = {k: _jsonable(v) for k, v in jdd.items()}
+            with open(os.path.join(extras_dir,
+                                    f"{stem}_jdd.json"), "w") as _fp:
+                _json.dump(payload, _fp, indent=2, default=str)
+            extras_saved.append("JDD")
+    except Exception as exc:
+        _log(f"  WARN: JDD save failed: {exc}")
+    try:
+        if dwell_df is not None and len(dwell_df):
+            dwell_df.to_csv(
+                os.path.join(extras_dir, f"{stem}_dwell_times.csv"),
+                index=False)
+            extras_saved.append("dwell times")
+    except Exception as exc:
+        _log(f"  WARN: dwell-times save failed: {exc}")
+    try:
+        if ta is not None and len(ta) > 0:
+            import pandas as _pd
+            _pd.DataFrame({"turning_angle_deg": ta}).to_csv(
+                os.path.join(extras_dir, f"{stem}_turning_angles.csv"),
+                index=False)
+            extras_saved.append("turning angles")
+    except Exception as exc:
+        _log(f"  WARN: turning-angles save failed: {exc}")
+    try:
+        if mf is not None and len(mf):
+            mf.to_csv(
+                os.path.join(extras_dir, f"{stem}_mobile_fraction.csv"),
+                index=False)
+            extras_saved.append("mobile fraction")
+    except Exception as exc:
+        _log(f"  WARN: mobile-fraction save failed: {exc}")
+    try:
+        if cluster_stats_df is not None and len(cluster_stats_df):
+            cluster_stats_df.to_csv(
+                os.path.join(extras_dir, f"{stem}_cluster_stats.csv"),
+                index=False)
+            extras_saved.append("cluster stats")
+    except Exception as exc:
+        _log(f"  WARN: cluster-stats save failed: {exc}")
+    # Per-run params — Compare relies on this for per-folder pixel size /
+    # frame interval, etc.  Matches the schema written by the
+    # PALM-Tracer summary loader.
+    try:
+        import json as _json
+        with open(os.path.join(extras_dir,
+                                f"{stem}_params.json"), "w") as _fp:
+            _json.dump({
+                "stem":             stem,
+                "pixel_size_um":    float(px),
+                "frame_interval_s": float(fi),
+                "n_localisations":  int(len(locs)),
+                "n_tracks":         int(diff_df.shape[0]) if diff_df is not None else 0,
+                "n_frames":         int(n_frames),
+                "width":            int(stack_w),
+                "height":           int(stack_h),
+                "source":           "firefly",
+            }, _fp, indent=2)
+        extras_saved.append("params")
+    except Exception as exc:
+        _log(f"  WARN: params save failed: {exc}")
+
+    _log(f"  Saved (firefly_extras/): {', '.join(extras_saved)}")
 
     figure_path = ""
     fig_dpi = int(p.get("fig_dpi", 150)) or 150
