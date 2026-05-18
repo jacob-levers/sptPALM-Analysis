@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import traceback
 
 
@@ -229,7 +230,8 @@ def _run_one_analysis(params: dict, msg_queue, cancel_event,
     _prog(5, "Loading stack…")
     stack, meta_px, meta_fi = load_file(
         fpath, channel=int(p.get("channel", 0)),
-        stop_event=cancel_event)
+        stop_event=cancel_event,
+        files=p.get("series_files"))
 
     # Override file-embedded metadata only when the user explicitly ticked
     # the "Override" checkbox (the GUI sends None otherwise).
@@ -257,25 +259,120 @@ def _run_one_analysis(params: dict, msg_queue, cancel_event,
 
     # Real-time mass histogram: each chunk's mass values get pushed into
     # the GUI via the msg queue so the user can spot a bad minmass early.
+    # Uses put_nowait so a stalled GUI can never block the worker on the
+    # IPC queue (which would lock the analysis up).
     def _mass_cb(masses):
         try:
-            # Truncate huge chunks so we don't flood the queue
+            import queue as _q
             arr = masses if len(masses) <= 20000 else masses[:20000]
-            msg_queue.put(("mass_chunk", arr.tolist()))
+            try:    msg_queue.put_nowait(("mass_chunk", arr.tolist()))
+            except _q.Full: pass     # drop — non-essential
         except Exception:
             pass
 
-    locs, mean_proj, _mm = preprocess_and_localise_adaptive(
-        stack,
-        diameter=int(p["diameter"]),
-        minmass=minmass_arg,
-        bg_radius=int(p.get("bg_radius", 10)),
-        bg_method=p.get("bg_method", "uniform_filter"),
-        workers=int(p["workers"]),
-        chunk_size=int(p["chunk_size"]),
-        stop_event=cancel_event,
-        mass_cb=_mass_cb,
-        backend=p["backend"])
+    # Live detection view: emit ~60 frames/s of (preprocessed frame +
+    # detected spots) to the GUI.  The main worker fires `_preview_cb`
+    # at whatever rate the pipeline produces frames (potentially many
+    # hundreds per second in a burst after each chunk's locate); a
+    # dedicated background thread pulls from a small internal queue
+    # and forwards to `msg_queue` paced at 60 Hz.  This decouples the
+    # main loop's speed from the GUI's frame budget — analysis stays
+    # fast, but the GUI only sees one frame every 16 ms (≈ 60 FPS).
+    import queue as _queue
+    import threading as _threading
+    _preview_internal_q: "_queue.Queue" = _queue.Queue(maxsize=240)
+    _preview_stop = _threading.Event()
+
+    # Memory-pressure brake.  Hot loops with a per-frame preview can
+    # push the system into swap on tight-RAM laptops; if free memory
+    # drops below this floor we silently stop emitting preview frames
+    # (analysis itself keeps running — only the cosmetic stream pauses).
+    try:    import psutil as _ps
+    except Exception: _ps = None
+    _MEM_FLOOR_GB = 1.5
+
+    def _system_under_pressure() -> bool:
+        if _ps is None:
+            return False
+        try:
+            return (_ps.virtual_memory().available / 1e9) < _MEM_FLOOR_GB
+        except Exception:
+            return False
+
+    def _preview_pump():
+        period = 1.0 / 60.0
+        while not _preview_stop.is_set():
+            try:
+                payload = _preview_internal_q.get(timeout=0.1)
+            except _queue.Empty:
+                continue
+            # Skip the emit if RAM is critically low.  Better to drop
+            # the visual than to push the host into swap and freeze.
+            if _system_under_pressure():
+                time.sleep(period)
+                continue
+            try:    msg_queue.put_nowait(("preview_frame", payload))
+            except _queue.Full: pass    # IPC queue saturated; drop
+            except Exception:   pass
+            time.sleep(period)
+
+    _preview_thread = _threading.Thread(target=_preview_pump, daemon=True)
+    _preview_thread.start()
+
+    def _preview_cb(frame_idx, frame, xs, ys, n_frames):
+        # Same brake as the pump — if memory is tight, don't even allocate
+        # the downsampled frame.
+        if _system_under_pressure():
+            return
+        try:
+            import numpy as _np
+            f = _np.asarray(frame, dtype=_np.float32)
+            # Downsample anything larger than 384 px on the long edge
+            scale_y = scale_x = 1.0
+            max_side = 384
+            if f.shape[0] > max_side or f.shape[1] > max_side:
+                step_y = max(1, f.shape[0] // max_side)
+                step_x = max(1, f.shape[1] // max_side)
+                f = f[::step_y, ::step_x]
+                scale_y, scale_x = 1.0 / step_y, 1.0 / step_x
+            xs_a = _np.asarray(xs, dtype=_np.float32) * scale_x
+            ys_a = _np.asarray(ys, dtype=_np.float32) * scale_y
+            payload = {
+                "idx":      int(frame_idx),
+                "n_frames": int(n_frames),
+                "shape":    [int(f.shape[0]), int(f.shape[1])],
+                "frame":    f.tobytes(),
+                "xs":       xs_a.tolist(),
+                "ys":       ys_a.tolist(),
+            }
+            # Non-blocking insert with drop-oldest when full so the worker
+            # never has to wait on the GUI.
+            if _preview_internal_q.full():
+                try:    _preview_internal_q.get_nowait()
+                except _queue.Empty: pass
+            try:    _preview_internal_q.put_nowait(payload)
+            except _queue.Full: pass
+        except Exception:
+            pass
+
+    try:
+        locs, mean_proj, _mm = preprocess_and_localise_adaptive(
+            stack,
+            diameter=int(p["diameter"]),
+            minmass=minmass_arg,
+            bg_radius=int(p.get("bg_radius", 10)),
+            bg_method=p.get("bg_method", "uniform_filter"),
+            workers=int(p["workers"]),
+            chunk_size=int(p["chunk_size"]),
+            stop_event=cancel_event,
+            mass_cb=_mass_cb,
+            preview_cb=_preview_cb,
+            backend=p["backend"])
+    finally:
+        # Stop the preview pump and let it drain whatever's left
+        _preview_stop.set()
+        try:    _preview_thread.join(timeout=1.0)
+        except Exception: pass
     # Fast-path users get a single bulk emit (no per-chunk hook there).
     try:
         if locs is not None and len(locs) > 0 and "mass" in locs.columns:
@@ -361,17 +458,25 @@ def _run_one_analysis(params: dict, msg_queue, cancel_event,
 
     _check_stop()
 
+    def _drain_gpu():
+        """Force a GPU cache drain.  Cheap, mostly defensive — calling
+        between heavy stages prevents PyTorch's caching allocator from
+        sitting on multi-GB allocations long after they're needed,
+        which can push tight-RAM laptops over the edge."""
+        try:
+            import torch as _torch, gc as _gc
+            _gc.collect()
+            if hasattr(_torch.backends, "mps") and \
+                    _torch.backends.mps.is_available():
+                if hasattr(_torch.mps, "synchronize"): _torch.mps.synchronize()
+                if hasattr(_torch.mps, "empty_cache"):  _torch.mps.empty_cache()
+            if _torch.cuda.is_available():
+                _torch.cuda.synchronize(); _torch.cuda.empty_cache()
+        except Exception:
+            pass
+
     # Belt-and-braces GPU drain before the long CPU-only linking stage.
-    try:
-        import torch as _torch, gc as _gc
-        _gc.collect()
-        if hasattr(_torch.backends, "mps") and _torch.backends.mps.is_available():
-            if hasattr(_torch.mps, "synchronize"): _torch.mps.synchronize()
-            if hasattr(_torch.mps, "empty_cache"): _torch.mps.empty_cache()
-        if _torch.cuda.is_available():
-            _torch.cuda.synchronize(); _torch.cuda.empty_cache()
-    except Exception:
-        pass
+    _drain_gpu()
 
     # ── Linking ───────────────────────────────────────────────────────────
     _log(f"\n── Linking ───────────────────────")
@@ -381,15 +486,29 @@ def _run_one_analysis(params: dict, msg_queue, cancel_event,
         _log(f"  NOTE: very high spot density ({len(locs):,} locs). "
              f"Consider raising minmass to reduce false positives.")
     _prog(50, f"Linking {len(locs):,} localisations…")
+
+    # Map linker [0, 1] progress onto the overall progress bar's 50–65%
+    # range so the user sees genuine per-frame motion instead of a
+    # multi-minute black box.
+    def _link_progress(frac: float):
+        try:    pct = 50 + int(frac * 15)
+        except Exception: pct = 50
+        _prog(pct, f"Linking… {frac*100:.0f} %")
+
     tracks = link_trajectories(
         locs,
         search_range=int(p["search_range"]),
         memory=int(p["memory"]),
         min_len=int(p["min_track_len"]),
-        max_len=p.get("max_track_len"))
+        max_len=p.get("max_track_len"),
+        progress_cb=_link_progress,
+        stop_event=cancel_event)
     n_tracks_found = tracks['particle'].nunique() if len(tracks) else 0
     _log(f"  → {n_tracks_found:,} trajectories")
     _check_stop()
+    # Drain again before the MSD / figure stages — linking can leave
+    # large temporaries behind that the next stage doesn't need.
+    _drain_gpu()
 
     if n_tracks_found == 0:
         _log("")
@@ -850,6 +969,12 @@ def run_batch_analysis(params_list: list, msg_queue, cancel_event):
             # Overall-batch progress: percent of files completed
             overall_pct = int(100 * (i - 1) / max(1, n))
             _prog(overall_pct, f"[{i}/{n}] {fname}")
+            # GUI hook — reset per-file UI elements (mass histogram).  Live
+            # view is fine; new preview_frame messages will overwrite the
+            # previous file's frame so no explicit reset is needed there.
+            msg_queue.put(("file_starting", {
+                "index": i, "total": n, "file": fname,
+            }))
 
             try:
                 payload = _run_one_analysis(

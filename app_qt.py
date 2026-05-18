@@ -108,6 +108,211 @@ _run_compare_in_subprocess  = firefly_worker.run_comparison
 # ══════════════════════════════════════════════════════════════════════════════
 #  MODE TILE — big segmented-control button with icon + title + subtitle
 # ══════════════════════════════════════════════════════════════════════════════
+_NAPARI_WELCOME_PHRASES = (
+    "Drag image",
+    "open image",
+    "key bindings",
+    "menu shortcuts",
+    "Use the menu",
+)
+
+
+class _UpdateCheckThread(QtCore.QThread):
+    """Tiny background thread that hits GitHub's Releases API and emits
+    `update_available(tag, html_url)` if the latest tag is newer than
+    the running FIREFLY version.  Silent on every other outcome — no
+    network, no nag, no error popup."""
+
+    update_available = QtCore.Signal(str, str)
+
+    def __init__(self, api_url: str, current_version: str, parent=None):
+        super().__init__(parent)
+        self._api_url = api_url
+        self._current = current_version
+
+    @staticmethod
+    def _parse_version(s: str) -> "tuple[int, ...]":
+        """Parse a 'v2.2.0' / '2.2.0-dev3' style tag into a comparable
+        tuple of ints.  Non-numeric suffix segments compare as 0."""
+        import re
+        s = s.lstrip("vV").split("-", 1)[0]
+        parts = []
+        for chunk in s.split("."):
+            m = re.match(r"(\d+)", chunk)
+            parts.append(int(m.group(1)) if m else 0)
+        # Pad to length 3 for tidy comparisons
+        while len(parts) < 3: parts.append(0)
+        return tuple(parts)
+
+    def run(self):
+        try:
+            import json
+            import urllib.request
+        except Exception:
+            return
+        try:
+            req = urllib.request.Request(
+                self._api_url,
+                headers={"Accept": "application/vnd.github+json",
+                         "User-Agent": "FIREFLY-app"})
+            with urllib.request.urlopen(req, timeout=4) as resp:
+                blob = resp.read()
+        except Exception:
+            return    # offline / rate-limited / etc. — silently no-op
+        try:
+            data = json.loads(blob)
+            tag      = data.get("tag_name") or ""
+            html_url = data.get("html_url") or ""
+            if not tag:
+                return
+            if self._parse_version(tag) > self._parse_version(self._current):
+                self.update_available.emit(tag, html_url)
+        except Exception:
+            return
+
+
+def _hide_napari_chrome(viewer) -> None:
+    """Hide napari's bottom-of-canvas viewer-button row (ndisplay / grid /
+    home / console / etc.), the new-layer/delete button row under the
+    layer list, and the empty-canvas 'Drag image(s) here…' welcome text.
+
+    The welcome text is stripped by emptying the QLabel widgets that
+    contain it (rather than hiding the welcome widget itself, which on
+    some napari versions also hides the canvas).
+
+    Defensive against napari version changes — attribute names shift
+    between minor releases; every access is guarded."""
+    try:
+        qtv = (getattr(viewer.window, "qt_viewer", None)
+               or getattr(viewer.window, "_qt_viewer", None))
+    except Exception:
+        qtv = None
+    if qtv is None:
+        return
+
+    # Bottom-of-canvas button strip (ndisplay / grid / transpose / home / console)
+    for attr in ("viewerButtons", "_viewer_buttons", "viewer_buttons"):
+        w = getattr(qtv, attr, None)
+        if w is not None and hasattr(w, "hide"):
+            try:    w.hide()
+            except Exception: pass
+
+    # New-layer / delete buttons under the layer list
+    for attr in ("layerButtons", "_layer_buttons", "layer_buttons"):
+        w = getattr(qtv, attr, None)
+        if w is not None and hasattr(w, "hide"):
+            try:    w.hide()
+            except Exception: pass
+
+    # Welcome-overlay text — walk every QLabel under the qt_viewer and
+    # blank out any that mention the welcome phrases.  Hiding the
+    # parent welcome widget itself takes the canvas with it on some
+    # napari versions, so we hide JUST the text content.
+    try:
+        for lbl in qtv.findChildren(QtWidgets.QLabel):
+            try:
+                txt = lbl.text() or ""
+            except Exception:
+                continue
+            if any(p in txt for p in _NAPARI_WELCOME_PHRASES):
+                try:    lbl.setText("")
+                except Exception: pass
+    except Exception:
+        pass
+
+    # Strip napari's menubar — on macOS its menus (File / View / Plugins /
+    # Window / Help) get merged into the system menu bar and ⌘, opens
+    # napari's Preferences dialog from "Python → Preferences".  None of
+    # those belong to FIREFLY; clear them so the only menus the user sees
+    # are the ones the host app actually owns.  Also disable any QActions
+    # napari attached to the window — clearing the menubar removes them
+    # from the menu, but their global shortcuts (⌘,, ⌘W, ⌘?, etc.) keep
+    # firing until the actions themselves are disabled.
+    try:
+        qt_window = getattr(viewer.window, "_qt_window", None)
+        mb = qt_window.menuBar() if qt_window is not None else None
+        if mb is not None:
+            # NOTE: do NOT call mb.clear() — on macOS the native menu bar
+            # is shared with the application, and clearing it nukes the
+            # standard QActions including the one ⌘Q routes through.
+            # Detaching from the native menu + hiding the widget is
+            # enough to keep napari's menus out of sight without taking
+            # the host's Quit action down with them.
+            try:    mb.setNativeMenuBar(False)
+            except Exception: pass
+            try:    mb.hide()
+            except Exception: pass
+        # Disable every QAction owned by the napari window so its global
+        # shortcuts stop responding.  We don't delete them — that can
+        # crash Qt mid-event — just set them disabled + remove their
+        # shortcut binding.
+        if qt_window is not None:
+            for act in qt_window.findChildren(QtGui.QAction):
+                try:    act.setEnabled(False)
+                except Exception: pass
+                try:    act.setShortcut(QtGui.QKeySequence())
+                except Exception: pass
+                try:    act.setShortcuts([])
+                except Exception: pass
+            # QShortcut objects are SEPARATE from QAction — napari uses
+            # them for ⌘,, ⌘?, ⌘Y, etc.  Disable + strip them too.
+            for sc in qt_window.findChildren(QtGui.QShortcut):
+                try:    sc.setEnabled(False)
+                except Exception: pass
+                try:    sc.setKey(QtGui.QKeySequence())
+                except Exception: pass
+    except Exception:
+        pass
+
+    # Trim the shapes-layer toolbar — for ROI use we only need the
+    # polygon tool + vertex edit + select + delete; rectangle / ellipse /
+    # line / path / Z-order shuffling are noise.  Walk the WHOLE napari
+    # window for buttons (the shape-mode buttons can sit deep inside
+    # the layer-controls stack, several parents under `qt_viewer`), and
+    # match against tooltip *and* object name + property hints.
+    try:
+        # Roots we'll walk in order of specificity
+        roots = []
+        for attr in ("controls", "layer_controls", "_layer_controls",
+                     "dockLayerControls"):
+            r = getattr(qtv, attr, None)
+            if r is not None:
+                # docks may carry the widget on .widget()
+                inner = r.widget() if hasattr(r, "widget") and callable(r.widget) else r
+                if inner is not None: roots.append(inner)
+                roots.append(r)
+        roots.append(qtv)
+        if qt_window is not None:
+            roots.append(qt_window)
+        # Tooltip / objectName substrings that identify buttons we hide
+        _kill = (
+            "rectangle", "ellipse", "line ",
+            "add lines", "add paths", "path mode", " path ",
+            "polygon lasso", "lasso",
+            "move to front", "move to back",
+            "raise", "lower",   # napari uses these for Z-order too
+        )
+        seen: set = set()
+        for root in roots:
+            try:    btns = root.findChildren(QtWidgets.QAbstractButton)
+            except Exception: continue
+            for btn in btns:
+                if id(btn) in seen:
+                    continue
+                seen.add(id(btn))
+                try:
+                    tip  = (btn.toolTip() or "").lower()
+                    name = (btn.objectName() or "").lower()
+                except Exception:
+                    continue
+                blob = tip + " | " + name
+                if any(k in blob for k in _kill):
+                    try:    btn.hide()
+                    except Exception: pass
+    except Exception:
+        pass
+
+
 class _ModeTile(QtWidgets.QFrame):
     """A big card-shaped clickable tile.  Acts like a checkable button:
     clicking toggles its state and emits `toggled(bool)`.  Used by the
@@ -326,6 +531,199 @@ class _CollapsibleSection(QtWidgets.QWidget):
 # ══════════════════════════════════════════════════════════════════════════════
 #  RESULTS PANEL — shown after a run completes (replaces the figure canvas)
 # ══════════════════════════════════════════════════════════════════════════════
+class _ResourceMonitor(QtWidgets.QFrame):
+    """1 Hz strip of system-resource gauges shown at the top of the
+    Analysis tab.  Four cells: CPU%, RAM used / total, GPU%, GPU VRAM.
+
+    Catches "why is my run slow" instantly — if the GPU sits at 0% the
+    backend silently fell back to CPU; if RAM is pinned the OS is
+    paging; etc.  Gracefully degrades when psutil or torch is missing.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("resource_monitor")
+        h = QtWidgets.QHBoxLayout(self)
+        h.setContentsMargins(8, 4, 8, 4)
+        h.setSpacing(14)
+        self._cells: "dict[str, QtWidgets.QLabel]" = {}
+        for key, label in (("cpu",  "CPU"),
+                           ("ram",  "RAM"),
+                           ("gpu",  "GPU"),
+                           ("vram", "VRAM")):
+            cell = QtWidgets.QHBoxLayout()
+            cell.setSpacing(4)
+            cap = QtWidgets.QLabel(label)
+            cap.setStyleSheet(
+                f"color: {_THEME['TXT_MUTED']}; font-size: 11px;"
+                "font-weight: 600;")
+            val = QtWidgets.QLabel("—")
+            val.setStyleSheet(
+                f"color: {_THEME['TXT']}; font-size: 12px; "
+                "font-variant-numeric: tabular-nums;")
+            val.setMinimumWidth(70)
+            self._cells[key] = val
+            cell.addWidget(cap)
+            cell.addWidget(val)
+            h.addLayout(cell)
+        h.addStretch(1)
+
+        # Probe deps once at construction so we don't pay the import cost
+        # per tick.  All three are optional — graceful no-op if absent.
+        self._psutil = None
+        self._torch  = None
+        try:
+            import psutil as _ps
+            self._psutil = _ps
+            # Warm the per-process cpu_percent baseline so the first
+            # reading isn't a misleading 0.0.
+            try:    _ps.cpu_percent(interval=None)
+            except Exception: pass
+        except Exception:
+            pass
+        try:
+            import torch as _t
+            self._torch = _t
+        except Exception:
+            pass
+
+        # Cached MPS utilisation (Apple Silicon has no Python API — we
+        # shell out to `ioreg`, which is fast but worth backgrounding).
+        self._mps_util_cache: "int | None" = None
+        self._mps_polling: bool = False
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self._refresh)
+        self._timer.start()
+        self._refresh()
+
+    @staticmethod
+    def _mps_gpu_utilization() -> "int | None":
+        """Best-effort macOS GPU utilisation via `ioreg`.  Returns an
+        integer percent or None if we can't tell.  Runs subprocess
+        — never call from the GUI thread; use `_poll_mps_async`.
+
+        Different macOS / chip combos expose the field under slightly
+        different keys, so we try a few.  Cheap regex parse — no
+        plistlib needed."""
+        import subprocess, re
+        try:
+            out = subprocess.check_output(
+                ["ioreg", "-r", "-c", "IOAccelerator", "-d", "1"],
+                stderr=subprocess.DEVNULL, timeout=1.0).decode(
+                "utf-8", errors="ignore")
+        except Exception:
+            return None
+        for pattern in (r'"Device Utilization\s*%"\s*=\s*(\d+)',
+                        r'"GPU Busy %"\s*=\s*(\d+)',
+                        r'"GPU Core Utilization\s*%"\s*=\s*(\d+)'):
+            m = re.search(pattern, out)
+            if m:
+                try:    return int(m.group(1))
+                except Exception: pass
+        return None
+
+    def _poll_mps_async(self):
+        """Run the ioreg parse on a background thread, write the result
+        to the cache.  Re-entrancy-guarded so we don't pile up threads."""
+        if self._mps_polling:
+            return
+        self._mps_polling = True
+        import threading
+        def _run():
+            try:    self._mps_util_cache = self._mps_gpu_utilization()
+            finally: self._mps_polling = False
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _set(self, key: str, txt: str, *, warn: bool = False):
+        lbl = self._cells.get(key)
+        if lbl is None: return
+        col = _THEME['WARN'] if warn else _THEME['TXT']
+        lbl.setStyleSheet(
+            f"color: {col}; font-size: 12px; "
+            "font-variant-numeric: tabular-nums;")
+        lbl.setText(txt)
+
+    def _refresh(self):
+        # CPU + RAM via psutil
+        if self._psutil is not None:
+            try:
+                pct = self._psutil.cpu_percent(interval=None)
+                self._set("cpu", f"{pct:5.1f} %",
+                          warn=(pct > 90))
+            except Exception:
+                self._set("cpu", "—")
+            try:
+                vm = self._psutil.virtual_memory()
+                used_gb = (vm.total - vm.available) / 1e9
+                total_gb = vm.total / 1e9
+                self._set("ram",
+                          f"{used_gb:4.1f} / {total_gb:.0f} GB",
+                          warn=(vm.percent > 90))
+            except Exception:
+                self._set("ram", "—")
+        else:
+            self._set("cpu", "(psutil)")
+            self._set("ram", "(psutil)")
+
+        # GPU usage + VRAM via torch.  CUDA exposes utilisation through
+        # nvidia-smi (not torch) so we report VRAM-in-use as the GPU
+        # cell when CUDA is active; MPS doesn't expose either cleanly.
+        if self._torch is None:
+            self._set("gpu",  "(torch)")
+            self._set("vram", "(torch)")
+            return
+
+        try:
+            t = self._torch
+            if t.cuda.is_available():
+                # GPU utilisation via NVML if available
+                util = None
+                try:
+                    import pynvml
+                    pynvml.nvmlInit()
+                    h = pynvml.nvmlDeviceGetHandleByIndex(0)
+                    util = pynvml.nvmlDeviceGetUtilizationRates(h).gpu
+                    pynvml.nvmlShutdown()
+                except Exception:
+                    pass
+                if util is not None:
+                    self._set("gpu", f"{util:5.1f} %",
+                              warn=(util < 1))
+                else:
+                    self._set("gpu", "CUDA")
+                try:
+                    alloc = t.cuda.memory_allocated() / 1e9
+                    total = t.cuda.get_device_properties(0).total_memory / 1e9
+                    self._set("vram", f"{alloc:4.1f} / {total:.0f} GB")
+                except Exception:
+                    self._set("vram", "CUDA")
+            elif (hasattr(t.backends, "mps")
+                  and t.backends.mps.is_available()):
+                # MPS exposes "current_allocated_memory" only in recent
+                # torch builds; fall back to a stub when missing.
+                try:
+                    alloc = t.mps.current_allocated_memory() / 1e9
+                    self._set("vram", f"{alloc:4.1f} GB")
+                except Exception:
+                    self._set("vram", "MPS")
+                # Kick off the async ioreg poll for the next tick + show
+                # the cached value from the previous tick.
+                self._poll_mps_async()
+                if self._mps_util_cache is not None:
+                    self._set("gpu", f"{self._mps_util_cache:5.1f} %",
+                              warn=(self._mps_util_cache < 1))
+                else:
+                    self._set("gpu", "MPS")
+            else:
+                self._set("gpu",  "CPU only")
+                self._set("vram", "—")
+        except Exception:
+            self._set("gpu",  "—")
+            self._set("vram", "—")
+
+
 class _MassHistogram(QtWidgets.QWidget):
     """Lightweight live histogram of localisation mass values.
 
@@ -348,7 +746,7 @@ class _MassHistogram(QtWidgets.QWidget):
         # ~6 Hz to keep the GUI responsive when chunks land in rapid fire.
         self._dirty = False
         self._repaint_timer = QTimer(self)
-        self._repaint_timer.setInterval(160)
+        self._repaint_timer.setInterval(16)   # ~60 Hz
         self._repaint_timer.setSingleShot(False)
         self._repaint_timer.timeout.connect(self._maybe_repaint)
         self._repaint_timer.start()
@@ -458,6 +856,125 @@ class _MassHistogram(QtWidgets.QWidget):
                 p.setPen(QtGui.QColor(_THEME['WARN']))
                 p.drawText(QtCore.QPointF(x + 3, plot.top() + 10),
                            f"min={self._minmass:g}")
+        p.end()
+
+
+class _LiveFrameView(QtWidgets.QWidget):
+    """Renders the most-recent preprocessed frame from the localisation
+    stream plus the detections found on it.  Pairs with `_MassHistogram`
+    to form a 'detection cockpit' on the Analysis tab so the user can
+    watch what's actually being detected during a run."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(220, 160)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
+                           QtWidgets.QSizePolicy.Policy.Expanding)
+        self._frame = None           # 2D float32 array
+        self._xs = None
+        self._ys = None
+        self._idx = None
+        self._n_frames = None
+        self._n_spots = 0
+        # Throttle repaints to ~6 Hz so a hot stream of chunks doesn't
+        # pin the GUI thread.
+        self._dirty = False
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)   # ~60 Hz
+        self._timer.timeout.connect(self._maybe_repaint)
+        self._timer.start()
+
+    def reset(self):
+        self._frame = None
+        self._xs = None
+        self._ys = None
+        self._idx = None
+        self._n_frames = None
+        self._n_spots = 0
+        self._dirty = True
+
+    def set_frame(self, frame, xs, ys, idx, n_frames):
+        try:
+            import numpy as _np
+            self._frame = _np.asarray(frame, dtype=_np.float32)
+            self._xs = _np.asarray(xs, dtype=_np.float32)
+            self._ys = _np.asarray(ys, dtype=_np.float32)
+            self._idx = int(idx)
+            self._n_frames = int(n_frames)
+            self._n_spots = int(self._xs.size)
+            self._dirty = True
+        except Exception:
+            pass
+
+    def _maybe_repaint(self):
+        if self._dirty:
+            self._dirty = False
+            self.update()
+
+    def paintEvent(self, _evt):
+        p = QtGui.QPainter(self)
+        r = self.rect()
+        p.fillRect(r, QtGui.QColor(_THEME['PANEL']))
+        p.setPen(QtGui.QColor(_THEME['BORDER']))
+        p.drawRect(r.adjusted(0, 0, -1, -1))
+
+        if self._frame is None:
+            p.setPen(QtGui.QColor(_THEME['TXT_MUTED']))
+            p.drawText(r, Qt.AlignmentFlag.AlignCenter,
+                       "Live detection view will appear here\n"
+                       "during a run.")
+            return
+
+        try:
+            import numpy as _np
+            f = self._frame
+            lo, hi = _np.percentile(f, [1.0, 99.5])
+            if hi <= lo:
+                hi = lo + 1.0
+            u8 = _np.clip((f - lo) * (255.0 / (hi - lo)),
+                          0, 255).astype(_np.uint8, copy=False)
+            # Pad to a contiguous buffer that QImage can wrap safely
+            u8 = _np.ascontiguousarray(u8)
+            h, w = u8.shape
+            img = QtGui.QImage(u8.tobytes(), w, h, w,
+                                QtGui.QImage.Format.Format_Grayscale8)
+        except Exception:
+            return
+
+        # Compute the rect inside the widget where we draw the frame
+        pad_t = 22; pad = 8
+        avail = r.adjusted(pad, pad_t, -pad, -pad)
+        if avail.width() <= 0 or avail.height() <= 0:
+            return
+        scale = min(avail.width() / w, avail.height() / h)
+        disp_w = max(1, int(w * scale))
+        disp_h = max(1, int(h * scale))
+        disp_x = avail.left() + (avail.width()  - disp_w) // 2
+        disp_y = avail.top()  + (avail.height() - disp_h) // 2
+        p.drawImage(QtCore.QRect(disp_x, disp_y, disp_w, disp_h), img)
+
+        # Title strip
+        p.setPen(QtGui.QColor(_THEME['TXT_MUTED']))
+        font = p.font(); font.setPointSize(10); p.setFont(font)
+        idx = self._idx if self._idx is not None else 0
+        total = self._n_frames if self._n_frames else 0
+        title = (f"Live detection  ·  frame {idx + 1}/{total}"
+                 f"  ·  {self._n_spots} spots")
+        p.drawText(QtCore.QRect(r.left() + pad, r.top() + 4,
+                                r.width() - 2 * pad, 18),
+                   Qt.AlignmentFlag.AlignLeft, title)
+
+        # Detection circles — flat accent for visibility on greyscale
+        if self._xs is not None and self._xs.size > 0:
+            pen = QtGui.QPen(QtGui.QColor(_THEME['ACC']))
+            pen.setWidthF(1.2)
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            radius = max(3.0, 4.0 * scale)
+            for x, y in zip(self._xs, self._ys):
+                cx = disp_x + float(x) * scale
+                cy = disp_y + float(y) * scale
+                p.drawEllipse(QtCore.QPointF(cx, cy), radius, radius)
         p.end()
 
 
@@ -1036,6 +1553,7 @@ class _RoiDialog(QtWidgets.QDialog):
             self._viewer = napari.Viewer(show=False)
             qt_window = self._viewer.window._qt_window
             self._viewer_layout.addWidget(qt_window)
+            _hide_napari_chrome(self._viewer)
         except Exception as exc:
             self._status.setText(f"Couldn't embed napari viewer: {exc}")
             return
@@ -1140,6 +1658,13 @@ class _RoiViewer(QtWidgets.QWidget):
         self._roi_mask_layer = None    # auto/manual-threshold overlay layer
         self._roi_mask_params = {"mode": "None", "auto_method": "li",
                                  "threshold": 0.08, "mask_mode": "mean"}
+        # When true, _on_layer_removed is a no-op.  Used by set_file
+        # while it tears down the previous file's layers — we DON'T want
+        # the "user deleted our ROI, recreate it" recovery path to fire
+        # during a programmatic teardown, because re-entering
+        # add_shapes() mid-clear corrupts napari's layer iterator and
+        # freezes the GUI.
+        self._suppress_layer_events = False
         self._lazy_init_pending = True
         self._detect_enabled = False
         self._detect_params  = {"diameter": 7, "minmass": 1.0,
@@ -1240,6 +1765,12 @@ class _RoiViewer(QtWidgets.QWidget):
             self._viewer_layout.removeWidget(self._placeholder)
             self._placeholder.hide()
             self._viewer_layout.addWidget(qt_window)
+            # Hide napari's "Drag image(s) here" welcome overlay + the
+            # bottom-of-canvas viewer-buttons row (ndisplay / grid / home /
+            # console / etc.) + the new-layer/delete buttons under the
+            # layer list — all visual noise for a viewer driven entirely
+            # programmatically by FIREFLY.
+            _hide_napari_chrome(self._viewer)
             # Re-run detection when the user scrubs frames (idempotent)
             if not self._dims_connected:
                 try:
@@ -1248,10 +1779,73 @@ class _RoiViewer(QtWidgets.QWidget):
                     self._dims_connected = True
                 except Exception:
                     pass
+            # Auto-recover if the user deletes a layer we own (e.g. the
+            # ROI shapes layer via napari's trash button).
+            try:
+                self._viewer.layers.events.removed.connect(
+                    self._on_layer_removed)
+            except Exception:
+                pass
             return True
         except Exception as exc:
             self._status.setText(f"Couldn't embed napari viewer: {exc}")
             return False
+
+    def _on_layer_removed(self, event):
+        """Recover from the user deleting one of our managed layers.
+
+        Shapes layer → recreate empty (so they can keep drawing polygons,
+        and let the host know the previous polygons are gone).
+        Image / points / mask layers → just null the stored reference;
+        the next set_file / detection run / mask-refresh will re-create
+        them lazily.
+        """
+        # Programmatic layer teardown (e.g. set_file clearing the old
+        # file's layers before loading a new one) sets this flag so we
+        # don't fight napari's iterator by reinserting layers mid-clear.
+        if self._suppress_layer_events:
+            return
+        try:
+            removed = getattr(event, "value", None)
+        except Exception:
+            removed = None
+        if removed is None or self._viewer is None:
+            return
+        if removed is self._shapes_layer:
+            try:
+                import numpy as _np
+                self._shapes_layer = self._viewer.add_shapes(
+                    data=None,
+                    shape_type="polygon",
+                    edge_color="#58a6ff",
+                    face_color="rgba(88,166,255,0.18)",
+                    edge_width=2,
+                    name="ROI",
+                )
+                try:    self._shapes_layer.mode = "add_polygon"
+                except Exception: pass
+                try:    self._shapes_layer.events.data.connect(
+                            self._on_shapes_changed)
+                except Exception: pass
+                # Notify host that polygons for the current file have
+                # been wiped (matches the napari state on disk).
+                if self._current_file:
+                    self.polygons_changed.emit(self._current_file, [])
+                self._status.setText(
+                    "ROI layer was deleted — recreated empty.  "
+                    "Draw a new polygon to set the ROI.")
+            except Exception:
+                self._shapes_layer = None
+            return
+        if removed is self._image_layer:
+            self._image_layer = None
+            return
+        if removed is self._points_layer:
+            self._points_layer = None
+            return
+        if removed is self._roi_mask_layer:
+            self._roi_mask_layer = None
+            return
 
     # ── Public API ───────────────────────────────────────────────────────
     def set_file(self, file_path: str,
@@ -1278,11 +1872,16 @@ class _RoiViewer(QtWidgets.QWidget):
         if not self._ensure_viewer():
             return
 
-        # Clear out any old layers from a previous file
+        # Clear out any old layers from a previous file.  Wrap the clear
+        # in `_suppress_layer_events = True` so _on_layer_removed doesn't
+        # try to recreate layers MID-clear — that recursion is what
+        # froze the GUI when switching files.
+        self._suppress_layer_events = True
         try:
-            self._viewer.layers.clear()
-        except Exception:
-            pass
+            try:    self._viewer.layers.clear()
+            except Exception: pass
+        finally:
+            self._suppress_layer_events = False
         self._image_layer = None
         self._shapes_layer = None
         self._points_layer = None
@@ -2018,6 +2617,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._roi_polygons: dict[str, list] = {}
 
         self._build_ui()
+        self._install_menubar()
         self._install_crash_hooks()
         self._load_icon()
         self._load_roi_polygons()
@@ -2192,6 +2792,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
         h.addStretch(1)
 
+        # "Update available" pill — hidden on startup, lit up by the
+        # background update-check thread if GitHub Releases reports a
+        # newer tag than __version__.  Clicking opens the Releases page.
+        self.btn_update_pill = QtWidgets.QPushButton("")
+        self.btn_update_pill.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_update_pill.setVisible(False)
+        self.btn_update_pill.setStyleSheet(
+            f"QPushButton {{ background-color: {_THEME['ACC']}; "
+            f"color: {_THEME['ACC_FG']}; border: none; "
+            "border-radius: 10px; padding: 4px 10px; "
+            "font-size: 11px; font-weight: 700; }} "
+            f"QPushButton:hover {{ background-color: {_THEME['ACC_HOVER']}; }}")
+        self.btn_update_pill.clicked.connect(self._on_update_pill_clicked)
+        h.addWidget(self.btn_update_pill)
+
         # Right: tagline + author on ONE line, joined with a pipe.  Using
         # rich-text formatting on a single QLabel sidesteps the nested-
         # container-border issue and looks tidier than two stacked labels.
@@ -2208,7 +2823,50 @@ class MainWindow(QtWidgets.QMainWindow):
         right.setStyleSheet("font-size: 12px;")
         h.addWidget(right)
 
+        # Fire off the update check 2 s after startup so it doesn't
+        # block the initial paint.
+        QtCore.QTimer.singleShot(2000, self._kick_off_update_check)
+
         return bar
+
+    # ── Auto-update check ─────────────────────────────────────────────────
+    _UPDATE_REPO = "jacob-levers/FIREFLY"
+    _UPDATE_RELEASES_URL = (
+        f"https://github.com/jacob-levers/FIREFLY/releases")
+    _UPDATE_API_URL = (
+        f"https://api.github.com/repos/jacob-levers/FIREFLY/releases/latest")
+
+    def _kick_off_update_check(self):
+        """Hit GitHub Releases asynchronously and show the update pill
+        in the header if a newer tag is available than __version__."""
+        try:
+            import sptpalm_analysis as _sa
+            current = str(getattr(_sa, "__version__", "0.0.0"))
+        except Exception:
+            current = "0.0.0"
+
+        self._update_thread = _UpdateCheckThread(
+            self._UPDATE_API_URL, current, parent=self)
+        self._update_thread.update_available.connect(self._on_update_available)
+        self._update_thread.start()
+
+    def _on_update_available(self, latest_tag: str, html_url: str):
+        """Slot called when the background thread finds a newer release."""
+        if not hasattr(self, "btn_update_pill"):
+            return
+        self._update_url = html_url or self._UPDATE_RELEASES_URL
+        self.btn_update_pill.setText(f"  ●  Update available: {latest_tag}  ")
+        self.btn_update_pill.setToolTip(
+            f"FIREFLY {latest_tag} is available on GitHub.  "
+            "Click to open the Releases page.")
+        self.btn_update_pill.setVisible(True)
+
+    def _on_update_pill_clicked(self):
+        url = getattr(self, "_update_url", self._UPDATE_RELEASES_URL)
+        try:
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl(url))
+        except Exception:
+            pass
 
     def _build_console_dock(self):
         """Create the dockable console.  Hidden by default — toggled via
@@ -2231,7 +2889,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._console_dock.setWidget(self.console_log)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea,
                            self._console_dock)
-        # Hidden by default; user has to click Console to open
+        # Hidden by default; user has to click Console to open.  Float
+        # the dock so toggling it open doesn't push the main window
+        # taller — the floating panel just appears next to the app and
+        # the user can drag it back into the main window if they want.
+        self._console_dock.setFloating(True)
+        self._console_dock.resize(800, 280)
         self._console_dock.hide()
         # Keep the toggle button in sync when the dock is closed via its
         # own ✕ button
@@ -2305,6 +2968,39 @@ class MainWindow(QtWidgets.QMainWindow):
         title = QtWidgets.QLabel("Analysis Parameters")
         f = title.font(); f.setBold(True); f.setPointSize(11); title.setFont(f)
         layout.addWidget(title)
+
+        # ── Presets ───────────────────────────────────────────────────────
+        # Quick switcher for labelled parameter bundles.  Selecting a
+        # preset applies its widget snapshot to the rest of the sidebar.
+        preset_row = QtWidgets.QHBoxLayout()
+        preset_row.setContentsMargins(0, 0, 0, 6)
+        preset_row.setSpacing(6)
+        preset_row.addWidget(QtWidgets.QLabel("Preset"))
+        self.c_preset = _QuietComboBox()
+        self.c_preset.setToolTip(
+            "Switch between labelled parameter bundles stored in\n"
+            "~/.firefly/presets/.  Two defaults ship out of the box;\n"
+            "use the disk icon to save the current sidebar as a new one.")
+        preset_row.addWidget(self.c_preset, 1)
+        self.btn_preset_save = QtWidgets.QToolButton()
+        self.btn_preset_save.setText("Save…")
+        self.btn_preset_save.setToolTip(
+            "Save the current sidebar values as a new preset.")
+        self.btn_preset_save.clicked.connect(self._on_preset_save)
+        preset_row.addWidget(self.btn_preset_save)
+        self.btn_preset_delete = QtWidgets.QToolButton()
+        self.btn_preset_delete.setText("Delete")
+        self.btn_preset_delete.setToolTip(
+            "Delete the currently-selected preset from\n"
+            "~/.firefly/presets/.  Built-in presets are re-seeded on the\n"
+            "next launch unless you save your own version with the same\n"
+            "name first.")
+        self.btn_preset_delete.clicked.connect(self._on_preset_delete)
+        preset_row.addWidget(self.btn_preset_delete)
+        layout.addLayout(preset_row)
+        # Deferred wiring — combobox change must apply only after construction
+        # of every widget the preset references.  See `_finalise_presets`.
+        QtCore.QTimer.singleShot(0, self._finalise_presets)
 
         # NOTE: Input/output pickers used to live here but moved to the
         # Import tab in v2.1 — see `_build_import_tab`.  The QLineEdit
@@ -2901,12 +3597,17 @@ class MainWindow(QtWidgets.QMainWindow):
         bg.addLayout(row)
 
         bg.addWidget(QtWidgets.QLabel(
-            "Files to process  (uncheck to skip):"))
-        self.lst_batch_files = QtWidgets.QListWidget()
-        self.lst_batch_files.setSelectionMode(
-            QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.lst_batch_files.setMinimumHeight(220)
-        bg.addWidget(self.lst_batch_files, stretch=1)
+            "Series to process  (expand a series to deselect individual files):"))
+        self.tree_batch_files = QtWidgets.QTreeWidget()
+        self.tree_batch_files.setHeaderHidden(True)
+        self.tree_batch_files.setColumnCount(1)
+        self.tree_batch_files.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.tree_batch_files.setMinimumHeight(200)
+        self.tree_batch_files.setRootIsDecorated(True)
+        self.tree_batch_files.setUniformRowHeights(True)
+        self.tree_batch_files.setIndentation(18)
+        bg.addWidget(self.tree_batch_files, stretch=1)
 
         sel_row = QtWidgets.QHBoxLayout()
         for label, fn in (("Select all",     self._on_batch_select_all),
@@ -2916,14 +3617,31 @@ class MainWindow(QtWidgets.QMainWindow):
             b.clicked.connect(fn)
             sel_row.addWidget(b)
         sel_row.addStretch(1)
-        self.lbl_batch_summary = QtWidgets.QLabel("0 files / 0 selected")
+        # Explicit "open in preview viewer" — file loading is heavy
+        # (reads ~30 frames + embeds in napari) and was previously
+        # triggered on every checkbox toggle via itemClicked, which froze
+        # the UI when the user was rapidly de-selecting files.  Now the
+        # load only fires when the user explicitly asks for it.
+        self.btn_batch_open_in_viewer = QtWidgets.QPushButton(
+            "Open in viewer")
+        self.btn_batch_open_in_viewer.setToolTip(
+            "Load the highlighted series (or file) into the preview\n"
+            "viewer below.  Double-clicking a row in the tree does the\n"
+            "same thing.")
+        self.btn_batch_open_in_viewer.clicked.connect(
+            self._on_batch_open_in_viewer)
+        sel_row.addWidget(self.btn_batch_open_in_viewer)
+        self.lbl_batch_summary = QtWidgets.QLabel("0 series / 0 selected")
         sel_row.addWidget(self.lbl_batch_summary)
         bg.addLayout(sel_row)
 
-        # The embedded ROI viewer below auto-loads whichever series the
-        # user clicks in the list, so no explicit "load" button is needed.
-        self.lst_batch_files.itemClicked.connect(
-            lambda _it: self._roi_embedded_load_current_file())
+        # Power-user shortcut: double-click a row to load it without
+        # using the toolbar button.  Single-click only highlights —
+        # no heavy work happens on checkbox toggles.
+        self.tree_batch_files.itemDoubleClicked.connect(
+            self._on_batch_tree_item_double_clicked)
+        # Parent ↔ child check-state propagation.  Wired in _batch_rescan
+        # after population to avoid spurious fires during seeding.
 
         # Where the batch outputs land
         self.lbl_batch_output_path = QtWidgets.QLabel(
@@ -2942,7 +3660,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Reserve a min height so the panel doesn't grow from nothing the
         # first time a file is loaded — that resize is what macOS animates
         # as a "slide".
-        self._roi_viewer_container.setMinimumHeight(420)
+        self._roi_viewer_container.setMinimumHeight(280)
         rvl = QtWidgets.QVBoxLayout(self._roi_viewer_container)
         rvl.setContentsMargins(0, 8, 0, 0)
         self._roi_viewer = _RoiViewer()
@@ -2983,6 +3701,10 @@ class MainWindow(QtWidgets.QMainWindow):
         stage_row.addWidget(self.lbl_elapsed)
         v.addLayout(stage_row)
 
+        # Resource monitor — CPU / RAM / GPU / VRAM at 1 Hz
+        self.resource_monitor = _ResourceMonitor()
+        v.addWidget(self.resource_monitor)
+
         self.progress_bar = QtWidgets.QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
@@ -3008,14 +3730,31 @@ class MainWindow(QtWidgets.QMainWindow):
         self.batch_subprogress.hide()
         v.addWidget(self.batch_subprogress)
 
-        # Live mass histogram — chunks land here during a run so the user
-        # can sanity-check minmass without waiting for the figure.
-        self.mass_hist = _MassHistogram()
-        v.addWidget(self.mass_hist)
+        # Detection cockpit (during a run) vs results panel (post-run)
+        # share the same bottom slot via a QStackedWidget.
+        self._analysis_stack = QtWidgets.QStackedWidget()
 
+        # Page 0 — cockpit: narrow mass histogram across the top (its
+        # original position / aspect), live frame view below it filling
+        # all remaining vertical space.
+        cockpit_w = QtWidgets.QWidget()
+        cockpit   = QtWidgets.QVBoxLayout(cockpit_w)
+        cockpit.setContentsMargins(0, 0, 0, 0)
+        cockpit.setSpacing(6)
+        self.mass_hist = _MassHistogram()
+        self.live_view = _LiveFrameView()
+        cockpit.addWidget(self.mass_hist)             # narrow, no stretch
+        cockpit.addWidget(self.live_view, 1)          # fills the rest
+        self._analysis_stack.addWidget(cockpit_w)
+
+        # Page 1 — results: same _ResultsPanel as before.
         self.run_results = _ResultsPanel(
             "Results will appear here after analysis.")
-        v.addWidget(self.run_results, stretch=1)
+        self._analysis_stack.addWidget(self.run_results)
+
+        v.addWidget(self._analysis_stack, stretch=1)
+        # Start on the results page (cockpit only shows during runs)
+        self._analysis_stack.setCurrentIndex(1)
 
         self.tabs.addTab(tab, "Analysis")
 
@@ -3413,40 +4152,46 @@ class MainWindow(QtWidgets.QMainWindow):
         if path:
             self._batch_rescan(path)
 
-    def _batch_rescan(self, folder: str):
-        """Populate the file list with one entry per file SERIES in `folder`.
+    # Custom data roles for tree items
+    _ROLE_PATH        = Qt.ItemDataRole.UserRole       # full file path
+    _ROLE_KIND        = Qt.ItemDataRole.UserRole + 1   # "series" or "file"
+    _ROLE_SERIES_KEY  = Qt.ItemDataRole.UserRole + 2   # series identifier
+    _ROLE_FILE_COUNT  = Qt.ItemDataRole.UserRole + 3   # series count (series items only)
 
-        Files of the form `name.tif` + `name(1).tif` + … are grouped into
-        a single series.  The primary (no-suffix) file is what gets added
-        to the batch list — the loader picks up the rest at run time, so
-        processing the series happens exactly once instead of N times.
+    def _batch_rescan(self, folder: str):
+        """Populate the tree with one parent per file SERIES + one child
+        per sister file inside the series.
+
+        Each series's parent toggles all of its file children at once;
+        the children can be individually deselected to exclude specific
+        sister files from the loader concat.  When the run starts, the
+        worker receives the per-series checked-file list and overrides
+        the auto-discovery in `load_tif` / `load_czi` accordingly.
         """
-        # Disconnect itemChanged to prevent handler pile-up on repeated
-        # rescans.  Reconnect at the end.  (Without this, every rescan
-        # adds another connection, and stale clicks fire multiple
-        # summary recalcs and may interfere with check-state toggling.)
+        # Disconnect itemChanged so populating doesn't fire a cascade
         try:
-            self.lst_batch_files.itemChanged.disconnect()
+            self.tree_batch_files.itemChanged.disconnect()
         except (TypeError, RuntimeError):
             pass
+        # Re-entrancy guard for parent ↔ child propagation
+        self._tree_propagation_guard = False
 
-        self.lst_batch_files.blockSignals(True)
-        self.lst_batch_files.clear()
-        # Per-series-key cache: list of (filename, full_path) sister files
+        self.tree_batch_files.blockSignals(True)
+        self.tree_batch_files.clear()
         self._batch_series_map: dict[str, list[tuple[str, str]]] = {}
 
         if not os.path.isdir(folder):
-            self.lst_batch_files.blockSignals(False)
+            self.tree_batch_files.blockSignals(False)
             self._batch_update_summary()
             return
         try:
             names = sorted(os.listdir(folder))
         except OSError:
-            self.lst_batch_files.blockSignals(False)
+            self.tree_batch_files.blockSignals(False)
             self._batch_update_summary()
             return
 
-        # Phase 1 — group files into series.
+        # Phase 1 — group files into series by the loader's keying.
         for name in names:
             if not self._looks_like_input_file(name):
                 continue
@@ -3456,57 +4201,166 @@ class MainWindow(QtWidgets.QMainWindow):
             key = self._series_key(name)
             self._batch_series_map.setdefault(key, []).append((name, full))
 
-        # Phase 2 — for each series, pick a representative file (the
-        # canonical no-suffix one, else alphabetically first) and add ONE
-        # list item per series.
+        # Phase 2 — build the tree.
         for key in sorted(self._batch_series_map.keys()):
             sisters = sorted(self._batch_series_map[key])
             primary_name, primary_full = sisters[0]
             for nm, pth in sisters:
-                bare_stem = os.path.splitext(nm)[0]
-                if bare_stem == key:
+                if os.path.splitext(nm)[0] == key:
                     primary_name, primary_full = nm, pth
                     break
             n = len(sisters)
-            label = primary_name if n == 1 else f"{primary_name}   × {n} files"
-            item = QtWidgets.QListWidgetItem(label)
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(Qt.CheckState.Checked)
-            item.setData(Qt.ItemDataRole.UserRole, primary_full)
-            # Cache the series count on the item for ROI-marker decoration
-            item.setData(Qt.ItemDataRole.UserRole + 1, n)
-            self.lst_batch_files.addItem(item)
+            parent_label = (primary_name if n == 1
+                            else f"{primary_name}   ×  {n} files")
+            parent = QtWidgets.QTreeWidgetItem([parent_label])
+            parent.setFlags(parent.flags()
+                            | Qt.ItemFlag.ItemIsUserCheckable
+                            | Qt.ItemFlag.ItemIsAutoTristate)
+            parent.setCheckState(0, Qt.CheckState.Checked)
+            parent.setData(0, self._ROLE_PATH, primary_full)
+            parent.setData(0, self._ROLE_KIND, "series")
+            parent.setData(0, self._ROLE_SERIES_KEY, key)
+            parent.setData(0, self._ROLE_FILE_COUNT, n)
+            # Highlight the parent slightly to distinguish from children
+            f = parent.font(0); f.setBold(True); parent.setFont(0, f)
+            # Add one child per sister file (in display order)
+            for nm, pth in sisters:
+                child = QtWidgets.QTreeWidgetItem([nm])
+                child.setFlags(child.flags()
+                               | Qt.ItemFlag.ItemIsUserCheckable)
+                child.setCheckState(0, Qt.CheckState.Checked)
+                child.setData(0, self._ROLE_PATH, pth)
+                child.setData(0, self._ROLE_KIND, "file")
+                child.setData(0, self._ROLE_SERIES_KEY, key)
+                parent.addChild(child)
+            self.tree_batch_files.addTopLevelItem(parent)
+            # Single-file series collapse — no point expanding a one-row group.
+            parent.setExpanded(n > 1)
 
-        self.lst_batch_files.blockSignals(False)
-        self.lst_batch_files.itemChanged.connect(
-            lambda _: self._batch_update_summary())
+        self.tree_batch_files.blockSignals(False)
+        self.tree_batch_files.itemChanged.connect(self._on_tree_item_changed)
         self._batch_update_summary()
-        # Mark series that already have a saved polygon ROI
+        # Mark series + files that already have a saved polygon ROI
         self._refresh_batch_roi_markers()
 
-    def _batch_iter_items(self):
-        for i in range(self.lst_batch_files.count()):
-            yield self.lst_batch_files.item(i)
+    # ── Tree iteration helpers ───────────────────────────────────────────
+    def _batch_iter_series(self):
+        """Yield each top-level (series) item in the batch tree."""
+        if not hasattr(self, "tree_batch_files"):
+            return
+        for i in range(self.tree_batch_files.topLevelItemCount()):
+            yield self.tree_batch_files.topLevelItem(i)
+
+    def _batch_iter_files(self):
+        """Yield every (series_item, file_item) pair in the batch tree."""
+        for ser in self._batch_iter_series():
+            for j in range(ser.childCount()):
+                yield ser, ser.child(j)
+
+    def _on_tree_item_changed(self, item: "QtWidgets.QTreeWidgetItem",
+                              _col: int):
+        """Keep parent ↔ child check states in sync, then refresh the
+        summary.  Re-entrancy-guarded because every setCheckState we
+        make in here would otherwise re-fire this slot."""
+        if self._tree_propagation_guard:
+            return
+        self._tree_propagation_guard = True
+        try:
+            kind = item.data(0, self._ROLE_KIND)
+            if kind == "series":
+                # Push the parent's new state down to children
+                state = item.checkState(0)
+                if state != Qt.CheckState.PartiallyChecked:
+                    for j in range(item.childCount()):
+                        item.child(j).setCheckState(0, state)
+            elif kind == "file":
+                parent = item.parent()
+                if parent is not None:
+                    n  = parent.childCount()
+                    on = sum(1 for j in range(n)
+                             if parent.child(j).checkState(0)
+                             == Qt.CheckState.Checked)
+                    if on == 0:
+                        parent.setCheckState(0, Qt.CheckState.Unchecked)
+                    elif on == n:
+                        parent.setCheckState(0, Qt.CheckState.Checked)
+                    else:
+                        parent.setCheckState(0, Qt.CheckState.PartiallyChecked)
+        finally:
+            self._tree_propagation_guard = False
+            self._batch_update_summary()
+
+    def _on_batch_tree_item_double_clicked(
+            self, item: "QtWidgets.QTreeWidgetItem", _col: int):
+        """Double-click on a tree row loads it into the preview viewer.
+        Single-click only highlights — checkbox toggles are cheap and
+        the heavy file load happens exclusively from here or the
+        toolbar button."""
+        if item is None:
+            return
+        path = item.data(0, self._ROLE_PATH)
+        if path:
+            self._roi_load_specific_path(path)
+
+    def _on_batch_open_in_viewer(self):
+        """Load the currently-highlighted tree item into the preview
+        viewer.  Triggered by the "Open in viewer" toolbar button."""
+        if not hasattr(self, "tree_batch_files"):
+            return
+        it = self.tree_batch_files.currentItem()
+        if it is None:
+            QtWidgets.QMessageBox.information(
+                self, "Open in viewer",
+                "Click a series or file in the tree first to highlight "
+                "it, then press 'Open in viewer'.")
+            return
+        path = it.data(0, self._ROLE_PATH)
+        if path:
+            self._roi_load_specific_path(path)
+
+    def _roi_load_specific_path(self, path: str):
+        """Load `path` into the embedded preview viewer.  Defers the
+        actual work one event-loop tick so the UI repaints first
+        (highlight / button-press feedback), then runs the heavy
+        napari load.  Status is surfaced via the viewer's own status
+        line so the user sees that something is happening."""
+        if not (path and os.path.isfile(path)):
+            return
+        try:
+            self.statusBar().showMessage(
+                f"Loading {os.path.basename(path)} into viewer…", 2000)
+        except Exception:
+            pass
+
+        def _go():
+            try:
+                existing = self._roi_polygons.get(os.path.abspath(path))
+                self._roi_viewer.set_file(path, current_polygons=existing)
+                self._push_detection_preview_params()
+                self._push_roi_mask_params()
+                self._roi_viewer.enable_detection_preview(True)
+            except Exception as exc:
+                try:
+                    self.statusBar().showMessage(
+                        f"Couldn't load preview: {exc}", 8000)
+                except Exception:
+                    pass
+        QtCore.QTimer.singleShot(0, _go)
 
     def _batch_update_summary(self):
-        n_series      = self.lst_batch_files.count()
-        n_sel_series  = sum(1 for it in self._batch_iter_items()
-                            if it.checkState() == Qt.CheckState.Checked)
-        n_total_files = sum(
-            int(it.data(Qt.ItemDataRole.UserRole + 1) or 1)
-            for it in self._batch_iter_items())
-        n_sel_files = sum(
-            int(it.data(Qt.ItemDataRole.UserRole + 1) or 1)
-            for it in self._batch_iter_items()
-            if it.checkState() == Qt.CheckState.Checked)
+        n_series     = sum(1 for _ in self._batch_iter_series())
+        n_sel_series = sum(1 for s in self._batch_iter_series()
+                           if s.checkState(0) != Qt.CheckState.Unchecked)
+        n_total_files = sum(1 for _ in self._batch_iter_files())
+        n_sel_files   = sum(1 for _, c in self._batch_iter_files()
+                            if c.checkState(0) == Qt.CheckState.Checked)
         if n_total_files == n_series:
             self.lbl_batch_summary.setText(
                 f"{n_series} series / {n_sel_series} selected")
         else:
             self.lbl_batch_summary.setText(
-                f"{n_series} series ({n_total_files} files total) / "
-                f"{n_sel_series} selected ({n_sel_files} files)")
-        # Show the user where the per-file outputs will land
+                f"{n_series} series ({n_total_files} files) / "
+                f"{n_sel_series} series selected ({n_sel_files} files)")
         folder = self.e_batch_folder.text().strip()
         if folder:
             self.lbl_batch_output_path.setText(
@@ -3516,23 +4370,48 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Output → (pick an input folder first)")
 
     def _on_batch_select_all(self):
-        for it in self._batch_iter_items():
-            it.setCheckState(Qt.CheckState.Checked)
+        for s in self._batch_iter_series():
+            s.setCheckState(0, Qt.CheckState.Checked)
 
     def _on_batch_select_none(self):
-        for it in self._batch_iter_items():
-            it.setCheckState(Qt.CheckState.Unchecked)
+        for s in self._batch_iter_series():
+            s.setCheckState(0, Qt.CheckState.Unchecked)
 
     def _on_batch_select_inverse(self):
-        for it in self._batch_iter_items():
-            it.setCheckState(
-                Qt.CheckState.Unchecked if it.checkState() == Qt.CheckState.Checked
+        for s in self._batch_iter_series():
+            cur = s.checkState(0)
+            s.setCheckState(0,
+                Qt.CheckState.Unchecked
+                if cur == Qt.CheckState.Checked
                 else Qt.CheckState.Checked)
 
+    def _batch_checked_series(self) -> "list[dict]":
+        """Return one entry per series the user wants processed, each a
+        dict {primary, key, files}: the primary file path (for stem +
+        outdir naming), the series key, and the explicit list of
+        checked sister files (in display order)."""
+        out: list[dict] = []
+        for s in self._batch_iter_series():
+            if s.checkState(0) == Qt.CheckState.Unchecked:
+                continue
+            files = [s.child(j).data(0, self._ROLE_PATH)
+                     for j in range(s.childCount())
+                     if s.child(j).checkState(0)
+                     == Qt.CheckState.Checked]
+            if not files:
+                continue
+            out.append({
+                "primary": s.data(0, self._ROLE_PATH),
+                "key":     s.data(0, self._ROLE_SERIES_KEY),
+                "files":   files,
+            })
+        return out
+
     def _batch_checked_files(self) -> list[str]:
-        return [it.data(Qt.ItemDataRole.UserRole)
-                for it in self._batch_iter_items()
-                if it.checkState() == Qt.CheckState.Checked]
+        """Backwards-compatible flat list of primary paths for any series
+        that has at least one checked file.  Kept for callers that only
+        need to count what's selected."""
+        return [g["primary"] for g in self._batch_checked_series()]
 
     # ── Embedded ROI viewer (Import tab) ─────────────────────────────────
     def _roi_embedded_load_current_file(self):
@@ -3543,9 +4422,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         path = ""
         if self.r_mode_batch.isChecked():
-            it = self.lst_batch_files.currentItem()
+            it = self.tree_batch_files.currentItem() \
+                if hasattr(self, "tree_batch_files") else None
             if it is not None:
-                path = it.data(Qt.ItemDataRole.UserRole) or ""
+                path = it.data(0, self._ROLE_PATH) or ""
         else:
             path = self.e_file.text().strip()
         if path and os.path.isfile(path):
@@ -3644,27 +4524,34 @@ class MainWindow(QtWidgets.QMainWindow):
         return f"{base}{self._ROI_MARKER}" if has_roi else base
 
     def _refresh_batch_roi_markers(self):
-        """Walk the batch file list and refresh ◉ markers based on whether
-        each item's primary file has a saved polygon ROI.
+        """Walk the batch tree and refresh ◉ markers.
 
-        Wrapped in blockSignals so the resulting `itemChanged` flurry
-        doesn't re-trigger handlers (which can interfere with the user's
-        in-progress check-state toggles)."""
-        if not hasattr(self, "lst_batch_files"):
+        File children get the marker when their own path has a saved
+        ROI; the series parent gets it when *any* of its files do.
+        Wrapped in blockSignals so the resulting itemChanged cascade
+        doesn't re-trigger the parent/child propagation logic."""
+        if not hasattr(self, "tree_batch_files"):
             return
-        self.lst_batch_files.blockSignals(True)
+        self.tree_batch_files.blockSignals(True)
         try:
-            for it in self._batch_iter_items():
-                path = it.data(Qt.ItemDataRole.UserRole)
-                if not path:
-                    continue
-                has_roi = bool(self._roi_polygons.get(os.path.abspath(path)))
-                new_text = self._decorate_filename_with_roi(
-                    it.text(), has_roi)
-                if new_text != it.text():
-                    it.setText(new_text)
+            for ser in self._batch_iter_series():
+                any_roi = False
+                for j in range(ser.childCount()):
+                    child = ser.child(j)
+                    path = child.data(0, self._ROLE_PATH)
+                    has_roi = bool(self._roi_polygons.get(
+                        os.path.abspath(path))) if path else False
+                    any_roi = any_roi or has_roi
+                    new = self._decorate_filename_with_roi(
+                        child.text(0), has_roi)
+                    if new != child.text(0):
+                        child.setText(0, new)
+                new_parent = self._decorate_filename_with_roi(
+                    ser.text(0), any_roi)
+                if new_parent != ser.text(0):
+                    ser.setText(0, new_parent)
         finally:
-            self.lst_batch_files.blockSignals(False)
+            self.tree_batch_files.blockSignals(False)
 
     def _refresh_single_roi_status(self):
         """Update the single-file ROI status label."""
@@ -3714,25 +4601,27 @@ class MainWindow(QtWidgets.QMainWindow):
             self._refresh_single_roi_status()
 
     def _on_batch_set_roi(self):
-        # Use the highlighted item (currentRow), not the checked ones,
+        # Use the highlighted item (currentItem), not the checked ones,
         # so the user can edit ROIs without changing what's selected
         # for processing.
-        it = self.lst_batch_files.currentItem()
+        it = self.tree_batch_files.currentItem() \
+            if hasattr(self, "tree_batch_files") else None
         if it is None:
             QtWidgets.QMessageBox.warning(
                 self, "ROI editor",
-                "Click a file in the list to highlight it, then click "
-                "Set ROI… again.")
+                "Click a file or series in the tree to highlight it, "
+                "then click Set ROI… again.")
             return
-        path = it.data(Qt.ItemDataRole.UserRole)
+        path = it.data(0, self._ROLE_PATH)
         if self._open_roi_dialog(path):
             self._refresh_batch_roi_markers()
 
     def _on_batch_clear_roi(self):
-        it = self.lst_batch_files.currentItem()
+        it = self.tree_batch_files.currentItem() \
+            if hasattr(self, "tree_batch_files") else None
         if it is None:
             return
-        path = it.data(Qt.ItemDataRole.UserRole)
+        path = it.data(0, self._ROLE_PATH)
         key = os.path.abspath(path) if path else None
         if key and key in self._roi_polygons:
             del self._roi_polygons[key]
@@ -4050,6 +4939,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._ws_container_layout.removeWidget(self._ws_placeholder)
             self._ws_placeholder.deleteLater()
             self._ws_container_layout.addWidget(qt_window)
+            _hide_napari_chrome(viewer)
             self._napari_viewer = viewer
         except Exception as exc:
             # Replace placeholder text with the real error
@@ -4227,30 +5117,42 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
 
     def _track_id_at(self, world_pos) -> "int | None":
-        """Return the particle id of the track closest to `world_pos`
-        in the current frame, or None if nothing is within reach."""
+        """Return the particle id of the track whose nearest localisation
+        is closest to `world_pos`.
+
+        We search ALL localisations globally rather than only the
+        current frame — napari draws each track's trail across many
+        past frames, so a click on a trail line will rarely land on a
+        frame where that particular track has a point.  A small
+        temporal penalty (~weighted) prefers hits at or near the
+        current time when there's a tie, but doesn't exclude trails.
+        """
         if self._ws_tracks_df is None:
             return None
         import numpy as _np
-        # world_pos is (t, y, x) for a Tracks layer
+        # world_pos comes from napari's Tracks layer; for a 3-D data
+        # array (track_id, t, y, x) the position tuple is (t, y, x).
         if len(world_pos) < 3:
             return None
-        t = int(round(float(world_pos[0])))
+        t = float(world_pos[0])
         y = float(world_pos[-2])
         x = float(world_pos[-1])
         df = self._ws_tracks_df
-        # Same-frame slice; fall back to ±1 frame so the user has some grace
-        slc = df[df["frame"] == t]
-        if slc.empty:
-            slc = df[(df["frame"] >= t - 1) & (df["frame"] <= t + 1)]
-        if slc.empty:
-            return None
-        d2 = (slc["x"].values - x) ** 2 + (slc["y"].values - y) ** 2
-        # Pixel threshold — generous so loose clicks still hit
+        xs = df["x"].values
+        ys = df["y"].values
+        fs = df["frame"].values
+        # Spatial distance² + a tiny temporal penalty so ties go to
+        # localisations near the current time.  The temporal weight
+        # is in *px²-per-frame²* units — set so ~10 frames away costs
+        # the same as ~1 pixel away.
+        d2 = (xs - x) ** 2 + (ys - y) ** 2 + 0.01 * (fs - t) ** 2
         idx = int(_np.argmin(d2))
-        if d2[idx] > 64.0:    # > 8 px from any point on this frame
+        # Tolerance is on the SPATIAL part only — generous (≤ ~16 px)
+        # so clicks on the trail line (between vertices) still register.
+        sp_d2 = (xs[idx] - x) ** 2 + (ys[idx] - y) ** 2
+        if sp_d2 > 256.0:        # > 16 px from any track point
             return None
-        return int(slc["particle"].values[idx])
+        return int(df["particle"].values[idx])
 
     def _show_track_in_inspector(self, particle_id: int):
         """Look up per-particle stats and push into the inspector panel."""
@@ -4496,6 +5398,27 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.restoreGeometry(geom)
         except Exception:
             pass
+        # Clamp the window to the available screen rect so a saved
+        # geometry from a previous session with a bigger / external
+        # monitor doesn't push the window off-screen.  Leaves a small
+        # margin so the title bar + bottom edge stay visible.
+        try:
+            screen = self.screen() or QtGui.QGuiApplication.primaryScreen()
+            if screen is not None:
+                avail = screen.availableGeometry()
+                w = min(self.width(),  max(900, avail.width()  - 20))
+                h = min(self.height(), max(640, avail.height() - 40))
+                self.resize(w, h)
+                # If the top-left is off-screen (negative or beyond the
+                # edges), re-centre instead of restoring.
+                x = self.x(); y = self.y()
+                if (x < avail.left() or y < avail.top()
+                        or x + w > avail.right()
+                        or y + h > avail.bottom()):
+                    self.move(avail.left() + (avail.width()  - w) // 2,
+                              avail.top()  + (avail.height() - h) // 2)
+        except Exception:
+            pass
 
         # Path entries are deliberately NOT restored — every launch starts
         # with empty file / folder fields so the user always picks fresh
@@ -4674,7 +5597,36 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._proc.join(timeout=1.0)
         except Exception:
             pass
+
+        # Explicitly close any embedded napari viewers.  Each one is a
+        # QMainWindow under the hood — without calling `viewer.close()`
+        # it stays alive as a "still-visible top-level window", which
+        # is enough to stop QApplication from quitting even after our
+        # own MainWindow closes (the "⌘Q does nothing after a run"
+        # symptom we saw).
+        for attr_chain in (
+                ("_roi_viewer", "_viewer"),       # Import-tab preview
+                ("_napari_viewer",),              # Visualise-tab viewer
+        ):
+            try:
+                obj = self
+                for a in attr_chain:
+                    obj = getattr(obj, a, None)
+                    if obj is None:
+                        break
+                if obj is not None and hasattr(obj, "close"):
+                    obj.close()
+            except Exception:
+                pass
+
         super().closeEvent(event)
+        # Belt-and-braces: ask the QApplication to quit.  This is a
+        # no-op when QApplication.quitOnLastWindowClosed already
+        # triggered, but covers cases where a stray hidden window
+        # (e.g. napari's docked plugin manager) keeps the event loop
+        # alive on macOS.
+        try:    QtWidgets.QApplication.instance().quit()
+        except Exception: pass
 
     # ── Backend availability helper ───────────────────────────────────────
     # Two-way mapping between GUI labels and internal backend strings.
@@ -4921,6 +5873,271 @@ class MainWindow(QtWidgets.QMainWindow):
                     cb.setChecked(k in wanted)
         except Exception: pass
 
+    # ── Parameter presets ────────────────────────────────────────────────
+    _BUILTIN_PRESETS_TAG = "__firefly_builtin__"
+
+    @staticmethod
+    def _presets_dir() -> str:
+        d = os.path.expanduser("~/.firefly/presets")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    @classmethod
+    def _builtin_presets(cls) -> "dict[str, dict]":
+        """Default presets seeded on first launch.  Two reasonable
+        starting points for common rigs in the lab — users can override
+        or extend them via the 'Save…' button."""
+        return {
+            "PC12 Cells": {
+                cls._BUILTIN_PRESETS_TAG: True,
+                # Imaging metadata — 100x oil, fast PALM acquisition
+                "analysis/override_px":     True,
+                "analysis/pixel_size":      0.106,
+                "analysis/override_fi":     True,
+                "analysis/frame_interval":  0.020,
+                # Preprocessing — flat well-spread cytoplasm
+                "analysis/bg_method":       "Uniform Filter",
+                "analysis/bg_radius":       20,
+                # Detection — typical PALM PSF after preprocessing
+                "analysis/diameter":        7,
+                "analysis/auto_minmass":    False,
+                "analysis/minmass":         1.5,
+                # Linking — small per-step displacements at 50 fps
+                "analysis/search_range":    5,
+                "analysis/memory":          3,
+                "analysis/min_track_len":   8,
+                "analysis/max_track_len":   0,
+                # Diffusion + motion classification — standard sptPALM
+                "analysis/max_lagtime":     20,
+                "analysis/n_fit":           5,
+                "analysis/alpha_immobile":  0.5,
+                "analysis/alpha_confined":  0.9,
+                "analysis/alpha_directed":  1.1,
+                "analysis/mobile_d":        0.05,
+                "analysis/jdd_components":  2,
+                # ROI — let auto-threshold handle the cell outline
+                "analysis/roi_mode":        "Auto threshold",
+                "analysis/roi_auto_method": "Li",
+                "analysis/roi_threshold":   0.08,
+                "analysis/roi_mask_mode":   "Mean",
+                # Drift correction — segment length tuned for ~10k frames
+                "analysis/drift_correct":   True,
+                "analysis/drift_segment":   500,
+                # Clustering — receptor-nanodomain defaults
+                "analysis/cluster_eps_nm":  50.0,
+                "analysis/cluster_min_samples": 10,
+            },
+            "Drosophila Neurons": {
+                cls._BUILTIN_PRESETS_TAG: True,
+                # Imaging metadata
+                "analysis/override_px":     True,
+                "analysis/pixel_size":      0.106,
+                "analysis/override_fi":     True,
+                "analysis/frame_interval":  0.030,
+                # Preprocessing — narrower processes, smaller bg radius
+                "analysis/bg_method":       "Uniform Filter",
+                "analysis/bg_radius":       15,
+                # Detection — typically sparser labelling than PC12
+                "analysis/diameter":        7,
+                "analysis/auto_minmass":    False,
+                "analysis/minmass":         1.0,
+                # Linking — slower diffusion in axons / dendrites
+                "analysis/search_range":    4,
+                "analysis/memory":          2,
+                "analysis/min_track_len":   10,
+                "analysis/max_track_len":   0,
+                # Diffusion + motion classification
+                "analysis/max_lagtime":     20,
+                "analysis/n_fit":           5,
+                "analysis/alpha_immobile":  0.5,
+                "analysis/alpha_confined":  0.9,
+                "analysis/alpha_directed":  1.1,
+                "analysis/mobile_d":        0.03,
+                "analysis/jdd_components":  2,
+                # ROI — small / branched cells; manual polygon is more robust
+                "analysis/roi_mode":        "Manual polygon",
+                "analysis/roi_auto_method": "Li",
+                "analysis/roi_threshold":   0.10,
+                "analysis/roi_mask_mode":   "Mean",
+                # Drift correction
+                "analysis/drift_correct":   True,
+                "analysis/drift_segment":   400,
+                # Clustering — synaptic-density defaults
+                "analysis/cluster_eps_nm":  40.0,
+                "analysis/cluster_min_samples": 8,
+            },
+        }
+
+    def _finalise_presets(self) -> None:
+        """Called once on startup (deferred so every sidebar widget is
+        constructed first).  Seeds the two built-in presets to disk if
+        the user hasn't already saved overrides, then populates the
+        combobox."""
+        try:
+            self._seed_builtin_presets()
+            self._refresh_preset_combo()
+            try:
+                self.c_preset.currentTextChanged.connect(
+                    self._on_preset_picked)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _seed_builtin_presets(self) -> None:
+        """Write the built-in presets to ~/.firefly/presets/ on first
+        launch.  Skips any name the user has already saved their own
+        version of, so user-customised presets aren't overwritten."""
+        import json
+        d = self._presets_dir()
+        for name, payload in self._builtin_presets().items():
+            path = os.path.join(d, f"{name}.json")
+            if os.path.isfile(path):
+                # Only overwrite if our previous write also tagged it as
+                # built-in (i.e. user hasn't customised it).
+                try:
+                    with open(path, "r", encoding="utf-8") as fh:
+                        prev = json.load(fh)
+                    if not prev.get(self._BUILTIN_PRESETS_TAG, False):
+                        continue
+                except Exception:
+                    continue
+            try:
+                with open(path, "w", encoding="utf-8") as fh:
+                    json.dump(payload, fh, indent=2)
+            except Exception:
+                pass
+
+    def _list_presets(self) -> "list[str]":
+        d = self._presets_dir()
+        try:
+            return sorted(
+                os.path.splitext(f)[0] for f in os.listdir(d)
+                if f.endswith(".json"))
+        except Exception:
+            return []
+
+    def _refresh_preset_combo(self) -> None:
+        if not hasattr(self, "c_preset"):
+            return
+        names = self._list_presets()
+        self.c_preset.blockSignals(True)
+        try:
+            self.c_preset.clear()
+            self.c_preset.addItem("— Current settings —")
+            for n in names:
+                self.c_preset.addItem(n)
+        finally:
+            self.c_preset.blockSignals(False)
+
+    def _on_preset_picked(self, name: str) -> None:
+        """Apply a preset to the sidebar when the user picks one from the
+        combobox.  Ignores the leading '— Current settings —' sentinel."""
+        if not name or name.startswith("—"):
+            return
+        import json
+        path = os.path.join(self._presets_dir(), f"{name}.json")
+        if not os.path.isfile(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                state = json.load(fh)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Couldn't load preset", str(exc))
+            return
+        # Drop our own internal tag before applying
+        state.pop(self._BUILTIN_PRESETS_TAG, None)
+        self._apply_widget_state(state)
+        self.statusBar().showMessage(f"Applied preset: {name}", 5000)
+
+    def _on_preset_delete(self) -> None:
+        """Remove the currently-selected preset from disk after
+        confirmation."""
+        name = self.c_preset.currentText() if hasattr(self, "c_preset") else ""
+        if not name or name.startswith("—"):
+            QtWidgets.QMessageBox.information(
+                self, "No preset selected",
+                "Pick a preset from the dropdown first, then click Delete.")
+            return
+        path = os.path.join(self._presets_dir(), f"{name}.json")
+        if not os.path.isfile(path):
+            return
+        # Heads-up if the user is about to delete a built-in: it'll come
+        # back on next launch from the seeding logic.
+        import json
+        is_builtin = False
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                is_builtin = bool(json.load(fh).get(
+                    self._BUILTIN_PRESETS_TAG, False))
+        except Exception:
+            pass
+        msg = f"Delete preset '{name}'?"
+        if is_builtin:
+            msg += ("\n\nThis is a built-in preset — it will be re-created "
+                    "on the next FIREFLY launch unless you save your own "
+                    "version with the same name first.")
+        ret = QtWidgets.QMessageBox.question(
+            self, "Delete preset", msg,
+            QtWidgets.QMessageBox.StandardButton.Yes
+            | QtWidgets.QMessageBox.StandardButton.No)
+        if ret != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        try:    os.remove(path)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self, "Delete failed", str(exc))
+            return
+        self._refresh_preset_combo()
+        # Park selection on the "current settings" sentinel
+        try:    self.c_preset.setCurrentIndex(0)
+        except Exception: pass
+        self.statusBar().showMessage(f"Deleted preset: {name}", 5000)
+
+    def _on_preset_save(self) -> None:
+        """Prompt for a name and write the current sidebar to disk."""
+        import json, re
+        name, ok = QtWidgets.QInputDialog.getText(
+            self, "Save preset",
+            "Name this preset (use letters, numbers, spaces, '-' or '_'):")
+        if not ok:
+            return
+        name = (name or "").strip()
+        if not name:
+            return
+        # Sanitise the filename — no path separators, control chars, etc.
+        if not re.match(r"^[A-Za-z0-9 _\-]+$", name):
+            QtWidgets.QMessageBox.warning(
+                self, "Invalid name",
+                "Preset names can only contain letters, numbers, "
+                "spaces, '-' and '_'.")
+            return
+        path = os.path.join(self._presets_dir(), f"{name}.json")
+        if os.path.isfile(path):
+            ret = QtWidgets.QMessageBox.question(
+                self, "Overwrite preset?",
+                f"'{name}' already exists.  Overwrite?",
+                QtWidgets.QMessageBox.StandardButton.Yes
+                | QtWidgets.QMessageBox.StandardButton.No)
+            if ret != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+        state = self._widget_state_dict()
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(state, fh, indent=2)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self, "Save failed", str(exc))
+            return
+        self._refresh_preset_combo()
+        # Surface the new preset as the current selection
+        try:
+            self.c_preset.setCurrentText(name)
+        except Exception:
+            pass
+        self.statusBar().showMessage(f"Saved preset: {name}", 5000)
+
     def _on_run_clicked(self):
         # Acting as Stop?
         if self._proc is not None and self._proc.is_alive():
@@ -5001,6 +6218,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.mass_hist.set_minmass(float(self.s_minmass.value())
                                       if not self.c_auto_minmass.isChecked()
                                       else None)
+            self.live_view.reset()
+            self._analysis_stack.setCurrentIndex(0)   # show cockpit
         except AttributeError:
             pass
         self._is_batch_run   = False
@@ -5011,7 +6230,14 @@ class MainWindow(QtWidgets.QMainWindow):
         # contends with PyTorch's MPS allocator in the same process.  A
         # subprocess gives PyTorch a clean Python interpreter with no Qt
         # loaded — MPS gets the full unified-memory pool to itself.
-        self._msg_queue    = multiprocessing.Queue()
+        # Bounded queue — a 60 FPS live preview at ~590 KB/frame can
+        # push ~35 MB/s through this pipe.  If the GUI ever stalls for
+        # a few seconds the queue grows unbounded and pushes the
+        # system into swap (we had a user hard-freeze caused by that).
+        # 2000 messages is enough headroom for normal jitter; the
+        # worker drops preview/mass messages when full and keeps only
+        # the analysis-critical ones (log/progress/done/etc.).
+        self._msg_queue    = multiprocessing.Queue(maxsize=2000)
         self._cancel_event = multiprocessing.Event()
         self._proc = multiprocessing.Process(
             target=_run_analysis_in_subprocess,
@@ -5025,9 +6251,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage("Running…")
 
     def _start_batch_run(self):
-        """Kick off batch analysis over the checked files."""
-        files = self._batch_checked_files()
-        if not files:
+        """Kick off batch analysis over the checked series.  Each series
+        contributes one analysis run; the loader uses the per-series
+        list of checked files (rather than auto-discovering siblings)."""
+        groups = self._batch_checked_series()
+        if not groups:
             QtWidgets.QMessageBox.warning(
                 self, "No files",
                 "On the Import tab, switch to Batch mode and pick a "
@@ -5038,14 +6266,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self._start_elapsed_timer()
 
         # Batch outputs go to <input_folder>/batch_results/<stem>/  — same
-        # convention as the Tk app.  Build a params dict per file.
+        # convention as the Tk app.  Build a params dict per series.
         out_root = os.path.join(self.e_batch_folder.text().strip(),
                                 "batch_results")
         params_list = []
-        for fpath in files:
+        for g in groups:
+            fpath = g["primary"]
             stem = os.path.splitext(os.path.basename(fpath))[0]
             file_out = os.path.join(out_root, stem)
-            params_list.append(self._build_params_for_file(fpath, file_out))
+            p = self._build_params_for_file(fpath, file_out)
+            # Override loader auto-discovery: pass the exact list of
+            # checked sister files for this series.
+            p["series_files"] = list(g.get("files") or [])
+            params_list.append(p)
 
         try:
             self._save_settings()
@@ -5067,12 +6300,21 @@ class MainWindow(QtWidgets.QMainWindow):
             self.mass_hist.set_minmass(float(self.s_minmass.value())
                                       if not self.c_auto_minmass.isChecked()
                                       else None)
+            self.live_view.reset()
+            self._analysis_stack.setCurrentIndex(0)   # show cockpit
         except AttributeError:
             pass
         self._is_batch_run   = True
         self._is_compare_run = False
 
-        self._msg_queue    = multiprocessing.Queue()
+        # Bounded queue — a 60 FPS live preview at ~590 KB/frame can
+        # push ~35 MB/s through this pipe.  If the GUI ever stalls for
+        # a few seconds the queue grows unbounded and pushes the
+        # system into swap (we had a user hard-freeze caused by that).
+        # 2000 messages is enough headroom for normal jitter; the
+        # worker drops preview/mass messages when full and keeps only
+        # the analysis-critical ones (log/progress/done/etc.).
+        self._msg_queue    = multiprocessing.Queue(maxsize=2000)
         self._cancel_event = multiprocessing.Event()
         self._proc = multiprocessing.Process(
             target=_run_batch_in_subprocess,
@@ -5084,7 +6326,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.btn_run.setText("Stop")
         self.statusBar().showMessage(
-            f"Batch: 0 / {len(files)} series")
+            f"Batch: 0 / {len(groups)} series")
 
     def _start_compare_run(self):
         """Kick off a comparison over the configured groups."""
@@ -5145,7 +6387,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._is_batch_run    = False
         self._is_compare_run  = True
 
-        self._msg_queue    = multiprocessing.Queue()
+        # Bounded queue — a 60 FPS live preview at ~590 KB/frame can
+        # push ~35 MB/s through this pipe.  If the GUI ever stalls for
+        # a few seconds the queue grows unbounded and pushes the
+        # system into swap (we had a user hard-freeze caused by that).
+        # 2000 messages is enough headroom for normal jitter; the
+        # worker drops preview/mass messages when full and keeps only
+        # the analysis-critical ones (log/progress/done/etc.).
+        self._msg_queue    = multiprocessing.Queue(maxsize=2000)
         self._cancel_event = multiprocessing.Event()
         self._proc = multiprocessing.Process(
             target=_run_compare_in_subprocess,
@@ -5213,11 +6462,38 @@ class MainWindow(QtWidgets.QMainWindow):
                 # Live histogram update from the localisation stream
                 try:    self.mass_hist.add_chunk(payload)
                 except AttributeError: pass
+            elif kind == "preview_frame":
+                # Live detection-view update.  Payload carries a flat
+                # bytes blob + shape so we can reconstruct the frame
+                # array without round-tripping through numpy in the
+                # queue (lighter and works in subprocess-spawned land).
+                try:
+                    import numpy as _np
+                    shape = payload.get("shape") or [0, 0]
+                    blob  = payload.get("frame")
+                    if blob and shape[0] and shape[1]:
+                        arr = _np.frombuffer(blob, dtype=_np.float32) \
+                                 .reshape(shape[0], shape[1])
+                        self.live_view.set_frame(
+                            arr,
+                            payload.get("xs", []),
+                            payload.get("ys", []),
+                            payload.get("idx", 0),
+                            payload.get("n_frames", 0))
+                except (AttributeError, ValueError, KeyError):
+                    pass
             elif kind == "done":
                 # Single-file completion.  Only valid in non-batch mode;
                 # in batch mode the per-file messages are "file_done".
                 self._handle_done(payload)
                 worker_done = True
+            elif kind == "file_starting":
+                # New file in a batch — wipe the mass histogram so it
+                # doesn't accumulate values from the previous file's
+                # localisations.  Live view is fine — preview_frame
+                # messages naturally overwrite as they arrive.
+                try:    self.mass_hist.reset()
+                except AttributeError: pass
             elif kind == "file_done":
                 self._handle_file_done(payload)
             elif kind == "file_error":
@@ -5485,8 +6761,49 @@ class MainWindow(QtWidgets.QMainWindow):
             self.batch_subprogress.hide()
         except AttributeError:
             pass
+        # Run is over — swap from cockpit to results panel.
+        try:
+            self._analysis_stack.setCurrentIndex(1)
+        except AttributeError:
+            pass
 
     # ── Crash reporter integration ────────────────────────────────────────
+    def _install_menubar(self):
+        """Give FIREFLY its own QMenuBar with at minimum a File → Quit
+        action.  On macOS the menubar is global; if we don't own one,
+        any embedded napari Viewer will claim it, and clearing napari's
+        menubar later (we no longer do that, but defensively) used to
+        take ⌘Q down with it.  Adding our own keeps Quit reliable."""
+        mb = self.menuBar()
+        # Use native (system) menu bar on macOS so the entries show in
+        # the system bar instead of inside the window.
+        try:    mb.setNativeMenuBar(True)
+        except Exception: pass
+
+        file_menu = mb.addMenu("File")
+
+        # Quit — ⌘Q on macOS, Ctrl+Q elsewhere.  Qt's StandardKey.Quit
+        # maps to the right shortcut per platform.  We bind the shortcut
+        # with ApplicationShortcut context so it fires no matter which
+        # QMainWindow currently has focus (the embedded napari viewer
+        # is also a QMainWindow, and without this the shortcut only
+        # fires when *our* window is key — hence the flaky ⌘Q).
+        act_quit = QtGui.QAction("Quit FIREFLY", self)
+        act_quit.setMenuRole(QtGui.QAction.MenuRole.QuitRole)
+        act_quit.setShortcut(QtGui.QKeySequence.StandardKey.Quit)
+        act_quit.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        act_quit.triggered.connect(self.close)
+        file_menu.addAction(act_quit)
+
+        # Belt-and-braces backup — a standalone QShortcut at the same
+        # application-wide context.  If something downstream resets
+        # the action's shortcut (some napari versions reach into the
+        # global QAction list), this still catches ⌘Q.
+        self._sc_quit = QtGui.QShortcut(
+            QtGui.QKeySequence.StandardKey.Quit, self)
+        self._sc_quit.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        self._sc_quit.activated.connect(self.close)
+
     def _install_crash_hooks(self):
         """Wire FIREFLY into the global crash reporter.  Same idea as the Tk
         version: capture every uncaught exception, write a self-contained
@@ -5605,8 +6922,13 @@ _THEME = {
 
 _FIREFLY_QSS = """
 /* ── Base ────────────────────────────────────────────────────────────────── */
+/* Note: we deliberately DO NOT set a background on the bare QWidget rule.
+   Doing so paints every transparent wrapper widget (e.g. the QWidgets used
+   as containers for QHBoxLayout rows inside a QGroupBox) in the darkest
+   shade, which then shows through as a dark rectangle against the lighter
+   panel background.  Widgets that need an explicit background get one
+   from their own rule (QMainWindow, QGroupBox, sidebar frame, etc.). */
 QWidget {{
-    background-color: {BG};
     color:            {TXT};
     font-family:      -apple-system, "SF Pro Text", "Segoe UI", "Inter",
                       "Helvetica Neue", Arial, sans-serif;
@@ -6043,6 +7365,12 @@ QLabel#action_tile_desc {{
 }}
 
 /* ── Results panel ──────────────────────────────────────────────────────── */
+QFrame#resource_monitor {{
+    background-color:    {PANEL};
+    border:              1px solid {BORDER};
+    border-radius:       4px;
+}}
+
 QFrame#results_panel {{
     background-color:    {PANEL};
     border:              1px solid {BORDER};

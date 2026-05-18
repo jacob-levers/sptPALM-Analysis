@@ -67,7 +67,11 @@ jobs:
   # ──────────────────────────────────────────────────────────────────────────
   build-windows:
     runs-on: windows-latest
-    needs: build-macos   # ensures macOS creates the release first; Windows then uploads to it
+    # Independent of the macOS job — if the Mac build fails (or is
+    # skipped on a Windows-only run) we still want the Windows .exe
+    # to be built and attached to the release.  softprops/action-gh-release
+    # creates the release if it doesn't exist yet and appends assets to
+    # it if another job already did.
 
     steps:
       - name: Checkout
@@ -108,9 +112,10 @@ jobs:
       - name: Smoke test (launch the onefile exe)
         shell: pwsh
         run: |
-          # Marker-file handshake: app writes a file only AFTER Tk fully
-          # initialises.  Catches startup crashes that PyInstaller hides
-          # behind an error dialog (which would otherwise keep HasExited false).
+          # Marker-file handshake: app writes a file only AFTER the
+          # PySide6 main window shows and repaints.  Catches startup
+          # crashes that PyInstaller hides behind an error dialog
+          # (which would otherwise keep HasExited false).
           $exe    = "dist\FIREFLY.exe"
           $marker = Join-Path $env:RUNNER_TEMP "sptpalm_ready.marker"
           Remove-Item -Path $marker -ErrorAction SilentlyContinue
@@ -141,17 +146,25 @@ jobs:
           $proc.Kill()
           $proc.WaitForExit(5000) | Out-Null
 
+      - name: Rename exe for release
+        # Releases page shows whatever filename we upload — match the
+        # name the README tells users to download.
+        shell: pwsh
+        run: |
+          Move-Item dist\FIREFLY.exe dist\FIREFLY-Windows.exe -Force
+          Write-Host "Renamed: $(Get-Item dist\FIREFLY-Windows.exe)"
+
       - name: Upload exe artifact
         uses: actions/upload-artifact@v4
         with:
           name: FIREFLY-Windows
-          path: dist\FIREFLY.exe
+          path: dist\FIREFLY-Windows.exe
           retention-days: 30
 
       - name: Upload to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist\FIREFLY.exe
+          files: dist\FIREFLY-Windows.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

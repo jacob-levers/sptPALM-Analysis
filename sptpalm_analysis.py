@@ -3,7 +3,7 @@ import multiprocessing
 import sys
 import os
 
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 
 # Fix macOS multiprocessing crashes — must be set before any other imports
 if sys.platform == "darwin":
@@ -419,14 +419,34 @@ def _load_single_czi(path, channel=0, stop_event=None):
         "Run:  pip install aicspylibczi imagecodecs")
 
 
-def load_czi(path, channel=0, stop_event=None):
-    # Detect multi-file series (Zeiss splits large datasets into companion files)
-    series = _find_czi_series(path)
+def load_czi(path, channel=0, stop_event=None, files=None):
+    """Load a CZI (or multi-file CZI series) into one stack.
+
+    `files`, when provided, overrides the auto-discovery of sibling
+    files — used by the GUI to honour per-file checkbox selections.
+    """
+    if files:
+        seen = set()
+        series = []
+        for f in sorted(files, key=lambda p: os.path.basename(p)):
+            if f in seen or not os.path.isfile(f):
+                continue
+            seen.add(f); series.append(f)
+        if not series:
+            series = [path]
+        print(f"  CZI series override: {len(series)} files",
+              flush=True)
+    else:
+        # Detect multi-file series (Zeiss splits large datasets into companion files)
+        series = _find_czi_series(path)
 
     if len(series) == 1:
-        # Single file — straightforward load
-        print(f"  Loading CZI: {path}")
-        stack, px_um, fi_s = _load_single_czi(path, channel, stop_event)
+        # Single file — straightforward load.  Use series[0] so a
+        # per-file override that selects a non-primary sister still
+        # loads the right one.
+        only = series[0]
+        print(f"  Loading CZI: {only}")
+        stack, px_um, fi_s = _load_single_czi(only, channel, stop_event)
         print(f"  Shape: {stack.shape}  (T x Y x X)", flush=True)
         return stack, px_um, fi_s
 
@@ -623,27 +643,55 @@ def _find_tif_series(path):
     return series if series else [path]
 
 def _load_single_tif(path, stop_event=None):
-    """Load a single TIF file and return its stack, pixel size, and frame interval."""
+    """Load a single TIF file and return its stack, pixel size, and frame interval.
+
+    Strategy: tifffile's `asarray()` reads + decompresses pages with internal
+    multithreading via `maxworkers`, which is far faster than looping
+    page.asarray() (each call re-opens its own thread pool).  For very
+    large files we'd still like a cancel-poll, so we read in chunks of
+    `BATCH` pages — each batch goes through the fast path, and we check
+    stop_event + log progress between batches.
+    """
     if not HAS_TIFFFILE:
         raise RuntimeError("Run: pip install tifffile")
+    BATCH = 2000
     with tifffile.TiffFile(path) as tif:
         px_um, fi_s = _parse_ome_metadata(tif)
         n_pages = len(tif.pages)
-        if stop_event is not None and n_pages > 500:
-            # Large file: load page-by-page so stop can interrupt mid-load.
-            # Check stop_event every 100 frames so cancel feels responsive
-            # (a 100-frame chunk is ~50 ms for 512×512 float32 on SSDs);
-            # log progress at every 500 to keep the log uncluttered.
-            frames = []
-            for i, page in enumerate(tif.pages):
-                frames.append(page.asarray().astype(np.float32))
-                if i % 100 == 0 and i > 0 and stop_event.is_set():
+        if n_pages > BATCH:
+            # Inspect first page for output shape + dtype so we can pre-allocate
+            sample = tif.pages[0].asarray()
+            shape = (n_pages,) + tuple(sample.shape)
+            stack = np.empty(shape, dtype=np.float32)
+            t0 = time.perf_counter()
+            for start in range(0, n_pages, BATCH):
+                if stop_event is not None and stop_event.is_set():
                     raise _Cancelled()
-                if i % 500 == 0 and i > 0:
-                    print(f"  Loading: {i}/{n_pages} frames...", flush=True)
-            stack = np.stack(frames)
+                end = min(start + BATCH, n_pages)
+                # tifffile asarray(key=range(...)) uses multithreaded decode
+                try:
+                    chunk = tif.asarray(key=range(start, end),
+                                         maxworkers=N_CPUS)
+                except TypeError:
+                    chunk = tif.asarray(key=range(start, end))
+                # asarray may return (1, H, W) for a single page, normalise
+                if chunk.ndim == 2:
+                    chunk = chunk[np.newaxis]
+                stack[start:end] = chunk.astype(np.float32, copy=False)
+                # Free intermediate so peak memory stays at one batch above
+                # the pre-allocated stack
+                del chunk
+                if start > 0:
+                    rate = (start) / max(time.perf_counter() - t0, 1e-3)
+                    print(f"  Loading: {end}/{n_pages} frames "
+                          f"({rate:.0f} fr/s)...", flush=True)
         else:
-            stack = tif.asarray().astype(np.float32)
+            # Small files — fastest path is a single asarray()
+            try:
+                stack = tif.asarray(maxworkers=N_CPUS).astype(
+                    np.float32, copy=False)
+            except TypeError:
+                stack = tif.asarray().astype(np.float32, copy=False)
 
     if   stack.ndim == 2: stack = stack[np.newaxis]
     elif stack.ndim == 4:
@@ -652,68 +700,195 @@ def _load_single_tif(path, stop_event=None):
     return stack, px_um, fi_s
 
 
-def load_tif(path, stop_event=None):
-    series = _find_tif_series(path)
+# ── Memmap cleanup ────────────────────────────────────────────────────────────
+# When the multi-file loader falls back to a disk-backed memmap (because the
+# combined stack won't fit in RAM), we leave the file on disk for the duration
+# of the run.  Register an atexit hook to remove these temp files so they
+# don't accumulate.
+_firefly_temp_stack_paths: list = []
+
+def _register_temp_stack_path(p: str) -> None:
+    import atexit
+    if not _firefly_temp_stack_paths:
+        atexit.register(_cleanup_temp_stack_paths)
+    _firefly_temp_stack_paths.append(p)
+
+def _cleanup_temp_stack_paths() -> None:
+    for p in list(_firefly_temp_stack_paths):
+        try:    os.remove(p)
+        except Exception: pass
+
+
+#  How much physical RAM to leave for the OS + the user's other apps.
+#  Without this reserve, FIREFLY's memory checks would happily consume
+#  every free byte; the moment the user opens a Safari tab the system
+#  starts swapping or OOM-killing.  We hold back the LARGER of:
+#     • a fixed floor (4 GB)                          — covers macOS itself
+#     • 20% of total RAM                              — scales with system size
+#  Tweaked via env var FIREFLY_USER_RAM_RESERVE_GB if you really need to.
+def _user_ram_reserve_gb() -> float:
+    """RAM (in GB) we deliberately keep available for non-FIREFLY uses."""
+    try:
+        env = os.environ.get("FIREFLY_USER_RAM_RESERVE_GB")
+        if env:
+            return max(0.5, float(env))
+    except Exception:
+        pass
+    try:
+        import psutil as _ps
+        total_gb = _ps.virtual_memory().total / 1e9
+    except Exception:
+        total_gb = 8.0   # conservative fallback if psutil is missing
+    return max(4.0, 0.20 * total_gb)
+
+
+def _probe_tif_shape_and_count(path: str):
+    """Read just enough of a TIF to return (n_pages, (H, W))."""
+    with tifffile.TiffFile(path) as tif:
+        n = len(tif.pages)
+        sample = tif.pages[0].asarray()
+        H, W = sample.shape[-2:]
+    return n, (int(H), int(W))
+
+
+def load_tif(path, stop_event=None, files=None):
+    """Load `path` and (when present) its sibling files into one stack.
+
+    If `files` is a non-empty list, it overrides auto-discovery — the
+    GUI uses this to honour per-file checkbox selections within a series.
+    The override is sorted to match _find_tif_series ordering so frame
+    indices line up with the user's expectation.
+    """
+    if files:
+        # De-dup and sort by the same key the auto-discovery uses so the
+        # frame order doesn't depend on how the GUI sent the list.
+        seen = set()
+        series = []
+        for f in sorted(files, key=lambda p: os.path.basename(p)):
+            if f in seen or not os.path.isfile(f):
+                continue
+            seen.add(f); series.append(f)
+        if not series:
+            series = [path]
+        print(f"  TIF series override: {len(series)} files",
+              flush=True)
+    else:
+        series = _find_tif_series(path)
 
     if len(series) == 1:
-        # Single file — straightforward load
-        print(f"  Loading TIF: {path}")
-        stack, px_um, fi_s = _load_single_tif(path, stop_event)
+        # Single file — straightforward load.  Use series[0] (not the
+        # original `path`) so a per-file override that selects a
+        # non-primary sister file still loads the right file.
+        only = series[0]
+        print(f"  Loading TIF: {only}")
+        stack, px_um, fi_s = _load_single_tif(only, stop_event)
         print(f"  Shape: {stack.shape}  (T x Y x X)")
         if px_um is not None: print(f"  Pixel size  : {px_um} µm  (from file metadata)")
         if fi_s is not None:  print(f"  Frame interval: {fi_s} s  (from file metadata)")
         return stack, px_um, fi_s
 
-    # Multi-file series — load each file and concatenate along time axis.
+    # ── Multi-file series ────────────────────────────────────────────────
+    # The old path loaded every file into a `stacks` list and called
+    # `np.concatenate(stacks)`, which allocates a brand-new combined array
+    # while the source list is still alive — peak memory = 2× the combined
+    # size.  On a 16.8 GB series that's a 33.6 GB working set on a 16 GB
+    # machine.  System swap takes minutes and pegs the disk.
+    #
+    # The new path:
+    #   1. Probes each file's frame count via TiffFile headers (no data load)
+    #   2. Pre-allocates the destination — in RAM if it fits, on disk via
+    #      np.memmap if not
+    #   3. Loads each source, copies into the destination slice, frees the
+    #      source.  Peak = combined + one source ≈ 1.25× total.
     print(f"  Loading TIF series: {len(series)} files", flush=True)
-    stacks   = []
-    px_um_out  = None
-    fi_s_out   = None
-    for i, fpath in enumerate(series):
-        print(f"  [{i+1}/{len(series)}] {os.path.basename(fpath)}", flush=True)
-        st, px, fi = _load_single_tif(fpath, stop_event)
-        stacks.append(st)
-        if i == 0:
-            # Metadata is only taken from the first file
-            px_um_out = px
-            fi_s_out  = fi
 
-    # Concatenate sister files into one continuous time series.  This
-    # creates a new array equal in size to the sum of all loaded files;
-    # peak memory during the call is roughly 2× the combined stack size
-    # (old + new exist simultaneously).  On memory-constrained machines
-    # this triggers swap and can take minutes — show a clear progress
-    # message so the user knows the GUI hasn't frozen.
-    n_total = sum(s.shape[0] for s in stacks)
-    total_gb = n_total * stacks[0].shape[1] * stacks[0].shape[2] * 4 / 1e9
-    print(f"  Concatenating {len(stacks)} files → {n_total:,} frames "
-          f"(~{total_gb:.1f} GB).  May take a minute on tight RAM.", flush=True)
+    n_per_file: list[int] = []
+    H = W = 0
+    for fpath in series:
+        n, (h, w) = _probe_tif_shape_and_count(fpath)
+        n_per_file.append(n)
+        H, W = h, w
+    n_total = sum(n_per_file)
+    bytes_per_frame = 4 * H * W      # float32
+    total_size = n_total * bytes_per_frame
+    total_gb = total_size / 1e9
+
+    # Decide RAM vs memmap.  We need the combined stack + headroom for
+    # one source file at a time + downstream allocations + (critically!)
+    # a reserve so the user's OS / browser / etc. don't get squeezed
+    # into swap.
+    use_memmap = False
+    free_gb    = None
+    reserve_gb = _user_ram_reserve_gb()
     try:
         import psutil as _psutil
         free_gb = _psutil.virtual_memory().available / 1e9
-        if free_gb < 2 * total_gb:
-            print(f"  WARNING: only {free_gb:.1f} GB free for a "
-                  f"{2*total_gb:.1f} GB peak — system may swap heavily.",
-                  flush=True)
+        # Usable budget = free RAM minus the bytes we promised to leave
+        # for everything else on the machine.
+        usable_gb = free_gb - reserve_gb
+        # And we need at least 1.2 × the combined stack to cover the
+        # intermediate per-file source array + downstream copies.
+        if usable_gb < total_gb * 1.2:
+            use_memmap = True
     except Exception:
         pass
 
-    combined = np.concatenate(stacks, axis=0)
-    # Free the per-file stacks now that they're copied into `combined`.
-    # Without this, the old list of per-file arrays stays alive until the
-    # function returns, doubling peak memory unnecessarily.
-    stacks.clear()
-    import gc as _gc; _gc.collect()
+    if use_memmap:
+        import tempfile
+        tmp_fh = tempfile.NamedTemporaryFile(
+            prefix="firefly_stack_", suffix=".raw", delete=False)
+        tmp_path = tmp_fh.name
+        tmp_fh.close()
+        _register_temp_stack_path(tmp_path)
+        free_disp = f"{free_gb:.1f}" if free_gb is not None else "?"
+        print(f"  Combined stack would need {total_gb:.1f} GB and we "
+              f"reserve {reserve_gb:.1f} GB for the OS / other apps; "
+              f"only {free_disp} GB free — backing it with a memmap on "
+              f"disk at {tmp_path}.", flush=True)
+        combined = np.memmap(tmp_path, dtype=np.float32, mode="w+",
+                             shape=(n_total, H, W))
+    else:
+        print(f"  Allocating combined stack ({n_total:,} frames, "
+              f"{total_gb:.1f} GB) in RAM…", flush=True)
+        combined = np.empty((n_total, H, W), dtype=np.float32)
+
+    # Load each file, copy into the destination slice, free immediately.
+    px_um_out = None
+    fi_s_out  = None
+    offset = 0
+    import gc as _gc
+    for i, fpath in enumerate(series):
+        print(f"  [{i+1}/{len(series)}] {os.path.basename(fpath)}",
+              flush=True)
+        st, px, fi = _load_single_tif(fpath, stop_event)
+        if i == 0:
+            px_um_out = px
+            fi_s_out  = fi
+        combined[offset:offset + st.shape[0]] = st
+        offset += st.shape[0]
+        del st
+        _gc.collect()
+    if use_memmap:
+        combined.flush()
     print(f"  Combined shape: {combined.shape}  (T x Y x X)", flush=True)
     if px_um_out is not None: print(f"  Pixel size  : {px_um_out} µm  (from file metadata)")
     if fi_s_out is not None:  print(f"  Frame interval: {fi_s_out} s  (from file metadata)")
     return combined, px_um_out, fi_s_out
 
 
-def load_file(path, channel=0, stop_event=None):
+def load_file(path, channel=0, stop_event=None, files=None):
+    """Load `path` (or, if `files` is provided, the explicit list of
+    files) as a single stack.
+
+    `files` lets a caller override the auto-discovery of sister files
+    that `_find_tif_series` / `_find_czi_series` does — useful when the
+    GUI wants to load only a user-selected subset of a multi-file series.
+    """
     ext = os.path.splitext(path)[1].lower()
-    if   ext == ".czi":            return load_czi(path, channel, stop_event)
-    elif ext in (".tif", ".tiff"): return load_tif(path, stop_event)
+    if   ext == ".czi":            return load_czi(path, channel, stop_event,
+                                                   files=files)
+    elif ext in (".tif", ".tiff"): return load_tif(path, stop_event,
+                                                   files=files)
     else: sys.exit(f"ERROR: Unsupported file '{ext}'. Use .czi or .tif")
 
 
@@ -1152,21 +1327,45 @@ def correct_drift(locs, n_seg_frames=200, upsampling=4, smooth_sigma=1.5):
     # redundancy averages out cross-correlation noise far better than the
     # consecutive-only chain, and is robust to any single bad pair (e.g. a
     # segment with too few localisations).
+    #
+    # Performance note:  scipy.signal.correlate(method="fft") re-FFTs both
+    # density maps on every pair call, so an N-segment run does ~N(N-1)
+    # FFTs.  We precompute rfft2 of each (zero-padded) map ONCE and just
+    # run an IFFT per pair — quadratic-cost FFT work collapses to linear,
+    # plus the IFFT loop parallelises trivially via threads.
+    from scipy.fft import rfft2 as _rfft2, irfft2 as _irfft2, \
+                          next_fast_len as _next_fast_len
+    pad_H = _next_fast_len(2 * H - 1)
+    pad_W = _next_fast_len(2 * W - 1)
+    fft_maps = [_rfft2(dm, s=(pad_H, pad_W)) for dm in density_maps]
+
+    pair_indices = [(i, j) for i in range(n_segments)
+                    for j in range(i + 1, n_segments)
+                    if seg_counts[i] >= 5 and seg_counts[j] >= 5]
+
+    def _pair_shift(i, j):
+        # Cross-correlation r[τ] = Σ a[k+τ] b[k]  via  IFFT(F_a · conj(F_b))
+        cross = _irfft2(fft_maps[i] * np.conj(fft_maps[j]),
+                        s=(pad_H, pad_W))
+        # Zero-lag at index 0; positive shifts up to (H-1, W-1) sit at low
+        # indices, negative shifts wrap to the end.  Re-centre by treating
+        # any index beyond half-extent as negative.
+        peak = int(np.argmax(cross))
+        py, px = divmod(peak, pad_W)
+        if py >= pad_H // 2: py -= pad_H
+        if px >= pad_W // 2: px -= pad_W
+        return i, j, float(px), float(py)
+
     A_rows_x, A_rows_y = [], []
     b_x, b_y = [], []
-    for i in range(n_segments):
-        for j in range(i + 1, n_segments):
-            if seg_counts[i] < 5 or seg_counts[j] < 5:
-                continue
-            corr = _correlate2d(density_maps[i], density_maps[j],
-                                mode="full", method="fft")
-            peak = np.unravel_index(np.argmax(corr), corr.shape)
-            dy_pair = float(peak[0] - (H - 1))
-            dx_pair = float(peak[1] - (W - 1))
-            row = np.zeros(n_segments)
-            row[i], row[j] = -1.0, 1.0    # drift[j] - drift[i] = Δ_{ij}
-            A_rows_x.append(row); b_x.append(dx_pair)
-            A_rows_y.append(row); b_y.append(dy_pair)
+    if pair_indices:
+        with ThreadPoolExecutor(max_workers=N_CPUS) as _exe:
+            for i, j, dx_pair, dy_pair in _exe.map(
+                    lambda ij: _pair_shift(*ij), pair_indices):
+                row = np.zeros(n_segments)
+                row[i], row[j] = -1.0, 1.0
+                A_rows_x.append(row); b_x.append(dx_pair)
+                A_rows_y.append(row); b_y.append(dy_pair)
 
     if not A_rows_x:
         # Fallback: zero drift
@@ -1222,12 +1421,17 @@ def _ram_strategy(stack, headroom: float = 0.75) -> tuple[bool, float, float]:
 
     Returns (use_fast, free_gb, needed_gb).
     Falls back to streaming if psutil is not installed.
+
+    Holds back `_user_ram_reserve_gb()` for the OS + the user's other
+    apps so a parallel Safari tab doesn't push the machine into swap.
     """
     needed_gb = stack.nbytes / 1e9   # preprocessed copy ≈ same dtype/shape
     try:
         import psutil
-        free_gb = psutil.virtual_memory().available / 1e9
-        return needed_gb < free_gb * headroom, free_gb, needed_gb
+        free_gb    = psutil.virtual_memory().available / 1e9
+        reserve_gb = _user_ram_reserve_gb()
+        usable_gb  = max(0.0, free_gb - reserve_gb)
+        return needed_gb < usable_gb * headroom, free_gb, needed_gb
     except ImportError:
         return False, 0.0, needed_gb
 
@@ -1311,17 +1515,20 @@ def preprocess_and_localise_adaptive(stack, diameter=7, minmass=None, percentile
         print(f"  Backend   : (resolution failed: {_e})")
 
     use_fast, free_gb, needed_gb = _ram_strategy(stack, headroom=ram_headroom)
+    reserve_gb = _user_ram_reserve_gb()
 
     if use_fast:
         print(f"  RAM strategy : FAST (parallel)   — "
-              f"{free_gb:.1f} GB free, {needed_gb:.1f} GB needed")
+              f"{free_gb:.1f} GB free, {needed_gb:.1f} GB needed, "
+              f"{reserve_gb:.1f} GB reserved for OS/apps")
         return _fast_preprocess_and_localise(
             stack, diameter, minmass, percentile,
             bg_radius, bg_method, workers, chunk_size,
             preview_cb=preview_cb, backend=backend)
     else:
         print(f"  RAM strategy : STREAM (low-mem)  — "
-              f"{free_gb:.1f} GB free, {needed_gb:.1f} GB needed")
+              f"{free_gb:.1f} GB free, {needed_gb:.1f} GB needed, "
+              f"{reserve_gb:.1f} GB reserved for OS/apps")
         return preprocess_and_localise_stream(
             stack, diameter, minmass, percentile,
             bg_radius, bg_method, workers, chunk_size,
@@ -1433,17 +1640,30 @@ def preprocess_and_localise_stream(stack, diameter=7, minmass=None, percentile=6
         try:    mass_cb(np.asarray(locs0["mass"].values, dtype=np.float32))
         except Exception: pass
 
-    # Emit preview for the first chunk (middle frame + its localisations)
-    if preview_cb is not None:
-        try:
-            mid = len(first_pp) // 2
-            preview_frame = first_pp[mid]
-            mid_locs = locs0[locs0["frame"] == mid] if len(locs0) > 0 else None
-            xs = mid_locs["x"].values if mid_locs is not None and len(mid_locs) > 0 else []
-            ys = mid_locs["y"].values if mid_locs is not None and len(mid_locs) > 0 else []
-            preview_cb(mid, preview_frame, xs, ys, n_frames)
-        except Exception:
-            pass
+    # ── Live preview: emit EVERY frame of each chunk after localisation
+    # so the GUI's live view scrolls through the actual movie at 60 Hz
+    # rather than ticking once per chunk.  The GUI's repaint timer
+    # naturally drops in-between frames it can't paint in time, so we
+    # just fire-and-forget every frame — the message queue + per-frame
+    # cost is tiny next to localisation itself.
+    def _emit_chunk_previews(chunk_pp, locs_chunk, frame_offset):
+        if preview_cb is None or len(chunk_pp) == 0:
+            return
+        # Pre-index spots by frame for cheap per-frame lookups
+        spots_by_frame = {}
+        if len(locs_chunk) > 0 and "frame" in locs_chunk.columns:
+            for f, sub in locs_chunk.groupby("frame"):
+                spots_by_frame[int(f)] = (sub["x"].values, sub["y"].values)
+        for local_i in range(len(chunk_pp)):
+            global_i = frame_offset + local_i
+            sxy = spots_by_frame.get(global_i, ([], []))
+            try:
+                preview_cb(global_i, chunk_pp[local_i],
+                           sxy[0], sxy[1], n_frames)
+            except Exception:
+                pass
+
+    _emit_chunk_previews(first_pp, locs0, frame_offset=0)
 
     del first_pp
     gc.collect()
@@ -1474,20 +1694,8 @@ def preprocess_and_localise_stream(stack, diameter=7, minmass=None, percentile=6
             try:    mass_cb(np.asarray(locs_i["mass"].values, dtype=np.float32))
             except Exception: pass
 
-        # Live preview: middle frame of this chunk with detected particles
-        if preview_cb is not None:
-            try:
-                mid_local = len(chunk_pp) // 2
-                preview_frame = chunk_pp[mid_local]
-                mid_global    = start + mid_local
-                if len(locs_i) > 0:
-                    sel = locs_i[locs_i["frame"] == mid_global]
-                    xs, ys = sel["x"].values, sel["y"].values
-                else:
-                    xs, ys = [], []
-                preview_cb(mid_global, preview_frame, xs, ys, n_frames)
-            except Exception:
-                pass
+        # Live previews — multiple evenly-spaced frames within this chunk
+        _emit_chunk_previews(chunk_pp, locs_i, frame_offset=start)
 
         del chunk_pp
         gc.collect()
@@ -2267,24 +2475,98 @@ def localise_particles(stack, diameter=7, minmass=0.1, percentile=64,
 #  LINKING
 # ══════════════════════════════════════════════════════════════════════════════
 
-def link_trajectories(locs, search_range=5, memory=3, min_len=5, max_len=None):
+def link_trajectories(locs, search_range=5, memory=3, min_len=5, max_len=None,
+                       progress_cb=None, stop_event=None):
+    """Link localisations into trajectories.
+
+    progress_cb : callable(fraction) → None
+        Optional.  Called periodically with a [0, 1] float so the host
+        can update a progress bar.  Updates are throttled to roughly
+        once every 32 frames + once on completion.
+    stop_event  : threading.Event-like
+        Optional.  Polled between frames; if `.is_set()` the linker
+        raises `_Cancelled` and aborts cleanly.
+
+    Uses `tp.link_iter` when available so the user can see progress
+    and cancel mid-link.  Falls back to atomic `tp.link` on older
+    trackpy versions or if the iterator path errors out (some
+    edge-case densities switch trackpy to a non-iter strategy).
+    """
     print(f"  Linking {len(locs):,} localisations  "
           f"(search_range={search_range}px, memory={memory}) ...")
     t0 = time.perf_counter()
-    try:
-        linked = tp.link(locs, search_range=search_range, memory=memory)
-        print(f"  tp.link done — filtering stubs (min_len={min_len}) ...")
-    except Exception as exc:
-        if "SubnetOversizeException" in type(exc).__name__ or "Subnetwork" in str(exc):
-            # Particle density is too high for the recursive solver at this
-            # search_range.  The nonrecursive strategy handles arbitrarily
-            # large subnetworks and is recommended for dense sptPALM data.
-            print(f"  WARNING: SubnetOversizeException — switching to "
-                  f"nonrecursive linker (consider reducing Search range)")
-            linked = tp.link(locs, search_range=search_range, memory=memory,
-                             link_strategy="nonrecursive")
-        else:
+
+    iter_ok = hasattr(tp, "link_iter") and len(locs) > 0
+    linked = None
+    if iter_ok:
+        # Per-frame coordinate iterator + index map so we can re-attach
+        # particle IDs to the original locs DataFrame.
+        try:
+            frame_nums = sorted(int(f) for f in locs["frame"].unique())
+            grouped = locs.groupby("frame")
+            coords_per_frame: list = []
+            indices_per_frame: list = []
+            for f in frame_nums:
+                sub = grouped.get_group(f)
+                coords_per_frame.append(sub[["y", "x"]].to_numpy())
+                indices_per_frame.append(sub.index.to_numpy())
+            n_frames = len(frame_nums)
+
+            particle_ids = np.full(len(locs), -1, dtype=np.int64)
+            iterator = tp.link_iter(
+                iter(coords_per_frame),
+                search_range=search_range, memory=memory)
+            for f_idx, p_ids in enumerate(iterator):
+                row_idx = indices_per_frame[f_idx]
+                arr = np.asarray(p_ids, dtype=np.int64)
+                if arr.shape[0] != row_idx.shape[0]:
+                    # Mismatch — trackpy's iter may have emitted in a
+                    # different shape than we expected.  Bail to atomic.
+                    raise RuntimeError("link_iter shape mismatch")
+                particle_ids[row_idx] = arr
+                # Progress + cancel — only every 32 frames to keep cost
+                # well under linking cost itself
+                if (f_idx & 31) == 0:
+                    if progress_cb is not None:
+                        try:    progress_cb((f_idx + 1) / max(1, n_frames))
+                        except Exception: pass
+                    if stop_event is not None and stop_event.is_set():
+                        raise _Cancelled()
+            if progress_cb is not None:
+                try:    progress_cb(1.0)
+                except Exception: pass
+
+            linked = locs.copy()
+            linked["particle"] = particle_ids
+            linked = linked[linked["particle"] >= 0].reset_index(drop=True)
+            print(f"  tp.link_iter done — filtering stubs "
+                  f"(min_len={min_len}) ...")
+        except _Cancelled:
             raise
+        except Exception as exc:
+            # Iter path didn't work — fall through to atomic tp.link
+            print(f"  link_iter failed ({type(exc).__name__}: {exc}); "
+                  f"falling back to atomic tp.link")
+            linked = None
+
+    if linked is None:
+        # Atomic path — uninterruptible but works on any trackpy version
+        if stop_event is not None and stop_event.is_set():
+            raise _Cancelled()
+        try:
+            linked = tp.link(locs, search_range=search_range, memory=memory)
+            print(f"  tp.link done — filtering stubs (min_len={min_len}) ...")
+        except Exception as exc:
+            if ("SubnetOversizeException" in type(exc).__name__
+                    or "Subnetwork" in str(exc)):
+                print(f"  WARNING: SubnetOversizeException — switching to "
+                      f"nonrecursive linker (consider reducing Search range)")
+                linked = tp.link(locs, search_range=search_range,
+                                  memory=memory,
+                                  link_strategy="nonrecursive")
+            else:
+                raise
+
     filtered = tp.filter_stubs(linked, min_len)
     if max_len is not None and max_len > 0:
         lengths  = filtered.groupby("particle")["frame"].count()
