@@ -773,10 +773,16 @@ def _cleanup_temp_stack_paths() -> None:
 #  How much physical RAM to leave for the OS + the user's other apps.
 #  Without this reserve, FIREFLY's memory checks would happily consume
 #  every free byte; the moment the user opens a Safari tab the system
-#  starts swapping or OOM-killing.  We hold back the LARGER of:
-#     • a fixed floor (4 GB)                          — covers macOS itself
-#     • 20% of total RAM                              — scales with system size
-#  Tweaked via env var FIREFLY_USER_RAM_RESERVE_GB if you really need to.
+#  starts swapping or OOM-killing.  Formula:
+#     • a fixed floor (4 GB)                          — covers OS itself
+#     • but at most 0.15 × total RAM, capped at 8 GB  — scales sanely
+#  The OLD formula was max(4, 0.20*total).  On a 32 GB box that's
+#  6.4 GB; combined with a 1.2× peak multiplier on the stack-load
+#  threshold, this routinely demoted big-RAM machines to disk-memmap
+#  even when there was plenty of room.  The new formula gives 4.8 GB
+#  on 32 GB and 8 GB on a 64 GB workstation — enough OS headroom
+#  without throwing away RAM that should be used for the stack.
+#  Override via env var FIREFLY_USER_RAM_RESERVE_GB.
 def _user_ram_reserve_gb() -> float:
     """RAM (in GB) we deliberately keep available for non-FIREFLY uses."""
     try:
@@ -790,7 +796,7 @@ def _user_ram_reserve_gb() -> float:
         total_gb = _ps.virtual_memory().total / 1e9
     except Exception:
         total_gb = 8.0   # conservative fallback if psutil is missing
-    return max(4.0, 0.20 * total_gb)
+    return max(4.0, min(8.0, 0.15 * total_gb))
 
 
 def _probe_tif_shape_and_count(path: str):
@@ -865,21 +871,25 @@ def load_tif(path, stop_event=None, files=None):
     total_gb = total_size / 1e9
 
     # Decide RAM vs memmap.  We need the combined stack + headroom for
-    # one source file at a time + downstream allocations + (critically!)
-    # a reserve so the user's OS / browser / etc. don't get squeezed
-    # into swap.
+    # one source file at a time (the loader frees each source after
+    # copying it into the destination slice) + a reserve for the OS.
+    #
+    # Peak transient = combined + largest_single_source.  Using the
+    # ACTUAL peak (not a 1.2× multiplier) keeps big-RAM machines on
+    # the fast in-RAM path: e.g. a 4-file 16.8 GB series only needs
+    # 16.8 + 4.2 ≈ 21 GB peak, not 16.8 × 1.2 = 20 GB; on a 32 GB box
+    # with 25 GB free and a 4.8 GB reserve, the old formula demoted
+    # to memmap unnecessarily.
     use_memmap = False
     free_gb    = None
     reserve_gb = _user_ram_reserve_gb()
+    max_source_gb = (max(n_per_file) * bytes_per_frame) / 1e9
+    peak_gb       = total_gb + max_source_gb
     try:
         import psutil as _psutil
         free_gb = _psutil.virtual_memory().available / 1e9
-        # Usable budget = free RAM minus the bytes we promised to leave
-        # for everything else on the machine.
         usable_gb = free_gb - reserve_gb
-        # And we need at least 1.2 × the combined stack to cover the
-        # intermediate per-file source array + downstream copies.
-        if usable_gb < total_gb * 1.2:
+        if usable_gb < peak_gb:
             use_memmap = True
     except Exception:
         pass
@@ -908,15 +918,20 @@ def load_tif(path, stop_event=None, files=None):
         tmp_fh.close()
         _register_temp_stack_path(tmp_path)
         free_disp = f"{free_gb:.1f}" if free_gb is not None else "?"
-        print(f"  Combined stack would need {total_gb:.1f} GB and we "
-              f"reserve {reserve_gb:.1f} GB for the OS / other apps; "
-              f"only {free_disp} GB free — backing it with a memmap on "
-              f"disk at {tmp_path}.", flush=True)
+        print(f"  Peak RAM needed: {peak_gb:.1f} GB (combined "
+              f"{total_gb:.1f} GB + largest source {max_source_gb:.1f} GB). "
+              f"Free: {free_disp} GB, reserve: {reserve_gb:.1f} GB. "
+              f"→ disk memmap at {tmp_path} "
+              f"(override reserve via FIREFLY_USER_RAM_RESERVE_GB).",
+              flush=True)
         combined = np.memmap(tmp_path, dtype=np.float32, mode="w+",
                              shape=(n_total, H, W))
     else:
-        print(f"  Allocating combined stack ({n_total:,} frames, "
-              f"{total_gb:.1f} GB) in RAM…", flush=True)
+        free_disp = f"{free_gb:.1f}" if free_gb is not None else "?"
+        print(f"  Peak RAM needed: {peak_gb:.1f} GB (combined "
+              f"{total_gb:.1f} GB + largest source {max_source_gb:.1f} GB). "
+              f"Free: {free_disp} GB, reserve: {reserve_gb:.1f} GB. "
+              f"→ in-RAM allocation (fast path).", flush=True)
         combined = np.empty((n_total, H, W), dtype=np.float32)
 
     # Load each file, copy into the destination slice, free immediately.
