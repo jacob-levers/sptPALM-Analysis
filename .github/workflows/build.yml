@@ -83,10 +83,32 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
+        # IMPORTANT — torch order matters on Windows.
+        # `pip install torch` from PyPI pulls the CPU-only wheel.  The
+        # CUDA wheels live on PyTorch's own index, so we install them
+        # FIRST (matching the >=2.3,<3 pin from requirements.txt) — the
+        # subsequent `pip install -r requirements.txt` then sees torch
+        # already satisfied and leaves the CUDA build in place.
+        # cu124 = CUDA 12.4 runtime, broadest current driver support.
         run: |
           pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cu124 "torch>=2.3,<3"
           pip install -r requirements.txt
           pip install "pyinstaller==6.11.1"   # pinned for reproducible bundling behaviour
+
+      - name: Verify CUDA torch bundle
+        # Sanity-check: the wheel we just installed should self-report
+        # as a CUDA build (version string ends in +cuXYZ).  If the index
+        # resolved to the CPU wheel anyway, fail fast — better to break
+        # the build than ship another CPU-only .exe.
+        shell: pwsh
+        run: |
+          $ver = python -c "import torch; print(torch.__version__)"
+          Write-Host "torch version: $ver"
+          if (-not ($ver -match '\+cu')) {
+            Write-Error "FATAL: torch is not a CUDA build ($ver) — Windows users would silently fall back to CPU"
+            exit 1
+          }
 
       - name: Build exe (onefile)
         # Spec produces a single self-contained FIREFLY.exe.  All binaries
