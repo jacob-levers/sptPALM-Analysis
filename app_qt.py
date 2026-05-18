@@ -7342,8 +7342,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 _cu.clear_declined()
             except Exception:
                 pass
-            QtWidgets.QMessageBox.warning(
-                self, "CUDA install failed", msg)
+            # Use a detailed box (not just .warning) so the multi-line
+            # error message — which lists every URL we tried — renders
+            # fully instead of being clipped.  Raise + activateWindow so
+            # the box pops to the front on Windows even if focus drifted
+            # while the worker ran.
+            box = QtWidgets.QMessageBox(
+                QtWidgets.QMessageBox.Icon.Warning,
+                "CUDA install failed", msg,
+                QtWidgets.QMessageBox.StandardButton.Ok, self)
+            box.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            box.raise_()
+            box.activateWindow()
+            box.exec()
 
         worker.progress.connect(_on_progress)
         worker.finished.connect(_on_finished)

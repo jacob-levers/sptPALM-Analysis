@@ -364,6 +364,31 @@ def install_cuda_torch(cuda_tag: str = "cu124",
             "the sidecar directory.  The wheel layout may be unexpected.")
 
 
+def url_exists(url: str, timeout: float = 8.0) -> bool:
+    """HEAD request to check whether a wheel URL is reachable.
+
+    Returns True on 2xx, False on 4xx, False on network error.  Never
+    raises.  Sub-second on a working connection — much faster than
+    waiting for a full download to fail.
+    """
+    try:
+        req = urllib.request.Request(
+            url, method="HEAD",
+            headers={"User-Agent": "FIREFLY-CUDA-installer/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return 200 <= int(getattr(resp, "status", 0) or 0) < 300
+    except urllib.error.HTTPError as exc:
+        # 404 == doesn't exist (try next tag).  Other 4xx/5xx → treat
+        # the same so we fall through and don't hang waiting.
+        print(f"[CUDA installer] HEAD {url} → HTTP {exc.code}",
+              flush=True)
+        return False
+    except Exception as exc:
+        print(f"[CUDA installer] HEAD {url} → {type(exc).__name__}: {exc}",
+              flush=True)
+        return False
+
+
 def install_cuda_torch_auto(torch_version: str,
                              cuda_tags: tuple = ("cu124", "cu121", "cu118"),
                              download_progress_cb=None,
@@ -371,40 +396,59 @@ def install_cuda_torch_auto(torch_version: str,
                              cancel_cb=None,
                              status_cb: Optional[Callable[[str], None]] = None
                              ) -> str:
-    """Try each CUDA tag in `cuda_tags` until one succeeds.  Returns the
-    cuda_tag that worked.  Used when the primary tag (cu124) doesn't
-    have a wheel for the bundled torch version — older tags often do.
+    """Try each CUDA tag in `cuda_tags` until one is reachable, then
+    download.  Returns the cuda_tag that worked.
+
+    Strategy: cheap HEAD requests to pick the first tag whose wheel
+    actually exists (each HEAD is <1 s on a normal connection), THEN
+    one full GET.  Avoids the 60-second triple-timeout stall the user
+    hit when the bundled torch version doesn't have any CUDA wheel.
 
     `status_cb(msg)` is called between attempts so the GUI can update
-    its label ("Trying cu121…").
+    its label ("Checking cu121…", "Found cu121, downloading…").
     """
-    last_err: Optional[Exception] = None
+    chosen_tag: Optional[str] = None
+    tried_urls = []
     for tag in cuda_tags:
-        try:
-            url = cuda_wheel_url(torch_version, cuda_tag=tag)
-            if status_cb is not None:
-                try: status_cb(f"Trying torch {torch_version} + {tag}…")
-                except Exception: pass
-            install_cuda_torch_from_url(
-                url, torch_version=torch_version, cuda_tag=tag,
-                download_progress_cb=download_progress_cb,
-                extract_progress_cb=extract_progress_cb,
-                cancel_cb=cancel_cb)
-            return tag
-        except RuntimeError as exc:
-            msg = str(exc)
-            last_err = exc
-            # Only fall through on HTTP 404 — other failures (network
-            # down, permission, user cancel) shouldn't be retried with
-            # a different tag.
-            if "HTTP 404" in msg:
-                continue
-            raise
-    raise RuntimeError(
-        f"No CUDA wheel found for torch {torch_version} across "
-        f"{', '.join(cuda_tags)}.  The bundled torch version may be "
-        f"too new — try installing from source (see README)."
-    ) from last_err
+        url = cuda_wheel_url(torch_version, cuda_tag=tag)
+        tried_urls.append(url)
+        if status_cb is not None:
+            try: status_cb(f"Checking torch {torch_version} + {tag}…")
+            except Exception: pass
+        if cancel_cb is not None and cancel_cb():
+            raise RuntimeError("Installation cancelled by user.")
+        if url_exists(url):
+            chosen_tag = tag
+            break
+
+    if chosen_tag is None:
+        # All three HEAD-checks said "not found" — make the failure
+        # actionable instead of mysterious.  Most likely cause: the
+        # bundled torch version isn't a real release on PyTorch's
+        # index (e.g. a pre-release or test version).
+        url_lines = "\n  ".join(tried_urls)
+        raise RuntimeError(
+            f"No CUDA wheel exists for torch {torch_version} at "
+            f"download.pytorch.org.\n\n"
+            f"Tried:\n  {url_lines}\n\n"
+            f"The bundled torch version may be a pre-release or a "
+            f"version PyTorch hasn't shipped CUDA builds for.  To get "
+            f"GPU acceleration on this machine, install FIREFLY from "
+            f"source and follow the 'Enabling CUDA' section of the "
+            f"README — that path lets pip resolve the latest matching "
+            f"CUDA torch wheel against your local Python."
+        )
+
+    url = cuda_wheel_url(torch_version, cuda_tag=chosen_tag)
+    if status_cb is not None:
+        try: status_cb(f"Found cu{chosen_tag[2:]}, downloading…")
+        except Exception: pass
+    install_cuda_torch_from_url(
+        url, torch_version=torch_version, cuda_tag=chosen_tag,
+        download_progress_cb=download_progress_cb,
+        extract_progress_cb=extract_progress_cb,
+        cancel_cb=cancel_cb)
+    return chosen_tag
 
 
 def install_cuda_torch_from_url(url: str,
