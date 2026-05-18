@@ -7028,7 +7028,15 @@ class MainWindow(QtWidgets.QMainWindow):
         action.  On macOS the menubar is global; if we don't own one,
         any embedded napari Viewer will claim it, and clearing napari's
         menubar later (we no longer do that, but defensively) used to
-        take ⌘Q down with it.  Adding our own keeps Quit reliable."""
+        take ⌘Q down with it.  Adding our own keeps Quit reliable.
+
+        On Windows/Linux the menubar is per-window and would show a
+        useless "File → Quit FIREFLY" strip across the top of the
+        main window — the window's own close button (X) already does
+        the same thing.  Skip it entirely off macOS.
+        """
+        if sys.platform != "darwin":
+            return
         mb = self.menuBar()
         # Use native (system) menu bar on macOS so the entries show in
         # the system bar instead of inside the window.

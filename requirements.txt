@@ -2,7 +2,7 @@
 # Install with:  pip install -r requirements.txt
 
 numpy<2            # napari 0.4.x was built against the numpy 1.x C-ABI — numpy 2.x breaks the frozen build's napari/vispy import
-pandas
+pandas<3           # pandas 3.x dropped numpy 1.x support; with napari<0.5 pinning us to numpy 1.x, pandas must stay on 2.x
 scipy
 matplotlib
 scikit-image

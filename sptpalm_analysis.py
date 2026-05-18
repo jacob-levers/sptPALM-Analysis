@@ -655,6 +655,26 @@ def _load_single_tif(path, stop_event=None):
     if not HAS_TIFFFILE:
         raise RuntimeError("Run: pip install tifffile")
     BATCH = 2000
+    # Peek at the file header — if the magic doesn't match TIFF (II*\0 /
+    # MM\0*) we surface a friendly error rather than letting tifffile's
+    # raw "not a TIFF file: header=b'...'" exception bubble up.  Common
+    # case: Zeiss CZI files saved with a `.tif` extension (header=ZISR).
+    try:
+        with open(path, "rb") as _fh:
+            _hdr = _fh.read(4)
+    except Exception:
+        _hdr = b""
+    if _hdr[:3] == b"ZIS":   # ZISRAWFILE → Zeiss CZI
+        raise RuntimeError(
+            f"{os.path.basename(path)} is a Zeiss CZI file with a .tif "
+            f"extension, not a real TIFF.  Rename it to .czi and "
+            f"re-import — FIREFLY's CZI loader will then handle it "
+            f"correctly.")
+    if _hdr[:2] not in (b"II", b"MM"):
+        raise RuntimeError(
+            f"{os.path.basename(path)} doesn't look like a TIFF file "
+            f"(header bytes: {_hdr!r}).  Check the file isn't corrupted "
+            f"or saved in a different format with the wrong extension.")
     with tifffile.TiffFile(path) as tif:
         px_um, fi_s = _parse_ome_metadata(tif)
         n_pages = len(tif.pages)
