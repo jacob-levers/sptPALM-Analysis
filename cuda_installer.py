@@ -404,31 +404,61 @@ def install_cuda_torch(cuda_tag: str = "cu124",
 def url_exists(url: str, timeout: float = 8.0) -> bool:
     """HEAD request to check whether a wheel URL is reachable.
 
-    Returns True on 2xx, False on 4xx, False on network error.  Never
-    raises.  Sub-second on a working connection — much faster than
-    waiting for a full download to fail.
+    Wrapped in a hard wall-clock watchdog: urllib's `timeout` is not
+    reliably honored on Windows when the TLS handshake or DNS stage
+    stalls (observed: cu118 HEAD hung indefinitely on Windows 11).
+    The watchdog runs the actual request on a daemon thread and gives
+    up after `timeout + 2 s`, so a stuck HEAD can never wedge the
+    worker thread (which was making the whole app look frozen).
+
+    Returns True on 2xx, False on anything else.  Never raises.
     """
     _log(f"HEAD {url}")
-    _log(f"  (timeout={timeout}s)")
-    try:
-        req = urllib.request.Request(
-            url, method="HEAD",
-            headers={"User-Agent": "FIREFLY-CUDA-installer/1.0"})
-        t0 = time.monotonic()
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            dt = time.monotonic() - t0
-            code = int(getattr(resp, "status", 0) or 0)
-            _log(f"  → HTTP {code} in {dt:.2f}s")
-            return 200 <= code < 300
-    except urllib.error.HTTPError as exc:
-        _log(f"  → HTTPError {exc.code}: {exc.reason}")
+    _log(f"  (timeout={timeout}s, watchdog={timeout + 2}s)")
+
+    import threading
+    result_holder = {"ok": False, "done": False}
+    t0 = time.monotonic()
+
+    def _do_head():
+        try:
+            req = urllib.request.Request(
+                url, method="HEAD",
+                headers={"User-Agent": "FIREFLY-CUDA-installer/1.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                dt = time.monotonic() - t0
+                code = int(getattr(resp, "status", 0) or 0)
+                _log(f"  → HTTP {code} in {dt:.2f}s")
+                result_holder["ok"] = 200 <= code < 300
+        except urllib.error.HTTPError as exc:
+            _log(f"  → HTTPError {exc.code}: {exc.reason} "
+                 f"in {time.monotonic()-t0:.2f}s")
+            result_holder["ok"] = False
+        except urllib.error.URLError as exc:
+            _log(f"  → URLError: {exc.reason} "
+                 f"in {time.monotonic()-t0:.2f}s")
+            result_holder["ok"] = False
+        except Exception as exc:
+            _log(f"  → {type(exc).__name__}: {exc} "
+                 f"in {time.monotonic()-t0:.2f}s")
+            result_holder["ok"] = False
+        finally:
+            result_holder["done"] = True
+
+    t = threading.Thread(target=_do_head, daemon=True,
+                          name="cuda-head-watchdog")
+    t.start()
+    t.join(timeout=timeout + 2)
+    if not result_holder["done"]:
+        _log(f"  → WATCHDOG: HEAD hung past {timeout + 2}s "
+             f"(urllib timeout not honored — likely Windows TLS "
+             f"handshake stall).  Treating as unreachable, moving on.")
+        # Daemon thread will keep running but won't block process exit
+        # or the worker thread.  Critical: we DON'T close the socket
+        # here — that would race with the daemon thread.  It'll time
+        # out eventually and exit on its own.
         return False
-    except urllib.error.URLError as exc:
-        _log(f"  → URLError: {exc.reason}")
-        return False
-    except Exception as exc:
-        _log(f"  → {type(exc).__name__}: {exc}")
-        return False
+    return result_holder["ok"]
 
 
 def install_cuda_torch_auto(torch_version: str,

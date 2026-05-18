@@ -18,7 +18,7 @@ Pillow
 psutil
 scikit-learn
 threadpoolctl      # dynamically expand BLAS pool during localisation
-torch>=2.3,<3      # GPU localiser backend (MPS on Apple Silicon, CUDA on NVIDIA, CPU fallback)
+torch>=2.3,<2.6    # GPU localiser backend.  Capped at <2.6 so the bundled version always exists on PyTorch's CUDA index (download.pytorch.org/whl/cuXYZ).  The in-app CUDA installer needs a real version to download a matching wheel from.
 
 # ── Qt UI stack ───────────────────────────────────────────────────────────────
 # FIREFLY 2.0+ uses PySide6 (Qt6) instead of tkinter.  Napari is embedded
