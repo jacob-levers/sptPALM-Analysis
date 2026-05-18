@@ -621,8 +621,18 @@ def _run_one_analysis(params: dict, msg_queue, cancel_event,
     # corresponding Compare-tab panels.
     extras_saved = ["locs", "trajectories", "diffusion summary"]
     try:
+        # compute_msd_and_fit returns the ensemble curve as a Series
+        # indexed by lag frame, NOT a DataFrame.  Compare expects a
+        # DataFrame with columns `lag_frame` + `msd_um2` (matching the
+        # PALM-Tracer summary loader), so we convert here.
         if emsd_df is not None and len(emsd_df):
-            emsd_df.to_csv(
+            import pandas as _pd
+            if isinstance(emsd_df, _pd.Series):
+                emsd_out = (emsd_df.to_frame("msd_um2")
+                                   .reset_index(names="lag_frame"))
+            else:
+                emsd_out = emsd_df
+            emsd_out.to_csv(
                 os.path.join(extras_dir, f"{stem}_ensemble_msd.csv"),
                 index=False)
             extras_saved.append("ensemble MSD")
