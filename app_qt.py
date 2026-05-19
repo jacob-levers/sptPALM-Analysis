@@ -5052,6 +5052,53 @@ class MainWindow(QtWidgets.QMainWindow):
         toolbar.addWidget(self.c_ws_auto)
         v.addLayout(toolbar)
 
+        # ── Motion-class filter row ───────────────────────────────────────
+        # Checkboxes let the user hide entire motion classes from the
+        # Tracks overlay.  Useful for cluttered fields — uncheck
+        # "Brownian" to see just the directed/confined tracks, for
+        # example.  Active only once a track CSV is loaded that has an
+        # associated diffusion-summary CSV (motion column).
+        filter_row = QtWidgets.QHBoxLayout()
+        filter_row.setContentsMargins(0, 0, 0, 0)
+        filter_row.setSpacing(8)
+        filter_row.addWidget(QtWidgets.QLabel("Show tracks:"))
+        self._ws_motion_checks: dict[str, QtWidgets.QCheckBox] = {}
+        # Order = visual order; colours match the per-class fill used in
+        # the figures so the user gets a consistent palette.
+        for cls, swatch in (
+                ("Immobile",  "#7f7f7f"),
+                ("Confined",  "#1f77b4"),
+                ("Brownian",  "#2ca02c"),
+                ("Directed",  "#d62728"),
+                ("Unknown",   "#bbbbbb"),
+        ):
+            cb = QtWidgets.QCheckBox(cls)
+            cb.setChecked(True)
+            cb.setStyleSheet(
+                f"QCheckBox::indicator:checked {{ background:{swatch}; "
+                f"border:1px solid {swatch}; }}")
+            cb.toggled.connect(self._ws_apply_motion_filter)
+            filter_row.addWidget(cb)
+            self._ws_motion_checks[cls] = cb
+
+        # Min-length filter — drop one/two-point detections that
+        # clutter the field visually and aren't diffusion-classifiable.
+        filter_row.addSpacing(16)
+        filter_row.addWidget(QtWidgets.QLabel("min length:"))
+        self._ws_min_len = QtWidgets.QSpinBox()
+        self._ws_min_len.setRange(1, 1000)
+        self._ws_min_len.setValue(1)
+        self._ws_min_len.setSuffix(" frames")
+        self._ws_min_len.setMaximumWidth(120)
+        self._ws_min_len.valueChanged.connect(self._ws_apply_motion_filter)
+        filter_row.addWidget(self._ws_min_len)
+
+        self._ws_filter_status = QtWidgets.QLabel("")
+        self._ws_filter_status.setStyleSheet("color: #888;")
+        filter_row.addWidget(self._ws_filter_status)
+        filter_row.addStretch(1)
+        v.addLayout(filter_row)
+
         # ── Viewer container ─────────────────────────────────────────────
         # Filled lazily on first tab activation.
         self._ws_container = QtWidgets.QWidget()
@@ -5232,35 +5279,19 @@ class MainWindow(QtWidgets.QMainWindow):
                     try:    diff_df = pd.read_csv(guess)
                     except Exception: diff_df = None
 
-            data = df[["particle", "frame", "y", "x"]].values.astype(float)
+            # Cache full data BEFORE building the layer so the motion-
+            # class filter can re-derive subsets without re-reading the
+            # CSV.  _ws_tracks_layer_name is the napari layer name we
+            # need to find/remove when the filter rebuilds.
+            self._ws_tracks_df         = df
+            self._ws_diff_df           = diff_df
+            self._ws_tracks_csv_path   = csv_path
+            self._ws_tracks_layer_name = os.path.basename(csv_path)
 
-            # Per-track features so we can colour by motion class if available
-            features = None
-            color_by = None
-            if diff_df is not None and "motion" in diff_df.columns:
-                motion_to_int = {"Immobile": 0, "Confined": 1,
-                                 "Brownian": 2, "Directed": 3,
-                                 "Unknown":  4}
-                motion_map = dict(zip(diff_df["particle"],
-                                      diff_df["motion"]))
-                # napari Tracks features are indexed by the rows of `data`
-                col = [motion_to_int.get(motion_map.get(int(pid), "Unknown"), 4)
-                       for pid in df["particle"].values]
-                features = {"motion_int": col}
-                color_by = "motion_int"
-
-            layer = v.add_tracks(
-                data, name=os.path.basename(csv_path),
-                blending="opaque",
-                **({"features": features, "color_by": color_by,
-                    "colormap": "turbo"} if features is not None else {}))
-
-            # Cache for the click handler
-            self._ws_tracks_df    = df
-            self._ws_diff_df      = diff_df
-            self._ws_tracks_layer = layer
-            self._attach_track_click_handler(layer)
-            self._ws_inspector.clear()
+            # Build the initial layer honouring whatever the filter
+            # checkboxes are currently set to (defaults to ALL classes
+            # checked → no filtering on first load).
+            self._ws_apply_motion_filter(initial=True)
 
             self.statusBar().showMessage(
                 f"Loaded {df['particle'].nunique():,} tracks "
@@ -5270,6 +5301,130 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(
                 self, "Load failed",
                 f"Couldn't load tracks from {os.path.basename(csv_path)}:\n\n{exc}")
+
+    # ── Motion-class + length filter ──────────────────────────────────────
+    def _ws_apply_motion_filter(self, *_args, initial: bool = False):
+        """Re-build the napari Tracks layer with only the currently-
+        selected motion classes and length ≥ min_len.  Called whenever
+        the user toggles a filter checkbox or changes the spinbox.
+
+        `initial=True` is passed by _ws_load_tracks_path when this is
+        the first build for a freshly loaded CSV (skips the "nothing
+        loaded" early-return so we always create the layer).
+        """
+        df = getattr(self, "_ws_tracks_df", None)
+        if df is None:
+            # Filter changed but no tracks loaded yet — nothing to do.
+            try: self._ws_filter_status.setText("")
+            except Exception: pass
+            return
+
+        v = self._ws_viewer_or_warn() if not initial else getattr(
+            self, "_napari_viewer", None)
+        if v is None:
+            return
+
+        try:
+            import pandas as pd  # noqa: F401 — used implicitly via df
+
+            diff_df = getattr(self, "_ws_diff_df", None)
+            motion_map = {}
+            if diff_df is not None and "motion" in diff_df.columns:
+                motion_map = dict(zip(diff_df["particle"],
+                                      diff_df["motion"]))
+
+            # Which classes does the user want to see?
+            checks = getattr(self, "_ws_motion_checks", {}) or {}
+            allowed = {cls for cls, cb in checks.items() if cb.isChecked()}
+            if not allowed:
+                # User unchecked everything — degrade gracefully (show
+                # nothing) rather than crashing on an empty layer.
+                allowed = set()
+
+            min_len = 1
+            try:    min_len = int(self._ws_min_len.value())
+            except Exception: pass
+
+            # Per-track length (number of detections) for the length gate.
+            try:
+                track_lens = df.groupby("particle").size()
+            except Exception:
+                track_lens = None
+
+            # Build the per-row boolean mask.
+            pids = df["particle"].values
+            if motion_map:
+                row_motion = [motion_map.get(int(p), "Unknown") for p in pids]
+                motion_mask = [m in allowed for m in row_motion]
+            else:
+                # No diffusion summary → all rows pass motion filter,
+                # filter UI is informational but does nothing useful.
+                motion_mask = [True] * len(pids)
+
+            if track_lens is not None and min_len > 1:
+                ok_pids = set(track_lens[track_lens >= min_len].index)
+                len_mask = [int(p) in ok_pids for p in pids]
+            else:
+                len_mask = [True] * len(pids)
+
+            import numpy as _np
+            combined = _np.array(motion_mask) & _np.array(len_mask)
+            sub = df[combined]
+
+            # Rebuild the layer.  Remove the old one first if present.
+            layer_name = getattr(self, "_ws_tracks_layer_name", None)
+            if layer_name is not None:
+                try:
+                    if layer_name in v.layers:
+                        v.layers.remove(layer_name)
+                except Exception: pass
+
+            if len(sub) == 0:
+                # Nothing to show — leave the layer absent and clear
+                # status.  Restoring requires user to re-check classes.
+                self._ws_tracks_layer = None
+                try:
+                    n_total = df["particle"].nunique()
+                    self._ws_filter_status.setText(
+                        f"0 / {n_total:,} tracks visible")
+                except Exception: pass
+                return
+
+            data = sub[["particle", "frame", "y", "x"]].values.astype(float)
+            features = None
+            color_by = None
+            if motion_map:
+                motion_to_int = {"Immobile": 0, "Confined": 1,
+                                 "Brownian": 2, "Directed": 3,
+                                 "Unknown":  4}
+                col = [motion_to_int.get(motion_map.get(int(p), "Unknown"), 4)
+                       for p in sub["particle"].values]
+                features = {"motion_int": col}
+                color_by = "motion_int"
+
+            kwargs = {"name": layer_name, "blending": "opaque"}
+            if features is not None:
+                kwargs["features"] = features
+                kwargs["color_by"] = color_by
+                kwargs["colormap"] = "turbo"
+            layer = v.add_tracks(data, **kwargs)
+
+            self._ws_tracks_layer = layer
+            self._attach_track_click_handler(layer)
+            self._ws_inspector.clear()
+
+            try:
+                n_visible = sub["particle"].nunique()
+                n_total   = df["particle"].nunique()
+                self._ws_filter_status.setText(
+                    f"{n_visible:,} / {n_total:,} tracks visible")
+            except Exception: pass
+        except Exception as exc:
+            # Filter failures shouldn't tear the GUI down — log + show
+            # a transient status message.
+            try:
+                self._ws_filter_status.setText(f"filter error: {exc}")
+            except Exception: pass
 
     def _attach_track_click_handler(self, layer):
         """Hook a mouse-drag callback onto the Tracks layer so clicking a
