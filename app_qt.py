@@ -5959,6 +5959,30 @@ class MainWindow(QtWidgets.QMainWindow):
         known live object down in turn AND schedule a hard-exit
         fallback so the process always terminates within ~3 s.
         """
+        # 0. FIRST THING: arm an independent hard-exit watchdog on a
+        # daemon OS thread.  CRITICAL — this must be scheduled BEFORE
+        # any cleanup, and via threading (NOT QTimer.singleShot),
+        # because:
+        #   * If we used QTimer, the timer wouldn't fire after
+        #     QApplication.quit() because the Qt event loop is gone.
+        #   * If we put it at the end of closeEvent, anything earlier
+        #     that hangs (cleanup, napari teardown, subprocess.join())
+        #     never reaches the timer-arming code.
+        # threading.Timer runs in its own OS thread and the daemon
+        # flag means it doesn't keep the process alive on its own
+        # — it just fires os._exit(0) after the wall-clock delay if
+        # the natural shutdown path hasn't already finished by then.
+        try:
+            import threading as _th
+            def _hard_exit():
+                import os as _os
+                _os._exit(0)
+            _wd = _th.Timer(3.0, _hard_exit)
+            _wd.daemon = True
+            _wd.start()
+        except Exception:
+            pass
+
         # 1. Persist settings BEFORE anything that could fail.
         try:    self._save_settings()
         except Exception: pass
@@ -6056,26 +6080,12 @@ class MainWindow(QtWidgets.QMainWindow):
         super().closeEvent(event)
 
         # 9. Ask the QApplication to quit (covers stray top-level windows).
+        # The hard-exit watchdog armed at step 0 will fire in 3 s if
+        # the natural shutdown hasn't completed by then — no need for
+        # any further QTimer-based fallback (which would itself
+        # depend on the Qt event loop still being alive).
         try:    QtWidgets.QApplication.instance().quit()
         except Exception: pass
-
-        # 10. Hard-exit fallback.  If after ALL the above some library
-        # (vispy / Metal / OpenSSL / a daemon thread doing socket I/O)
-        # still refuses to let the interpreter unwind, os._exit() is
-        # the only thing that guarantees the OS reclaims the PID
-        # within a finite time.  Schedule it via the QTimer event
-        # loop so the closeEvent itself can return cleanly first.
-        try:
-            def _hard_exit():
-                # Settings are already saved; we don't care about
-                # graceful Python shutdown — the OS reclaims everything.
-                import os as _os
-                _os._exit(0)
-            QtCore.QTimer.singleShot(2500, _hard_exit)
-        except Exception:
-            # If even that fails, drop straight to os._exit.
-            import os as _os
-            _os._exit(0)
 
     # ── Backend availability helper ───────────────────────────────────────
     # Two-way mapping between GUI labels and internal backend strings.
