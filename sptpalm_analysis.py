@@ -3307,7 +3307,7 @@ def compute_msd_and_fit(tracks, pixel_size, frame_interval,
     # Heuristic: use processes when there are enough tracks for the
     # parallelism win to outweigh spawn cost.  Below threshold, stick
     # with threads.
-    PROCESS_POOL_THRESHOLD = 8000
+    PROCESS_POOL_THRESHOLD = 5000
     use_processes = n_tracks >= PROCESS_POOL_THRESHOLD
 
     # Pre-extract per-track arrays ONCE so we don't pay get_group twice
