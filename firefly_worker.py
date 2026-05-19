@@ -232,25 +232,31 @@ def _start_memory_watchdog(cancel_event, msg_queue,
                 continue
             if free_gb < critical_gb:
                 if cancel_event is not None and not cancel_event.is_set():
+                    # Set the abort signals BEFORE attempting to enqueue
+                    # the log message.  Under memory pressure the queue
+                    # may itself be full (GUI is starved of CPU and not
+                    # draining); a blocking put_nowait → queue.Full
+                    # exception is far better than hanging here forever
+                    # and never tripping cancel_event at all.
+                    if mem_abort_event is not None:
+                        try: mem_abort_event.set()
+                        except Exception: pass
+                    cancel_event.set()
                     try:
-                        msg_queue.put(("log",
+                        msg_queue.put_nowait(("log",
                             f"\n  ⚠ CRITICAL: only {free_gb:.2f} GB RAM "
                             f"free — aborting to keep the system "
                             f"responsive.  Close other apps or set a "
                             f"larger FIREFLY_USER_RAM_RESERVE_GB and "
                             f"re-run."))
                     except Exception: pass
-                    # Signal that THIS abort came from the watchdog (not
-                    # the user) so the batch handler can skip-and-continue
-                    # to the next file rather than killing the whole run.
-                    if mem_abort_event is not None:
-                        try: mem_abort_event.set()
-                        except Exception: pass
-                    cancel_event.set()
                 return
             if not warned and free_gb < warn_gb:
+                # Same put_nowait pattern — never block the watchdog
+                # on a queue that the memory-starved GUI may have
+                # stopped draining.
                 try:
-                    msg_queue.put(("log",
+                    msg_queue.put_nowait(("log",
                         f"  ⚠ Memory pressure: {free_gb:.2f} GB RAM "
                         f"free (warn < {warn_gb:.1f} GB / abort < "
                         f"{critical_gb:.1f} GB).  Run will abort if "

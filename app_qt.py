@@ -582,7 +582,19 @@ class _ResourceMonitor(QtWidgets.QFrame):
         # Probe deps once at construction so we don't pay the import cost
         # per tick.  All three are optional — graceful no-op if absent.
         self._psutil = None
-        self._torch  = None
+        # CRITICAL: do NOT eagerly import torch into the GUI process.
+        # The whole subprocess-isolation architecture (firefly_worker.py
+        # comment, top of file) exists to keep torch + Metal/MPS out of
+        # the Qt process on Apple Silicon.  Importing it here defeats
+        # that and contributes to MPS allocator "Insufficient Memory"
+        # crashes mid-localisation.
+        #
+        # Instead, we only USE torch for VRAM reporting if some other
+        # part of the app has already imported it (i.e. never in the
+        # GUI process — only when the user is on Windows + CUDA where
+        # subprocess isolation isn't needed and torch may be on
+        # sys.path via the sidecar installer).
+        self._torch = None
         try:
             import psutil as _ps
             self._psutil = _ps
@@ -592,11 +604,19 @@ class _ResourceMonitor(QtWidgets.QFrame):
             except Exception: pass
         except Exception:
             pass
-        try:
-            import torch as _t
-            self._torch = _t
-        except Exception:
-            pass
+
+    def _maybe_get_torch(self):
+        """Return torch ONLY if it's already in sys.modules (i.e. some
+        other code path imported it).  Never triggers a fresh import.
+        Re-checks each tick so it picks up torch after the CUDA sidecar
+        installer adds it to sys.path mid-session."""
+        if self._torch is not None:
+            return self._torch
+        import sys as _sys
+        mod = _sys.modules.get("torch")
+        if mod is not None:
+            self._torch = mod
+        return self._torch
 
         # Cached MPS utilisation (Apple Silicon has no Python API — we
         # shell out to `ioreg`, which is fast but worth backgrounding).
@@ -678,16 +698,20 @@ class _ResourceMonitor(QtWidgets.QFrame):
             self._set("cpu", "(psutil)")
             self._set("ram", "(psutil)")
 
-        # GPU usage + VRAM via torch.  CUDA exposes utilisation through
+        # GPU usage + VRAM via torch — ONLY if torch is already
+        # imported elsewhere (the subprocess-isolation invariant on
+        # Apple Silicon forbids us from importing it ourselves; see
+        # _maybe_get_torch).  CUDA exposes utilisation through
         # nvidia-smi (not torch) so we report VRAM-in-use as the GPU
         # cell when CUDA is active; MPS doesn't expose either cleanly.
-        if self._torch is None:
-            self._set("gpu",  "(torch)")
-            self._set("vram", "(torch)")
+        torch_mod = self._maybe_get_torch()
+        if torch_mod is None:
+            self._set("gpu",  "(idle)")
+            self._set("vram", "(idle)")
             return
 
         try:
-            t = self._torch
+            t = torch_mod
             if t.cuda.is_available():
                 # GPU utilisation via NVML if available
                 util = None
@@ -7138,14 +7162,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Also detect a subprocess that has exited without posting a
         # terminal message (e.g. crashed, SIGTERM'd, or SIGKILL'd).
+        # IMPORTANT: never time.sleep() in this slot — it runs on the
+        # GUI thread on a 30 Hz QTimer.  Drain whatever's already in
+        # the queue non-blockingly; any final logs the subprocess
+        # wrote in the last instant will be picked up by the next
+        # tick (~33 ms away) anyway.
         if not worker_done and self._proc is not None and not self._proc.is_alive():
-            time.sleep(0.05)
-            try:
-                kind, payload = self._msg_queue.get_nowait()
+            # Drain any pending logs without blocking.
+            for _ in range(64):
+                try:
+                    kind, payload = self._msg_queue.get_nowait()
+                except (queue.Empty, Exception):
+                    break
                 if kind == "log":
                     log_widget.appendPlainText(payload)
-            except queue.Empty:
-                pass
             # If the user pressed Stop, treat exit as "stopped", not an error
             if getattr(self, "_stop_requested_at", None) is not None:
                 self._handle_stopped()
@@ -7233,12 +7263,19 @@ class MainWindow(QtWidgets.QMainWindow):
             "n_locs":   total_locs,
             "motion_counts": {},
         }
-        # Find the common output root (parent of every file's out_dir)
+        # Find the common output root (parent of every file's out_dir).
+        # On Windows, os.path.commonpath raises ValueError when paths
+        # straddle different drive letters (e.g. C:\ + D:\) — handle
+        # that explicitly so a batch writing across drives doesn't
+        # surface a misleading "root = first file's parent" link.
         common_root = ""
         ok_dirs = [r.get("out_dir") for r in results if r.get("ok") and r.get("out_dir")]
         if ok_dirs:
             try:
                 common_root = os.path.commonpath(ok_dirs)
+            except ValueError:
+                # Mixed drives on Windows.  Don't fabricate a wrong root.
+                common_root = ""
             except Exception:
                 common_root = os.path.dirname(ok_dirs[0])
         self.run_results.show_results(headline, common_root,
@@ -7785,6 +7822,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 return ""
 
         def _state_provider() -> dict:
+            # Guard: if the main window's C++ side has already been
+            # destroyed (e.g. crash during shutdown after a background
+            # thread queued its exception), accessing self.attribute on
+            # a deleted QObject raises RuntimeError or worse.  shiboken's
+            # isValid() check returns False once the C++ peer is gone.
+            try:
+                from shiboken6 import isValid as _is_valid
+                if not _is_valid(self):
+                    return {"<state>": "main window already destroyed"}
+            except Exception:
+                pass
             try:
                 return {
                     "UI":                 "PySide6 (v2.0-dev)",
