@@ -3404,7 +3404,13 @@ def compute_jdd(tracks, pixel_size_um, frame_interval_s, n_components=2):
     if len(tracks) < 2:
         jumps = np.array([], dtype=np.float64)
     else:
-        srt = tracks.sort_values(["particle", "frame"], kind="stable")
+        # Drop the index level first — trackpy.link sets `frame` as
+        # both an index level AND a column, which makes sort_values
+        # raise "ambiguous" on those keys.  reset_index(drop=True)
+        # discards the index but keeps the column intact.
+        srt = (tracks
+               .reset_index(drop=True)
+               .sort_values(["particle", "frame"], kind="stable"))
         pid_arr   = srt["particle"].to_numpy()
         frame_arr = srt["frame"].to_numpy()
         x_arr     = srt["x"].to_numpy() * pixel_size_um
@@ -3522,7 +3528,12 @@ def compute_turning_angles(tracks):
     if len(tracks) < 3:
         result = np.array([], dtype=float)
     else:
-        srt = tracks.sort_values(["particle", "frame"], kind="stable")
+        # Drop the index level first — trackpy.link sets `frame` as
+        # both an index level AND a column, which makes sort_values
+        # raise "ambiguous" on those keys.
+        srt = (tracks
+               .reset_index(drop=True)
+               .sort_values(["particle", "frame"], kind="stable"))
         pid_arr = srt["particle"].to_numpy()
         xy_arr  = srt[["x", "y"]].to_numpy()
         # Step vectors v[i] = xy[i+1] - xy[i].  same_track_step[i] is True
