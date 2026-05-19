@@ -605,6 +605,17 @@ class _ResourceMonitor(QtWidgets.QFrame):
         except Exception:
             pass
 
+        # Cached MPS utilisation (Apple Silicon has no Python API — we
+        # shell out to `ioreg`, which is fast but worth backgrounding).
+        self._mps_util_cache: "int | None" = None
+        self._mps_polling: bool = False
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self._refresh)
+        self._timer.start()
+        self._refresh()
+
     def _maybe_get_torch(self):
         """Return torch ONLY if it's already in sys.modules (i.e. some
         other code path imported it).  Never triggers a fresh import.
@@ -617,17 +628,6 @@ class _ResourceMonitor(QtWidgets.QFrame):
         if mod is not None:
             self._torch = mod
         return self._torch
-
-        # Cached MPS utilisation (Apple Silicon has no Python API — we
-        # shell out to `ioreg`, which is fast but worth backgrounding).
-        self._mps_util_cache: "int | None" = None
-        self._mps_polling: bool = False
-
-        self._timer = QTimer(self)
-        self._timer.setInterval(1000)
-        self._timer.timeout.connect(self._refresh)
-        self._timer.start()
-        self._refresh()
 
     @staticmethod
     def _mps_gpu_utilization() -> "int | None":
