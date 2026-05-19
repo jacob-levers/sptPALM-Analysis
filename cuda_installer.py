@@ -206,19 +206,221 @@ def cuda_wheel_url(torch_version: str, cuda_tag: str = "cu124",
 
 
 # ── Download / extract ────────────────────────────────────────────────────────
+def _download_via_bits(url: str,
+                        dest_path: str,
+                        progress_cb: Optional[Callable[[int, int], None]] = None,
+                        cancel_cb: Optional[Callable[[], bool]] = None) -> None:
+    """Windows-native download via PowerShell's BITS (Background
+    Intelligent Transfer Service).  Used in preference to urllib on
+    Windows because:
+
+      * BITS uses the Windows HTTP stack (winhttp) → same code path as
+        Windows Update → far more compatible with Defender real-time
+        scanning, corporate proxies, and TLS deep-packet inspection
+        appliances than Python's urllib.
+      * Resumable across network blips.
+      * The BITS service runs in the background — even if our process
+        is suspended by Defender's scan, BITS keeps going.
+
+    Drives a synchronous Start-BitsTransfer in PowerShell and polls the
+    destination file size for progress (Get-BitsTransfer adds complexity
+    for marginal gain over file-size polling).
+    """
+    import json as _json
+
+    _log("Using Windows BITS (Background Intelligent Transfer Service)")
+    # Inline PowerShell driver — start an async BITS job and emit
+    # JSON progress to stdout every 500 ms until done.
+    ps_script = r"""
+$ErrorActionPreference = 'Stop'
+Import-Module BitsTransfer
+$src = $args[0]
+$dst = $args[1]
+# Async so we can stream progress AND honour cancellation by
+# polling Python's stdin.  Synchronous mode would block until done
+# with no way to monitor.
+$job = $null
+try {
+    $job = Start-BitsTransfer -Source $src -Destination $dst `
+                              -Asynchronous `
+                              -DisplayName 'FIREFLY-CUDA-installer' `
+                              -Priority Foreground
+    while ($true) {
+        Start-Sleep -Milliseconds 500
+        $j = Get-BitsTransfer -JobId $job.JobId -ErrorAction SilentlyContinue
+        if ($null -eq $j) { break }
+        $payload = @{
+            state = [string]$j.JobState
+            transferred = [int64]$j.BytesTransferred
+            total = [int64]$j.BytesTotal
+        }
+        Write-Output ($payload | ConvertTo-Json -Compress)
+        switch ($j.JobState) {
+            'Transferred' {
+                Complete-BitsTransfer -BitsJob $j
+                Write-Output '{"state":"Done","transferred":0,"total":0}'
+                return
+            }
+            'Error' {
+                $err = $j.ErrorDescription
+                Remove-BitsTransfer -BitsJob $j -ErrorAction SilentlyContinue
+                throw "BITS Error: $err"
+            }
+            'Cancelled' {
+                Remove-BitsTransfer -BitsJob $j -ErrorAction SilentlyContinue
+                throw 'BITS Cancelled'
+            }
+        }
+    }
+} catch {
+    if ($job) {
+        Remove-BitsTransfer -BitsJob $job -ErrorAction SilentlyContinue
+    }
+    throw
+}
+"""
+
+    # Use -EncodedCommand so quoting around the URL is bulletproof.
+    import base64 as _b64
+    encoded = _b64.b64encode(ps_script.encode("utf-16le")).decode("ascii")
+
+    # Open PowerShell, pipe stdout to us so we can stream progress.
+    creationflags = 0
+    if is_windows():
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+    cmd = ["powershell", "-NoProfile", "-NonInteractive",
+           "-EncodedCommand", encoded,
+           "--", url, dest_path]
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        creationflags=creationflags,
+    )
+
+    last_transferred = 0
+    no_progress_since = time.monotonic()
+    stall_limit_s = 30.0   # BITS handles transient failures internally —
+                            # only abort if it's COMPLETELY stuck.
+
+    try:
+        while True:
+            if cancel_cb is not None:
+                try:
+                    if cancel_cb():
+                        _log("  → Cancel requested, killing PowerShell + BITS job")
+                        proc.terminate()
+                        try: proc.wait(timeout=5)
+                        except Exception: pass
+                        try: os.remove(dest_path)
+                        except Exception: pass
+                        raise RuntimeError("Download cancelled by user.")
+                except RuntimeError:
+                    raise
+                except Exception:
+                    pass
+
+            line = proc.stdout.readline()
+            if not line:
+                # stdout closed → PowerShell exited
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = _json.loads(line)
+            except Exception:
+                # Non-JSON output (warnings etc.) — just log it
+                _log(f"  ps: {line}")
+                continue
+            state = ev.get("state", "")
+            trans = int(ev.get("transferred", 0))
+            total = int(ev.get("total", 0))
+            if state == "Done":
+                _log("  ✓ BITS reports Transfer complete")
+                break
+            # Stall detection — BITS has internal retries but if it's
+            # genuinely dead, fail fast rather than wait forever.
+            if trans > last_transferred:
+                last_transferred = trans
+                no_progress_since = time.monotonic()
+            elif time.monotonic() - no_progress_since > stall_limit_s:
+                _log(f"  → BITS stalled: no progress for {stall_limit_s:.0f}s "
+                     f"({trans/1e6:.1f} MB / {total/1e6:.1f} MB)")
+                proc.terminate()
+                raise RuntimeError(
+                    f"BITS download stalled at {trans/1e6:.1f} MB "
+                    f"of {total/1e6:.1f} MB.  Check your network "
+                    f"connection or try again later.")
+            if progress_cb is not None:
+                try:
+                    progress_cb(trans, total)
+                except Exception:
+                    pass
+            # Per-2s heartbeat into the debug log so the user sees activity
+            # without being flooded.
+            if int(time.monotonic() * 2) % 4 == 0:
+                _log(f"  BITS: {state} {trans/1e6:.1f} / {total/1e6:.1f} MB")
+
+        rc = proc.wait(timeout=10)
+        stderr = proc.stderr.read() or ""
+        if rc != 0:
+            raise RuntimeError(
+                f"PowerShell/BITS exited with code {rc}: {stderr.strip()}")
+
+        if not os.path.exists(dest_path):
+            raise RuntimeError(
+                "BITS completed but the destination file is missing.")
+        size_mb = os.path.getsize(dest_path) / 1e6
+        _log(f"  ✓ download complete via BITS: {size_mb:.1f} MB")
+        if progress_cb is not None:
+            try:
+                progress_cb(int(size_mb * 1e6), int(size_mb * 1e6))
+            except Exception:
+                pass
+    finally:
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try: proc.wait(timeout=2)
+                except Exception:
+                    proc.kill()
+        except Exception:
+            pass
+
+
 def download_wheel(url: str,
                    dest_path: str,
                    progress_cb: Optional[Callable[[int, int], None]] = None,
                    cancel_cb: Optional[Callable[[], bool]] = None) -> None:
-    """Stream-download `url` to `dest_path` with optional progress and
-    cancellation callbacks.  Raises RuntimeError with user-facing wording
-    on failure.
+    """Download `url` → `dest_path` with progress + cancel support.
 
-    progress_cb(downloaded, total) is called every ~64 KB.  total may be
-    0 if the server omits Content-Length.
-    cancel_cb() is polled regularly; returning True aborts the download
-    and removes the partial file.
+    Implementation strategy:
+      * On Windows, use BITS via PowerShell (rock-solid through
+        Defender / proxies / corporate networks).
+      * Anywhere else, the urllib path (with the existing stall
+        watchdog) is fine because the issues we've hit are
+        Windows-specific.
     """
+    # Windows: try BITS first.  If PowerShell or BitsTransfer module is
+    # missing (unlikely on any current Windows install), fall back to
+    # the urllib path below.
+    if is_windows():
+        try:
+            _download_via_bits(url, dest_path,
+                                progress_cb=progress_cb,
+                                cancel_cb=cancel_cb)
+            return
+        except RuntimeError:
+            # Re-raise user-cancel and BITS-specific errors as-is.
+            raise
+        except Exception as exc:
+            _log(f"  BITS path unavailable ({exc!r}); falling back "
+                 f"to urllib")
+            # fall through to urllib path
     os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
     # Bigger chunks → fewer read() syscalls AND fewer progress signals
     # queued to the GUI thread.  At ~50 MB/s on a 64 KB chunk that's

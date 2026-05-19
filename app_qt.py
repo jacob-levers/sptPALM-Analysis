@@ -5767,30 +5767,81 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
 
     def closeEvent(self, event):
-        """Persist state on close and tear down any running subprocess."""
-        try:
-            self._save_settings()
-        except Exception:
-            pass
-        # Make sure we don't leave an orphan analysis subprocess running
-        # after the GUI is closed.
+        """Tear EVERYTHING down on close, and guarantee process exit.
+
+        Symptoms before this rewrite: closing FIREFLY left the process
+        hanging in the OS task manager (Windows) or the Dock (macOS)
+        until force-quit.  Root causes were varied — orphan analysis
+        subprocess, multiprocessing.Queue feeder thread keeping the
+        parent alive on Windows, napari viewer's Vispy/Metal context
+        not releasing, CUDA-install QThread still running, modal
+        QMessageBox left visible, etc.  Rather than guess which one
+        is responsible on any given user's machine, we shut every
+        known live object down in turn AND schedule a hard-exit
+        fallback so the process always terminates within ~3 s.
+        """
+        # 1. Persist settings BEFORE anything that could fail.
+        try:    self._save_settings()
+        except Exception: pass
+
+        # 2. Stop the message-poll QTimer so it can't fire during teardown.
+        try:    self._poll_timer.stop()
+        except Exception: pass
+
+        # 3. Cancel + terminate the analysis subprocess.
         try:
             if self._proc is not None and self._proc.is_alive():
                 if self._cancel_event is not None:
-                    self._cancel_event.set()
-                self._proc.join(timeout=2.0)
+                    try: self._cancel_event.set()
+                    except Exception: pass
+                self._proc.join(timeout=1.5)
                 if self._proc.is_alive():
-                    self._proc.terminate()
-                    self._proc.join(timeout=1.0)
-        except Exception:
-            pass
+                    try: self._proc.terminate()
+                    except Exception: pass
+                    self._proc.join(timeout=0.5)
+                if self._proc.is_alive():
+                    # multiprocessing.Process.kill is the nuclear option
+                    # (SIGKILL on POSIX, TerminateProcess on Windows).
+                    try: self._proc.kill()
+                    except Exception: pass
+        except Exception: pass
 
-        # Explicitly close any embedded napari viewers.  Each one is a
-        # QMainWindow under the hood — without calling `viewer.close()`
-        # it stays alive as a "still-visible top-level window", which
-        # is enough to stop QApplication from quitting even after our
-        # own MainWindow closes (the "⌘Q does nothing after a run"
-        # symptom we saw).
+        # 4. Drop the multiprocessing.Queue WITHOUT joining the feeder
+        # thread.  On Windows the feeder thread can block process exit
+        # waiting to flush pending writes to a pipe whose other end is
+        # already dead — cancel_join_thread() abandons it cleanly.
+        try:
+            q = self._msg_queue
+            if q is not None:
+                try: q.cancel_join_thread()
+                except Exception: pass
+                try: q.close()
+                except Exception: pass
+        except Exception: pass
+        self._msg_queue = None
+
+        # 5. Stop any in-flight CUDA installer thread/timer.  The worker
+        # may be wedged inside urlopen; we don't try to join it — daemon
+        # status means it dies with the process below.
+        try:
+            if getattr(self, "_cuda_heartbeat", None) is not None:
+                self._cuda_heartbeat.stop()
+        except Exception: pass
+        try:
+            if getattr(self, "_cuda_thread", None) is not None:
+                self._cuda_thread.quit()
+                self._cuda_thread.wait(500)
+        except Exception: pass
+        try:
+            import cuda_installer as _cu
+            _cu.set_log_callback(None)
+        except Exception: pass
+
+        # 6. Close every embedded napari viewer.  On macOS the Vispy
+        # backend holds a Metal CAMetalLayer that prevents Cocoa from
+        # tearing down the QApplication until the layer is released —
+        # calling viewer.close() (which calls window.close() →
+        # Vispy.app.canvas.close()) takes care of it.
         for attr_chain in (
                 ("_roi_viewer", "_viewer"),       # Import-tab preview
                 ("_napari_viewer",),              # Visualise-tab viewer
@@ -5803,17 +5854,49 @@ class MainWindow(QtWidgets.QMainWindow):
                         break
                 if obj is not None and hasattr(obj, "close"):
                     obj.close()
-            except Exception:
-                pass
+            except Exception: pass
+
+        # 7. Close any leftover modal dialogs that might still be alive
+        # (CUDA debug log window, progress dialog, etc.).
+        try:
+            for w in QtWidgets.QApplication.topLevelWidgets():
+                if w is self:
+                    continue
+                try: w.close()
+                except Exception: pass
+        except Exception: pass
+
+        # 8. Close every matplotlib figure we created.  Live figure
+        # objects hold a Qt FigureCanvas which counts as a top-level
+        # window on macOS and blocks quitOnLastWindowClosed.
+        try:
+            import matplotlib.pyplot as _plt
+            _plt.close("all")
+        except Exception: pass
 
         super().closeEvent(event)
-        # Belt-and-braces: ask the QApplication to quit.  This is a
-        # no-op when QApplication.quitOnLastWindowClosed already
-        # triggered, but covers cases where a stray hidden window
-        # (e.g. napari's docked plugin manager) keeps the event loop
-        # alive on macOS.
+
+        # 9. Ask the QApplication to quit (covers stray top-level windows).
         try:    QtWidgets.QApplication.instance().quit()
         except Exception: pass
+
+        # 10. Hard-exit fallback.  If after ALL the above some library
+        # (vispy / Metal / OpenSSL / a daemon thread doing socket I/O)
+        # still refuses to let the interpreter unwind, os._exit() is
+        # the only thing that guarantees the OS reclaims the PID
+        # within a finite time.  Schedule it via the QTimer event
+        # loop so the closeEvent itself can return cleanly first.
+        try:
+            def _hard_exit():
+                # Settings are already saved; we don't care about
+                # graceful Python shutdown — the OS reclaims everything.
+                import os as _os
+                _os._exit(0)
+            QtCore.QTimer.singleShot(2500, _hard_exit)
+        except Exception:
+            # If even that fails, drop straight to os._exit.
+            import os as _os
+            _os._exit(0)
 
     # ── Backend availability helper ───────────────────────────────────────
     # Two-way mapping between GUI labels and internal backend strings.
