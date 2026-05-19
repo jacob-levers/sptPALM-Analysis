@@ -698,64 +698,95 @@ class _ResourceMonitor(QtWidgets.QFrame):
             self._set("cpu", "(psutil)")
             self._set("ram", "(psutil)")
 
-        # GPU usage + VRAM via torch — ONLY if torch is already
-        # imported elsewhere (the subprocess-isolation invariant on
-        # Apple Silicon forbids us from importing it ourselves; see
-        # _maybe_get_torch).  CUDA exposes utilisation through
-        # nvidia-smi (not torch) so we report VRAM-in-use as the GPU
-        # cell when CUDA is active; MPS doesn't expose either cleanly.
+        # GPU usage + VRAM.
+        #
+        # Subprocess-isolation invariant (B2): we MUST NOT import torch
+        # into the GUI process, especially on Apple Silicon, because Qt
+        # + Metal contend with the analysis subprocess's MPS allocator.
+        # But that doesn't mean we can't report GPU stats — both the
+        # MPS path (ioreg) and the NVIDIA path (nvidia-smi / pynvml)
+        # are torch-free.  Use those directly so users actually SEE
+        # what their GPU is doing during a run.
         torch_mod = self._maybe_get_torch()
-        if torch_mod is None:
-            self._set("gpu",  "(idle)")
-            self._set("vram", "(idle)")
-            return
+        gpu_reported = False
+        vram_reported = False
 
-        try:
-            t = torch_mod
-            if t.cuda.is_available():
-                # GPU utilisation via NVML if available
-                util = None
+        # ── macOS: MPS utilisation via ioreg (torch-free) ─────────────
+        if sys.platform == "darwin":
+            self._poll_mps_async()
+            if self._mps_util_cache is not None:
+                self._set("gpu", f"{self._mps_util_cache:5.1f} %",
+                          warn=(self._mps_util_cache < 1))
+                gpu_reported = True
+            else:
+                self._set("gpu", "MPS")
+                gpu_reported = True
+            # VRAM on Apple Silicon is unified with system RAM — no
+            # separate readout.  If torch IS already in this process
+            # (uncommon but possible), report its allocator footprint;
+            # otherwise display a dash.
+            if torch_mod is not None:
                 try:
-                    import pynvml
-                    pynvml.nvmlInit()
-                    h = pynvml.nvmlDeviceGetHandleByIndex(0)
-                    util = pynvml.nvmlDeviceGetUtilizationRates(h).gpu
-                    pynvml.nvmlShutdown()
+                    if (hasattr(torch_mod.backends, "mps")
+                            and torch_mod.backends.mps.is_available()):
+                        alloc = torch_mod.mps.current_allocated_memory() / 1e9
+                        self._set("vram", f"{alloc:4.1f} GB")
+                        vram_reported = True
                 except Exception:
                     pass
-                if util is not None:
+            if not vram_reported:
+                self._set("vram", "unified")
+                vram_reported = True
+
+        # ── NVIDIA (any OS): util + VRAM via pynvml (torch-free) ──────
+        if not gpu_reported:
+            try:
+                import pynvml as _nv
+                _nv.nvmlInit()
+                try:
+                    h = _nv.nvmlDeviceGetHandleByIndex(0)
+                    util = _nv.nvmlDeviceGetUtilizationRates(h).gpu
+                    mem  = _nv.nvmlDeviceGetMemoryInfo(h)
                     self._set("gpu", f"{util:5.1f} %",
                               warn=(util < 1))
-                else:
-                    self._set("gpu", "CUDA")
+                    self._set("vram",
+                              f"{mem.used/1e9:4.1f} / {mem.total/1e9:.0f} GB")
+                    gpu_reported = True
+                    vram_reported = True
+                finally:
+                    try: _nv.nvmlShutdown()
+                    except Exception: pass
+            except Exception:
+                # pynvml not installed OR no NVIDIA driver.  Try
+                # nvidia-smi as a last resort (Windows .exe bundles
+                # pynvml but on a fresh from-source install it may
+                # be missing).
                 try:
-                    alloc = t.cuda.memory_allocated() / 1e9
-                    total = t.cuda.get_device_properties(0).total_memory / 1e9
-                    self._set("vram", f"{alloc:4.1f} / {total:.0f} GB")
+                    import subprocess as _sub
+                    flags = getattr(_sub, "CREATE_NO_WINDOW", 0) \
+                            if sys.platform == "win32" else 0
+                    out = _sub.run(
+                        ["nvidia-smi",
+                         "--query-gpu=utilization.gpu,memory.used,memory.total",
+                         "--format=csv,noheader,nounits"],
+                        capture_output=True, text=True, timeout=2,
+                        creationflags=flags).stdout.strip().splitlines()
+                    if out:
+                        u, used, total = [s.strip() for s in out[0].split(",")]
+                        self._set("gpu", f"{float(u):5.1f} %",
+                                  warn=(float(u) < 1))
+                        self._set("vram",
+                                  f"{float(used)/1024:4.1f} / "
+                                  f"{float(total)/1024:.0f} GB")
+                        gpu_reported = True
+                        vram_reported = True
                 except Exception:
-                    self._set("vram", "CUDA")
-            elif (hasattr(t.backends, "mps")
-                  and t.backends.mps.is_available()):
-                # MPS exposes "current_allocated_memory" only in recent
-                # torch builds; fall back to a stub when missing.
-                try:
-                    alloc = t.mps.current_allocated_memory() / 1e9
-                    self._set("vram", f"{alloc:4.1f} GB")
-                except Exception:
-                    self._set("vram", "MPS")
-                # Kick off the async ioreg poll for the next tick + show
-                # the cached value from the previous tick.
-                self._poll_mps_async()
-                if self._mps_util_cache is not None:
-                    self._set("gpu", f"{self._mps_util_cache:5.1f} %",
-                              warn=(self._mps_util_cache < 1))
-                else:
-                    self._set("gpu", "MPS")
-            else:
-                self._set("gpu",  "CPU only")
-                self._set("vram", "—")
-        except Exception:
-            self._set("gpu",  "—")
+                    pass
+
+        # ── Last resort: CPU only / nothing detected ──────────────────
+        if not gpu_reported:
+            self._set("gpu", "CPU only")
+        if not vram_reported:
             self._set("vram", "—")
 
 
